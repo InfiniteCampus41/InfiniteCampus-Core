@@ -1426,8 +1426,8 @@ const ROUTES = {
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
 };
 app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) => {
-    const uploadedBy = req.headers.uploadedby || "User";
     const uid = req.headers["x-user-id"] || "unknown";
+    const uploadedBy = uid;
     try {
         const fileId = req.headers.fileid;
         const chunkIndex = Number(req.headers.chunkindex);
@@ -1509,23 +1509,39 @@ setInterval(() => {
 }, 30_000);
 app.get(ROUTES.LIST_APPLY, (req, res) => {
     try {
-        const files = fs.readdirSync(APPLY_DIR);
-        const list = files
-        .map((f) => {
-            const p = path.join(APPLY_DIR, f);
-            const s = fs.statSync(p);
+        const files = fs.readdirSync(APPLY_DIR)
+            .filter(f => !f.endsWith(".json"));
+        const list = files.map(file => {
+            const full = path.join(APPLY_DIR, file);
+            const stats = fs.statSync(full);
+            const statusObj = acceptStatus.get(file);
+            let status = "idle";
+            let percent = null;
+            if (statusObj) {
+                status = statusObj.status || "idle";
+                if (statusObj.percent !== undefined) {
+                    percent = String(Math.round(statusObj.percent));
+                }
+            }
             return {
-                file: f,
-                size: s.size,
-                mtime: s.mtime,
-                humanSize: formatBytes(s.size),
+                file,
+                size: stats.size,
+                mtime: stats.mtime,
+                humanSize: formatBytes(stats.size),
+                status,
+                percent
             };
-        })
-        .sort((a, b) => b.mtime - a.mtime);
-        res.json({ ok: true, list, folderSize: folderSizeBytes(APPLY_DIR) });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ ok: false, message: "Failed To List Applicants" });
+        });
+        res.json({
+            ok: true,
+            files: list
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({
+            ok: false
+        });
+
     }
 });
 app.get(ROUTES.STREAM_APPLY, (req, res) => {
@@ -1629,21 +1645,6 @@ app.get(ROUTES.STREAM_VIDEO, (req, res) => {
         console.error(e);
         res.status(500).send("Server Error");
     }
-});
-app.get("/accept_status/:file", (req, res) => {
-    const file = path.basename(req.params.file);
-    const status = acceptStatus.get(file);
-    if (!status) {
-        return res.json({
-            exists: false,
-            status: "idle"
-        });
-    }
-    res.json({
-        exists: true,
-        file,
-        ...status
-    });
 });
 setInterval(() => {
     const now = Date.now();
@@ -1788,9 +1789,23 @@ function setupSocketHandlers(ioInstance, label) {
                 const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
                 const copyPath = path.join(APPLY_DIR, copyName);
                 const scaledPathTemp = path.join(APPLY_DIR, scaledName);
+                acceptStatus.set(safeFile, {
+                    status: "copying",
+                    percent: 0,
+                    remainingSec: null,
+                    message: "Copying Container",
+                    updated: Date.now()
+                });
                 await runFfmpegWithProgress(socket, workId, safeFile, safeFile, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container" );
                 try { fs.unlinkSync(srcPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Original" }); } catch (e) { socket.emit("jobLog", { filename: safeFile, text: "Could Not Delete Original (Non-Fatal)." }); }
                 await new Promise(r => setTimeout(r, 500));
+                acceptStatus.set(safeFile, {
+                    status: "scaling",
+                    percent: 0,
+                    remainingSec: null,
+                    message: "Scaling",
+                    updated: Date.now()
+                });
                 await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360" );
                 try { fs.unlinkSync(copyPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Intermediate Copy." }); } catch (e) {}
                 const finalFileName = `${baseTarget}.mp4`;
@@ -1804,14 +1819,12 @@ function setupSocketHandlers(ioInstance, label) {
                 fs.renameSync(scaledPathTemp, finalDest);
                 const moviesJson = loadMoviesJSON();
                 const baseName = path.basename(finalDest);
-                let uploader = "User";
+                let uploaderUid = null;
                 try {
                     const metaPath = path.join(APPLY_DIR, safeFile + ".json");
-                    let uploaderUid = null;
                     if (fs.existsSync(metaPath)) {
                         const meta = JSON.parse(fs.readFileSync(metaPath));
-                        uploader = meta.uploadedBy || "User";
-                        uploaderUid = meta.uid || null;
+                        uploaderUid = meta.uid || meta.uploadedBy || null;
                         fs.unlinkSync(metaPath);
                     }
                     if (uploaderUid && uploaderUid !== "unknown") {
@@ -1829,7 +1842,7 @@ function setupSocketHandlers(ioInstance, label) {
 		        if (!moviesJson[baseName]) {
     		        moviesJson[baseName] = {
                         order: getNextOrder(moviesJson),
-                        uploadedBy: uploader
+                        uploadedBy: uploaderUid
                     };
                     saveMoviesJSON(moviesJson);
                 }
