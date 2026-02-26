@@ -44,7 +44,7 @@ app.post("/stripe-webhook",
             process.env.STRIPE_WEBHOOK_SECRET
         );
     } catch (err) {
-        console.log("Webhook Signature Failed.");
+        console.log("Webhook signature failed.");
         return res.sendStatus(400);
     }
     if (event.type === "checkout.session.completed") {
@@ -77,6 +77,7 @@ const acceptStatus = new Map();
 setInterval(() => {
     if (acceptStatus.size > 500) {
         acceptStatus.clear();
+
     }
 }, 10 * 60 * 1000);
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -1425,6 +1426,8 @@ const ROUTES = {
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
 };
 app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) => {
+    const uploadedBy = req.headers.uploadedby || "User";
+    const uid = req.headers["x-user-id"] || "unknown";
     try {
         const fileId = req.headers.fileid;
         const chunkIndex = Number(req.headers.chunkindex);
@@ -1464,6 +1467,11 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
                 writeStream.end();
                 writeStream.on("close", () => {
                     fs.rmSync(chunkDir, { recursive: true, force: true });
+                    const metaPath = path.join(APPLY_DIR, safeFile + ".json");
+                    fs.writeFileSync(metaPath, JSON.stringify({
+                        uploadedBy,
+                        uid
+                    }));
                     const fileSize = fs.statSync(finalPath).size;
                     res.json({
                         ok: true,
@@ -1571,7 +1579,8 @@ function listMovies() {
             size: stats.size,
             mtime: stats.mtime,
             humanSize: formatBytes(stats.size),
-            order: moviesJson[f]?.order ?? 99999999
+            order: moviesJson[f]?.order ?? 99999999,
+            uploadedBy: moviesJson[f]?.uploadedBy || "User"
         };
     });
     list.sort((a, b) => a.order - b.order);
@@ -1652,6 +1661,13 @@ app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
     const file = path.join(MOVIES_DIR, name + ".mp4");
     if (!file.startsWith(MOVIES_DIR) || !fs.existsSync(file)) return res.status(404).send("Not Found");
     res.download(file, `${name}.mp4`);
+});
+app.delete(ROUTES.DELETE_VIDEO, (req, res) => {
+    const name = path.basename(req.params.name);
+    const file = path.join(MOVIES_DIR, name + ".mp4");
+    if (!fs.existsSync(file)) return res.status(404).send("Not Found");
+    fs.unlinkSync(file);
+    res.json({ ok: true });
 });
 app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
     const { filename } = req.body;
@@ -1786,11 +1802,34 @@ function setupSocketHandlers(ioInstance, label) {
                     counter++;
                 }
                 fs.renameSync(scaledPathTemp, finalDest);
-		const moviesJson = loadMoviesJSON();
-		const baseName = path.basename(finalDest);
-		if (!moviesJson[baseName]) {
-    		    moviesJson[baseName] = {
-                        order: getNextOrder(moviesJson)
+                const moviesJson = loadMoviesJSON();
+                const baseName = path.basename(finalDest);
+                let uploader = "User";
+                try {
+                    const metaPath = path.join(APPLY_DIR, safeFile + ".json");
+                    let uploaderUid = null;
+                    if (fs.existsSync(metaPath)) {
+                        const meta = JSON.parse(fs.readFileSync(metaPath));
+                        uploader = meta.uploadedBy || "User";
+                        uploaderUid = meta.uid || null;
+                        fs.unlinkSync(metaPath);
+                    }
+                    if (uploaderUid && uploaderUid !== "unknown") {
+                        try {
+                            await db.ref(`users/${uploaderUid}/profile`).update({
+                                isUploader: true
+                            });
+                        } catch (err) {
+                            console.error("Failed To Grant Uploader Role:", err);
+                        }
+                    }
+                } catch (e) {
+                    console.error("Failed To Load Uploader Metadata");
+                }
+		        if (!moviesJson[baseName]) {
+    		        moviesJson[baseName] = {
+                        order: getNextOrder(moviesJson),
+                        uploadedBy: uploader
                     };
                     saveMoviesJSON(moviesJson);
                 }
