@@ -5,7 +5,7 @@ const app = express();
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, ngrok-skip-browser-warning, x-admin-password, fileId, chunkIndex, totalChunks, filename, x-user-id, X-File-Id, X-Chunk-Number, X-Total-Chunks, X-Filename, X-User-Id");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, uploadedby, ngrok-skip-browser-warning, x-admin-password, fileId, chunkIndex, totalChunks, filename, x-user-id, X-File-Id, X-Chunk-Number, X-Total-Chunks, X-Filename, X-User-Id");
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
 });
@@ -31,7 +31,7 @@ import child_process from "child_process";
 const execProm = util.promisify(child_process.exec);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: [ "Content-Type", "Authorization", "ngrok-skip-browser-warning", "x-admin-password", "fileId", "chunkIndex", "totalChunks", "filename", "x-user-id", "X-File-Id", "X-Chunk-Number", "X-Total-Chunks", "X-User-Id"]}));
+app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: [ "Content-Type", "Authorization", "ngrok-skip-browser-warning", "x-admin-password", "fileId", "chunkIndex", "totalChunks", "filename", "x-user-id", "X-File-Id", "X-Chunk-Number", "X-Total-Chunks", "X-User-Id", "uploadedby"]}));
 app.post("/stripe-webhook",
     express.raw({ type: "application/json" }),
     async (req, res) => {
@@ -1244,7 +1244,7 @@ app.post("/uploadthis", async (req, res) => {
                     }
                 }
             } catch (err) {
-                console.error("Premium Check Failed:", err);
+                console.error("Premium check failed:", err);
             }
             setTimeout(() => fs.unlink(finalPath, () => {}), deleteDelay);
             pushUploadLog(finalFilename, uploadedBytes);
