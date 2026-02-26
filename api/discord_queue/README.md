@@ -1,0 +1,1 @@
+This Folder Is For Temporarily Storing Queued Discord Requests

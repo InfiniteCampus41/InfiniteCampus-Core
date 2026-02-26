@@ -1,0 +1,1 @@
+This Folder Is For Where The 5 Or 15 Minute File Uploads Go. When You Upload A File, There Is A Tmp Folder That Is Created In This Folder Which Contains The Chunks For That Upload

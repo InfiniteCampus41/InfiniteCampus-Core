@@ -1,0 +1,1 @@
+This File Contains The Firebase Admin SDK For The Status RTDB

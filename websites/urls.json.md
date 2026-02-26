@@ -1,0 +1,1 @@
+This File Is For Storing Blocked URLs And Their Error Codes
