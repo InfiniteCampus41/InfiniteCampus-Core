@@ -188,6 +188,22 @@ const fastify = Fastify({
         });
     },
 });
+fastify.addHook("onSend", async (req, reply, payload) => {
+    reply.header(
+        "Content-Security-Policy",
+        `
+        default-src * data: blob: 'unsafe-inline' 'unsafe-eval';
+        script-src * data: blob: 'unsafe-inline' 'unsafe-eval';
+        worker-src * blob:;
+        connect-src *;
+        img-src * data: blob:;
+        frame-src *;
+        style-src * 'unsafe-inline';
+        `
+        .replace(/\s+/g, " ")
+    );
+    return payload;
+});
 fastify.register(fastifyStatic, { root: publicPath, decorateReply: true });
 fastify.register(fastifyStatic, { root: scramjetPath, prefix: "/scram/", decorateReply: false });
 fastify.register(fastifyStatic, { root: libcurlPath, prefix: "/libcurl/", decorateReply: false });
@@ -239,7 +255,6 @@ fastify.post("/github-webhook", async (request, reply) => {
     }
 });
 fastify.get("/edit-urls", async (req, reply) => {
-    if (!requireAdmin(req, reply)) return;
     await loadBlockedUrls();
     reply.send(blockedUrls);
 });
