@@ -74,6 +74,7 @@ const DISCORD_QUEUE_DIR = path.join(__dirname, "discord_queue");
 const logid = "1460410323369721868";
 const stripe = new Stripe(process.env.STRIPE_SECRET);
 const acceptStatus = new Map();
+const discordVerifications = new Map();
 setInterval(() => {
     if (acceptStatus.size > 500) {
         acceptStatus.clear();
@@ -833,7 +834,7 @@ app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (re
         res.status(500).send("Failed To Send Message");
     }
 });
-app.post("/upload", blockDiscordIfDisabled, memoryUpload.single("file"), async (req, res) => {
+app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (req, res) => {
     const { channelId } = req.body;
     const file = req.file;
     let targetChannel = channelId || DEFAULT_CHANNEL_ID;
@@ -853,24 +854,36 @@ app.post("/upload", blockDiscordIfDisabled, memoryUpload.single("file"), async (
     ]);
     if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
     if (!file) return res.status(400).send("No File Uploaded");
-    try {
-        const formData = new FormData();
-        formData.append("files[0]", file.buffer, {
-            filename: file.originalname,
-            contentType: file.mimetype,
-        });
-        await discordRequest({
-            method: "post",
-            url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
-            data: formData,
-            headers: formData.getHeaders(),
-        });
-        res.status(200).send("File Uploaded");
-    } catch (err) {
-        console.error("File Upload Error:", err.response?.data || err.message);
-        res.status(500).send("Failed To Upload File");
+        const MAX_SIZE = 10 * 1024 * 1024;
+        if (file.size > MAX_SIZE) {
+            fs.unlink(file.path, () => {});
+            return res.status(400).send("File exceeds 10MB limit");
+        }
+        try {
+            const formData = new FormData();
+            formData.append("files[0]", fs.createReadStream(file.path), {
+                filename: file.originalname,
+                contentType: file.mimetype,
+            });
+            await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
+                data: formData,
+                headers: formData.getHeaders(),
+            });
+            fs.unlink(file.path, (err) => {
+                if (err) console.error("Failed to delete temp file:", err);
+            });
+            res.status(200).send("File Uploaded");
+        } catch (err) {
+            if (file?.path) {
+                fs.unlink(file.path, () => {});
+            }
+            console.error("File Upload Error:", err.response?.data || err.message);
+            res.status(500).send("Failed To Upload File");
+        }
     }
-});
+);
 app.get("/api/messages", blockDiscordIfDisabled, async (req, res) => {
     let channelId = req.query.channelId || DEFAULT_CHANNEL_ID;
     const ALLOWED_CHANNELS = new Set([
@@ -1523,13 +1536,25 @@ app.get(ROUTES.LIST_APPLY, (req, res) => {
                     percent = String(Math.round(statusObj.percent));
                 }
             }
+            let uploadedBy = null;
+            const jsonPath = path.join(APPLY_DIR, `${file}.json`);
+            if (fs.existsSync(jsonPath)) {
+                try {
+                    const raw = fs.readFileSync(jsonPath, "utf8");
+                    const parsed = JSON.parse(raw);
+                    uploadedBy = parsed.uploadedBy || null;
+                } catch (err) {
+                    console.error("Failed To Read Metadata For", file, err);
+                }
+            }
             return {
                 file,
                 size: stats.size,
                 mtime: stats.mtime,
                 humanSize: formatBytes(stats.size),
                 status,
-                percent
+                percent,
+                uploadedBy
             };
         });
         res.json({
@@ -1541,7 +1566,6 @@ app.get(ROUTES.LIST_APPLY, (req, res) => {
         res.status(500).json({
             ok: false
         });
-
     }
 });
 app.get(ROUTES.STREAM_APPLY, (req, res) => {
@@ -1581,6 +1605,152 @@ app.get(ROUTES.STREAM_APPLY, (req, res) => {
         res.status(500).send("Server Error");
     }
 });
+app.post("/discordVerify", async (req, res) => {
+    try {
+        const { username, uid } = req.body;
+        if (!username || !uid) {
+            return res.status(400).json({ error: "Missing Username Or uid" });
+        }
+        const GUILD_ID = process.env.DISCORD_GUILD_ID;
+        const response = await axios.get(
+            `https://discord.com/api/v10/guilds/${GUILD_ID}/members/search`,
+            {
+                params: { query: username, limit: 10 },
+                headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
+            }
+        );
+        const members = response.data;
+        const found = members.find(m =>
+            m.user.username.toLowerCase() === username.toLowerCase()
+        );
+        if (!found) {
+            return res.json({ message: "Not In Server" });
+        }
+        const discordId = found.user.id;
+        const code = Math.floor(100000 + Math.random() * 900000).toString();
+        discordVerifications.set(uid, {
+            discordId,
+            username,
+            code,
+            created: Date.now()
+        });
+        await axios.post(
+            `https://discord.com/api/v10/users/@me/channels`,
+            { recipient_id: discordId },
+            { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+        ).then(async dm => {
+            await axios.post(
+                `https://discord.com/api/v10/channels/${dm.data.id}/messages`,
+                {
+                    content: `This Code Is For Discord Verification\nYour Verification Code Is: **${code}**\nIf You Did Not Request Verification, You Can Ignore This Message.`
+                },
+                { headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+            );
+        });
+        res.json({
+            success: true,
+            message: "Verification Code Sent Via Discord DM"
+        });
+    } catch (err) {
+        console.error("Discord Verify Error:", err.response?.data || err.message);
+        res.status(500).json({ error: "Verification failed" });
+    }
+});
+app.post("/discordVerifyConfirm", async (req, res) => {
+    const { uid, code } = req.body;
+    const verify = discordVerifications.get(uid);
+    if (!verify) {
+        return res.status(400).json({ error: "No Verification In Progress" });
+    }
+    if (verify.code !== code) {
+        return res.status(400).json({ error: "Invalid Code" });
+    }
+    await admin.database()
+        .ref(`users/${uid}/profile`)
+        .update({ dUsername: verify.username });
+    discordVerifications.delete(uid);
+    res.json({
+        success: true,
+        message: "Discord Account Verified"
+    });
+});
+app.post("/discordVerifyCancel", (req, res) => {
+    const { uid } = req.body;
+    if (discordVerifications.has(uid)) {
+        discordVerifications.delete(uid);
+    }
+    res.json({
+        success: true,
+        message: "Verification Cancelled"
+    });
+});
+setInterval(() => {
+    const now = Date.now();
+    for (const [uid, data] of discordVerifications) {
+        if (now - data.created > 10 * 60 * 1000) {
+            discordVerifications.delete(uid);
+        }
+    }
+}, 60000);
+const seenUsers = new Set();
+async function watchForNewUsers() {
+    const snap = await db.ref("users").once("value");
+    snap.forEach(child => {
+        seenUsers.add(child.key);
+    });
+    setInterval(async () => {
+        const usersSnap = await db.ref("users").once("value");
+        for (const child of Object.keys(usersSnap.val() || {})) {
+            if (!seenUsers.has(child)) {
+                seenUsers.add(child);
+                const profile = usersSnap.child(child).child("profile").val();
+                const displayName = profile?.displayName || "Unknown";
+                const verified = profile?.verified || false;
+                if (!verified) {
+                    console.log(`New Unverified User Detected: ${displayName}`);
+                    await sendVerificationNotification(child, displayName);
+                }
+            }
+        }
+    }, 5000);
+}
+async function sendVerificationNotification(uid, displayName) {
+    const usersSnap = await db.ref("users").once("value");
+    const tokens = [];
+    for (const user of Object.keys(usersSnap.val() || {})) {
+        const profile = usersSnap.child(user).child("profile");
+        if (
+            profile.child("isOwner").val() === true ||
+            profile.child("isTester").val() === true ||
+            profile.child("isCoOwner").val() === true ||
+            profile.child("isDev").val() === true
+        ) {
+            const tokenSnap = await db.ref(`pushTokens/${user}`).once("value");
+            tokenSnap.forEach(token => {
+                tokens.push(token.key);
+            });
+        }
+    }
+    if (tokens.length === 0) {
+        console.log("No Admin Tokens Found.");
+        return;
+    }
+    const message = {
+        data: {
+            type: "verifyUser",
+            uid: uid,
+            url: `/InfiniteAdminChats.html`
+        },
+        notification: {
+            title: "A New User Has Signed Up!",
+            body: `User ${displayName} Is Awaiting Verification`
+        },
+        tokens: tokens
+    };
+    const response = await admin.messaging().sendEachForMulticast(message);
+    console.log("Verification Notification Sent.");
+    console.log("Success:", response.successCount);
+}
 function listMovies() {
     const moviesJson = loadMoviesJSON();
     const files = fs.readdirSync(MOVIES_DIR).filter((f) => {
@@ -2166,3 +2336,4 @@ httpServer.listen(PORT, () => {
     httpServer.headersTimeout = 0;
     mainMenu();
 });
+watchForNewUsers();

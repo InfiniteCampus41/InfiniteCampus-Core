@@ -1,0 +1,50 @@
+app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (req, res) => {
+    const { channelId } = req.body;
+    const file = req.file;
+    let targetChannel = channelId || DEFAULT_CHANNEL_ID;
+    const ALLOWED_CHANNELS = new Set([
+        '1464689808717774970',
+        '1389703415810101308',
+        '1389334335114580229',
+        '1309160050904006696',
+        '1309164699417448550',
+        '1007051892821594183',
+        '1086362556203028540',
+        '1334945403912720586',
+        '1390991482650886215',
+        '1391898825588740108',
+        '1401659961880088668',
+        '1334377158789042226'
+    ]);
+    if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
+    if (!file) return res.status(400).send("No File Uploaded");
+        const MAX_SIZE = 10 * 1024 * 1024;
+        if (file.size > MAX_SIZE) {
+            fs.unlink(file.path, () => {});
+            return res.status(400).send("File exceeds 10MB limit");
+        }
+        try {
+            const formData = new FormData();
+            formData.append("files[0]", fs.createReadStream(file.path), {
+                filename: file.originalname,
+                contentType: file.mimetype,
+            });
+            await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
+                data: formData,
+                headers: formData.getHeaders(),
+            });
+            fs.unlink(file.path, (err) => {
+                if (err) console.error("Failed to delete temp file:", err);
+            });
+            res.status(200).send("File Uploaded");
+        } catch (err) {
+            if (file?.path) {
+                fs.unlink(file.path, () => {});
+            }
+            console.error("File Upload Error:", err.response?.data || err.message);
+            res.status(500).send("Failed To Upload File");
+        }
+    }
+);
