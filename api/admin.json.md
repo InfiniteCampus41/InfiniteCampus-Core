@@ -1,1 +1,2 @@
 This File Contains The Firebase Admin SDK For The Database. This Is Needed To Detect If You Are A Premium User, And Upload Profile Pics To The Site.
+It Also Helps With Verification Notifications For Admins, And Discord Username Verification
