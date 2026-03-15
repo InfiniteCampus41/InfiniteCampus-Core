@@ -7,15 +7,6 @@ admin.initializeApp({
     databaseURL: "https://status-ba6c4-default-rtdb.firebaseio.com"
 });
 const db = admin.database();
-const sites = {
-    infinitecampusxyz: "https://infinitecampus.xyz",
-    instructurespace: "https://instructure.space",
-    apiinfinitecampusxyz: "https://api.infinitecampus.xyz",
-    backupinfinitecampusxyz: "https://backup.infinitecampus.xyz",
-    devsinfinitecampusxyz: "https://devs.infinitecampus.xyz",
-    playinfinitecampusxyz: "https://play.infinitecampus.xyz",
-    docsinfinitecampusxyz: "https://docs.infinitecampus.xyz"
-};
 function hourKeyUTC(date = new Date()) {
     return (
         date.getUTCFullYear() +
@@ -31,9 +22,17 @@ async function safeFetch(url) {
     try {
         const res = await axios.get(url, {
             timeout: 7000,
-            headers: { "User-Agent": "StatusMonitor" }
+            headers: { "User-Agent": "StatusMonitor" },
+            validateStatus: () => true
         });
-        return res.status >= 200 && res.status < 400;
+        if (res.status >= 400) return false;
+        const html = typeof res.data === "string" ? res.data.toLowerCase() : "";
+        if (
+            html.includes("there isn't a github pages site here") ||
+            html.includes("github pages site not found") ||
+            (html.includes("404") && html.includes("github"))
+        ) return false;
+        return true;
     } catch (err) {
         console.log("NETWORK ERROR:", url, err.code || err.message);
         return false;
@@ -47,29 +46,46 @@ async function checkSites() {
     const key = hourKeyUTC(now);
     const cutoff = Date.now() - 24 * 60 * 60 * 1000;
     console.log("Checking Sites @", now.toISOString());
-    for (const [id, url] of Object.entries(sites)) {
+    const sitesSnap = await db.ref("sites").get();
+    if (!sitesSnap.exists()) {
+        console.log("No Sites Configured");
+        running = false;
+        return;
+    }
+    const sitesRoot = sitesSnap.val();
+    for (const num of Object.keys(sitesRoot)) {
+        const site = sitesRoot[num];
+        if (!site.url) continue;
+        const url = site.url;
         try {
             const isUp = await safeFetch(url);
-            const ref = db.ref(`status/${id}/${key}`);
-            const snap = await ref.get();
-            let downMinutes = snap.exists()
-                ? snap.val().downMinutes || 0
-                : 0;
+            const statusRef = db.ref(`sites/${num}/status/${key}`);
+            const snap = await statusRef.get();
+            let downMinutes = snap.exists() ? snap.val().downMinutes || 0 : 0;
             if (!isUp) downMinutes += 5;
             const hourUp = downMinutes < 10;
-            await ref.set({downMinutes, up: hourUp});
-            console.log( id, hourUp ? "UP" : "DOWN", `(${downMinutes} Min)` );
-            const all = await db.ref(`status/${id}`).get();
-            all.forEach(child => {
+            await statusRef.set({ downMinutes, up: hourUp });
+            console.log(`Site ${num} (${site.name}) is ${hourUp ? "UP" : "DOWN"} (${downMinutes} min)`);
+            const allStatusSnap = await db.ref(`sites/${num}/status`).get();
+            allStatusSnap.forEach(child => {
                 const [year, month, day, hour] = child.key.split("-").map(Number);
                 const entryTime = Date.UTC(year, month - 1, day, hour);
                 if (entryTime < cutoff) {
-                    console.log("Deleting Old Hour:", id, child.key);
+                    console.log("Deleting Old Hour:", num, child.key);
                     child.ref.remove();
                 }
             });
+            const maintRef = db.ref(`sites/${num}/maint`);
+            const maintSnap = await maintRef.get();
+            if (maintSnap.exists()) {
+                const maint = maintSnap.val();
+                if (maint.end && maint.end * 1000 < Date.now()) {
+                    console.log("Cleaning Expired Maintenance:", num);
+                    maintRef.remove();
+                }
+            }
         } catch (err) {
-            console.error("Error Checking", id, err.message);
+            console.error(`Error checking site ${num} (${site.name})`, err.message);
         }
     }
     running = false;
