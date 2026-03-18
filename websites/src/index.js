@@ -29,6 +29,51 @@ const ADMIN_PASSWORDS = (process.env.ADMIN_PASSWORDS || "")
     .split(",")
     .map(p => p.trim())
     .filter(Boolean);
+let dnsFilteringEnabled = true;
+function normalizeHostname(input) {
+    try {
+        return new URL(input).hostname.toLowerCase().replace(/\.$/, "");
+    } catch {
+        return null;
+    }
+}
+function isBlockedHost(host) {
+    for (const blocked in blockedUrls) {
+        if (host === blocked || host.endsWith("." + blocked)) {
+            return blockedUrls[blocked];
+        }
+    }
+    return null;
+}
+function isPageRequest(url) {
+    const pathname = new URL(url).pathname.toLowerCase();
+    return !pathname.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|webp|mp4|mp3|woff|woff2|ttf)$/);
+}
+function applySafeSearch(urlObj) {
+    const host = urlObj.hostname;
+    if (host.includes("google.")) {
+        urlObj.searchParams.set("safe", "active");
+    }
+    if (host.includes("bing.com")) {
+        urlObj.searchParams.set("adlt", "strict");
+    }
+    if (host.includes("duckduckgo.com")) {
+        urlObj.searchParams.set("kp", "1");
+    }
+    if (host.includes("youtube.com")) {
+        urlObj.searchParams.set("persist_gl", "1");
+        urlObj.searchParams.set("safeSearch", "strict");
+    }
+    return urlObj;
+}
+async function loadSettings() {
+    try {
+        const data = JSON.parse(await fs.readFile(LOG_FILE, "utf-8"));
+        dnsFilteringEnabled = !!data.dnsFilteringEnabled;
+    } catch {
+        dnsFilteringEnabled = false;
+    }
+}
 function requireAdmin(req, reply) {
     const password = req.headers["x-admin-password"];
     if (!password || !ADMIN_PASSWORDS.includes(password)) {
@@ -136,22 +181,28 @@ async function saveBlockedUrls() {
     await fs.writeFile(URLS_FILE, JSON.stringify(blockedUrls, null, 2));
 }
 async function logUrlVisit(url) {
+    if (!isPageRequest(url)) return;
     let logs = {};
     try {
-        const data = await fs.readFile(LOG_FILE, "utf-8");
-        logs = JSON.parse(data);
+        logs = JSON.parse(await fs.readFile(LOG_FILE, "utf-8"));
     } catch {}
+    if (!logs.logs) logs.logs = {};
+    if (typeof logs.dnsFilteringEnabled !== "boolean") logs.dnsFilteringEnabled = false;
+    const host = normalizeHostname(url);
+    if (!host) return;
     const now = new Date().toISOString();
-    if (!logs[url]) logs[url] = { count: 1, lastVisit: now };
-    else {
-        logs[url].count += 1;
-        logs[url].lastVisit = now;
+    if (!logs.logs[host]) logs.logs[host] = {};
+    if (!logs.logs[host][url]) {
+        logs.logs[host][url] = { count: 1, lastVisit: now };
+    } else {
+        logs.logs[host][url].count++;
+        logs.logs[host][url].lastVisit = now;
     }
     await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2));
 }
 async function clearLogs() {
     try {
-        await fs.writeFile(LOG_FILE, "{}");
+        await fs.writeFile(LOG_FILE, JSON.stringify({ logs: {}, dnsFilteringEnabled}, null, 2));        
         console.log("Logs Cleared.");
     } catch (err) {
         console.error("Failed To Clear Logs:", err);
@@ -263,8 +314,10 @@ fastify.post("/edit-urls/add", async (req, reply) => {
     const { url, reason } = req.body;
     if (!url || !reason) return reply.code(400).send({ error: "Missing URL Or Reason" });
     await loadBlockedUrls();
-    if (blockedUrls[url]) return reply.code(400).send({ error: "URL Already Exists" });
-    blockedUrls[url] = reason;
+    const host = normalizeHostname(url);
+    if (!host) return reply.code(400).send({ error: "Invalid URL" });
+    if (blockedUrls[host]) return reply.code(400).send({ error: "URL Already Exists" });
+    blockedUrls[host] = reason;
     await saveBlockedUrls();
     reply.send({ success: true, message: "URL Added" });
 });
@@ -273,8 +326,10 @@ fastify.post("/edit-urls/delete", async (req, reply) => {
     const { url } = req.body;
     if (!url) return reply.code(400).send({ error: "Missing URL" });
     await loadBlockedUrls();
-    if (!blockedUrls[url]) return reply.code(404).send({ error: "URL Not Found" });
-    delete blockedUrls[url];
+    const host = normalizeHostname(url);
+    if (!host) return reply.code(400).send({ error: "Invalid URL" });
+    if (!blockedUrls[host]) return reply.code(404).send({ error: "URL Not Found" });
+    delete blockedUrls[host];
     await saveBlockedUrls();
     reply.send({ success: true, message: "URL Removed" });
 });
@@ -292,39 +347,51 @@ fastify.route({
         }
         if (req.method === "GET") return reply.code(200).send(logs);
         if (req.method === "POST") {
-            const { url } = req.body || {};
-            if (!url) return reply.code(400).send({ error: "Missing URL In Body" });
-            let baseUrl;
-            try {
-                baseUrl = new URL(url).origin;
-            } catch {
-                return reply.code(400).send({ error: "Invalid URL" });
-            }
-            const now = new Date().toISOString();
-            if (!logs[baseUrl]) logs[baseUrl] = { count: 1, lastVisit: now };
-            else {
-                logs[baseUrl].count += 1;
-                logs[baseUrl].lastVisit = now;
-            }
-            await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2));
-            return reply.code(200).send({ success: true, url: baseUrl, logs: logs[baseUrl] });
+            return reply.code(403).send({ error: "Manual Logging Disabled" });
         }
     },
+});
+fastify.post("/scramjet/toggle", async (req, reply) => {
+    if (!requireAdmin(req, reply)) return;
+    let logs = {};
+    try {
+        logs = JSON.parse(await fs.readFile(LOG_FILE, "utf-8"));
+    } catch {}
+    dnsFilteringEnabled = !dnsFilteringEnabled;
+    logs.dnsFilteringEnabled = dnsFilteringEnabled;
+    await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2));
+    reply.send({
+        success: true,
+        dnsFilteringEnabled
+    });
 });
 fastify.post("/scramjet/url", async (req, reply) => {
     try {
         const { url } = req.body;
         if (!url) return reply.code(400).send({ error: "Missing URL In Body" });
         await loadBlockedUrls();
-        if (blockedUrls[url]) return reply.code(403).send(`<h1>Blocked</h1><p>${blockedUrls[url]}</p>`);
         let validatedUrl;
         try {
             validatedUrl = new URL(url);
         } catch {
             return reply.code(400).send({ error: "Invalid URL" });
         }
-        await logUrlVisit(validatedUrl.toString());
+        validatedUrl = applySafeSearch(validatedUrl);
+        const host = normalizeHostname(validatedUrl.toString());
+        if (!host) return reply.code(400).send({ error: "Invalid Host" });
+        const blockReason = isBlockedHost(host);
+        if (blockReason) {
+            const label = dnsFilteringEnabled ? "DNS Blocked" : "Blocked";
+            return reply.code(403).send(`<h1>${label}</h1><p>${blockReason}</p>`);
+        }
         const response = await fetch(validatedUrl.toString());
+        const finalHost = normalizeHostname(response.url);
+        if (!finalHost) return reply.code(400).send({ error: "Invalid Redirect Host" });
+        const redirectBlock = isBlockedHost(finalHost);
+        if (redirectBlock) {
+            return reply.code(403).send(`<h1>Blocked After Redirect</h1><p>${redirectBlock}</p>`);
+        }
+        await logUrlVisit(response.url);
         let body = await response.text();
         body = body.replace(
             /<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi,
@@ -365,7 +432,6 @@ fastify.post("/scramjet/url", async (req, reply) => {
                 </script>
                 <base href="${baseUrl}/">`
         );
-        body = body.replace(/<head([^>]*)>/i, `<head$1><base href="${baseUrl}/">`);
         reply
         .code(response.status)
         .headers(headers)
@@ -420,24 +486,20 @@ function shutdown() {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 scheduleDailyLogClear();
-loadBlockedUrls();
-cloneOrPullRepo().catch((err) => console.error("Initial Sync Failed:", err));
+await loadBlockedUrls();
+await cloneOrPullRepo().catch((err) => console.error("Initial Sync Failed:", err));
 let port = parseInt(process.env.PORT || "");
 if (isNaN(port)) port = 8080;
-fastify.listen({ port, host: "0.0.0.0" }, () => {
-    const address = fastify.server.address();
-    console.log("Listening On:");
-    console.log(`\thttp://localhost:${address.port}`);
-    console.log(`\thttp://${hostname()}:${address.port}`);
-    console.log(
-        `\thttp://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${
-            address.port
-        }`
-    );
-});
-process.on("exit", (code) => {
-    if (code === 137) {
-        console.log("Restarting after OOM...");
-        exec(`node src/index.js`);
-    }
+loadSettings().then(() => {
+    fastify.listen({ port, host: "0.0.0.0" }, () => {
+        const address = fastify.server.address();
+        console.log("Listening On:");
+        console.log(`\thttp://localhost:${address.port}`);
+        console.log(`\thttp://${hostname()}:${address.port}`);
+        console.log(
+            `\thttp://${address.family === "IPv6" ? `[${address.address}]` : address.address}:${
+                address.port
+            }`
+        );
+    });
 });
