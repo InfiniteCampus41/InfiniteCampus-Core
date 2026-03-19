@@ -32,6 +32,9 @@ const ADMIN_PASSWORDS = (process.env.ADMIN_PASSWORDS || "")
 let dnsFilteringEnabled = true;
 function normalizeHostname(input) {
     try {
+        if (!/^https?:\/\//i.test(input)) {
+            input = "https://" + input;
+        }
         return new URL(input).hostname.toLowerCase().replace(/\.$/, "");
     } catch {
         return null;
