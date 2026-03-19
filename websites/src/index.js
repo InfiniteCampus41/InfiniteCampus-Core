@@ -184,8 +184,8 @@ async function saveBlockedUrls() {
     await fs.writeFile(URLS_FILE, JSON.stringify(blockedUrls, null, 2));
 }
 async function logUrlVisit(url) {
-    if (!isPageRequest(url)) return;
     let logs = {};
+    console.log("Attempting to log:", url);
     try {
         logs = JSON.parse(await fs.readFile(LOG_FILE, "utf-8"));
     } catch {}
@@ -202,6 +202,7 @@ async function logUrlVisit(url) {
         logs.logs[host][url].lastVisit = now;
     }
     await fs.writeFile(LOG_FILE, JSON.stringify(logs, null, 2));
+    console.log("Logged URL:", url);
 }
 async function clearLogs() {
     try {
@@ -245,29 +246,25 @@ const fastify = Fastify({
 fastify.addHook("onSend", async (req, reply, payload) => {
     reply.header(
         "Content-Security-Policy",
-        `
-        default-src * data: blob: 'unsafe-inline' 'unsafe-eval';
-        script-src * data: blob: 'unsafe-inline' 'unsafe-eval';
-        worker-src * blob:;
-        connect-src *;
-        img-src * data: blob:;
-        frame-src *;
-        style-src * 'unsafe-inline';
-        `
+        `default-src * data: blob: 'unsafe-inline' 'unsafe-eval';
+         script-src * data: blob: 'unsafe-inline' 'unsafe-eval';
+         worker-src * blob:;
+         connect-src *;
+         img-src * data: blob:;
+         frame-src *;
+         style-src * 'unsafe-inline';`
         .replace(/\s+/g, " ")
     );
+    if (req.url.startsWith("/scram/sw.js")) {
+        reply.header("Service-Worker-Allowed", "/");
+        reply.header("Cache-Control", "no-store");
+    }
     return payload;
 });
 fastify.register(fastifyStatic, { root: publicPath, decorateReply: true });
 fastify.register(fastifyStatic, { root: scramjetPath, prefix: "/scram/", decorateReply: false });
 fastify.register(fastifyStatic, { root: libcurlPath, prefix: "/libcurl/", decorateReply: false });
 fastify.register(fastifyStatic, { root: baremuxPath, prefix: "/baremux/", decorateReply: false });
-fastify.addHook("onSend", async (req, reply, payload) => {
-    if (req.url.startsWith("/scram/sw.js")) {
-        reply.header("Service-Worker-Allowed", "/");
-        reply.header("Cache-Control", "no-store");
-    }
-});
 fastify.get("/", (req, reply) => {
     reply.sendFile("index.html");
 });
@@ -381,6 +378,7 @@ fastify.post("/scramjet/url", async (req, reply) => {
         }
         validatedUrl = applySafeSearch(validatedUrl);
         const host = normalizeHostname(validatedUrl.toString());
+        logUrlVisit(validatedUrl.toString()).catch(() => {});
         if (!host) return reply.code(400).send({ error: "Invalid Host" });
         const blockReason = isBlockedHost(host);
         if (blockReason) {
@@ -394,7 +392,9 @@ fastify.post("/scramjet/url", async (req, reply) => {
         if (redirectBlock) {
             return reply.code(403).send(`<h1>Blocked After Redirect</h1><p>${redirectBlock}</p>`);
         }
-        await logUrlVisit(response.url);
+        logUrlVisit(response.url).catch(err =>
+            console.error("Logging failed:", err)
+        );        
         let body = await response.text();
         body = body.replace(
             /<meta[^>]+http-equiv=["']Content-Security-Policy["'][^>]*>/gi,
@@ -435,7 +435,7 @@ fastify.post("/scramjet/url", async (req, reply) => {
                 </script>
                 <base href="${baseUrl}/">`
         );
-        reply
+        return reply
         .code(response.status)
         .headers(headers)
         .header("Content-Type", contentType)
@@ -475,7 +475,9 @@ fastify.post("/scramjet/url", async (req, reply) => {
         )
         .send(body);
     } catch (err) {
-        reply.code(500).send({ error: err.message });
+        if (!reply.sent && !reply.raw.headersSent) {
+            reply.code(500).send({ error: err.message });
+        }
     }
 });
 fastify.setNotFoundHandler((req, reply) => {
