@@ -116,6 +116,7 @@ const uploadPfp = multer({
         cb(null, true);
     }
 });
+let vm;
 let testEnabled = false;
 if (!admin.apps.length) {
     admin.initializeApp({
@@ -389,6 +390,7 @@ app.post("/check_pass", (req, res) => {
 });
 function requireAdminPassword(req, res, next) {
     const adminRoutes = [
+        `hyperadminvm`,
         `/api/movies-json`,
         `/api/list_apply_${UNIQUE_SUFFIX}`,
         `/delete/${UNIQUE_SUFFIX}`,
@@ -1603,6 +1605,125 @@ app.get(ROUTES.STREAM_APPLY, (req, res) => {
     } catch (e) {
         console.error(e);
         res.status(500).send("Server Error");
+    }
+});
+const sessions = new Map();
+const creating = new Map();
+let lastCreateTime = 0;
+const CREATE_COOLDOWN = 1500;
+async function createVM(apiKey) {
+    const now = Date.now();
+    if (now - lastCreateTime < CREATE_COOLDOWN) {
+        await new Promise(r => setTimeout(r, CREATE_COOLDOWN));
+    }
+    lastCreateTime = Date.now();
+    const resp = await axios.post(
+        "https://engine.hyperbeam.com/v0/vm",
+        {},
+        {
+            headers: {
+                Authorization: `Bearer ${apiKey}`,
+            },
+        }
+    );
+    return resp.data;
+}
+app.get("/hypervm", async (req, res) => {
+    const uid = req.query.uid;
+    if (!uid) {
+        return res.status(400).send("Missing uid");
+    }
+    try {
+        let session = sessions.get(uid);
+        if (session) {
+            session.lastActive = Date.now();
+            return res.json(session.vm);
+        }
+        if (creating.has(uid)) {
+            const vm = await creating.get(uid);
+            return res.json(vm);
+        }
+        const createPromise = createVM(process.env.HB_API_KEY);
+        creating.set(uid, createPromise);
+        const vm = await createPromise;
+        creating.delete(uid);
+        session = {
+            vm,
+            lastActive: Date.now(),
+            timer: null
+        };
+        sessions.set(uid, session);
+        session.timer = setTimeout(async () => {
+            try {
+                await axios.delete(
+                    `https://engine.hyperbeam.com/v0/vm/${vm.session_id}`,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${process.env.HB_API_KEY}`,
+                        },
+                    }
+                );
+                console.log(`Deleted VM for ${uid}`);
+            } catch (e) {
+                console.error("Delete failed:", e.message);
+            }
+            sessions.delete(uid);
+        }, 30 * 60 * 1000);
+        console.log("Created VM for:", uid);
+        res.json(vm);
+    } catch (err) {
+        creating.delete(uid);
+        console.error(err.response?.data || err.message);
+        res.status(500).send("Failed to create VM");
+    }
+});
+app.get("/hyperadminvm", async (req, res) => {
+    const uid = req.query.uid;
+    if (!uid) {
+        return res.status(400).send("Missing uid");
+    }
+    try {
+        let session = sessions.get("admin_" + uid);
+        if (session) {
+            session.lastActive = Date.now();
+            return res.json(session.vm);
+        }
+        if (creating.has("admin_" + uid)) {
+            const vm = await creating.get("admin_" + uid);
+            return res.json(vm);
+        }
+        const createPromise = createVM(process.env.HB_API_TEST_KEY);
+        creating.set("admin_" + uid, createPromise);
+        const vm = await createPromise;
+        creating.delete("admin_" + uid);
+        session = {
+            vm,
+            lastActive: Date.now(),
+            timer: null
+        };
+        sessions.set("admin_" + uid, session);
+        session.timer = setTimeout(async () => {
+            try {
+                await axios.delete(
+                    `https://engine.hyperbeam.com/v0/vm/${vm.session_id}`,
+                    {
+                        headers: {
+                            Authorization: `Bearer ${process.env.HB_API_TEST_KEY}`,
+                        },
+                    }
+                );
+                console.log(`Deleted ADMIN VM for ${uid}`);
+            } catch (e) {
+                console.error("Delete failed:", e.message);
+            }
+            sessions.delete("admin_" + uid);
+        }, 30 * 60 * 1000);
+        console.log("Created ADMIN VM for:", uid);
+        res.json(vm);
+    } catch (err) {
+        creating.delete("admin_" + uid);
+        console.error(err.response?.data || err.message);
+        res.status(500).send("Failed to create admin VM");
     }
 });
 app.post("/discordVerify", async (req, res) => {
