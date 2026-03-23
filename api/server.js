@@ -2133,12 +2133,28 @@ function listMovies() {
     return list;
 }
 function loadApplyJSON() {
-    if (!fs.existsSync(APPLY_JSON)) return {};
-    try {
-        return JSON.parse(fs.readFileSync(APPLY_JSON, "utf8"));
-    } catch {
-        return {};
+    let data = {};
+    if (fs.existsSync(APPLY_JSON)) {
+        try {
+            data = JSON.parse(fs.readFileSync(APPLY_JSON, "utf8"));
+        } catch {
+            data = {};
+        }
     }
+    const files = new Set(
+        fs.readdirSync(APPLY_DIR).filter(f => !f.endsWith(".json"))
+    );
+    let changed = false;
+    for (const movieName of Object.keys(data)) {
+        if (!files.has(movieName)) {
+            delete data[movieName];
+            changed = true;
+        }
+    }
+    if (changed) {
+        fs.writeFileSync(APPLY_JSON, JSON.stringify(data, null, 2));
+    }
+    return data;
 }
 function loadMoviesJSON() {
     if (!fs.existsSync(MOVIES_JSON)) return {};
@@ -2414,11 +2430,20 @@ function toggleLockdown() {
 function updateApply(movieName, newData) {
     const data = loadApplyJSON();
     if (!data[movieName]) {
-        data[movieName] = {};
+        const existingIds = Object.values(data)
+            .map(v => v.id)
+            .filter(id => typeof id === "number");
+        const nextId = existingIds.length > 0
+            ? Math.max(...existingIds) + 1
+            : 1;
+        data[movieName] = {
+            id: nextId
+        };
     }
     data[movieName] = {
         ...data[movieName],
         ...newData,
+        id: data[movieName].id,
         eta: newData.eta !== undefined
             ? newData.eta
             : data[movieName].eta ?? null
