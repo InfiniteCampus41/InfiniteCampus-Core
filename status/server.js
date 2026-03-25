@@ -7,37 +7,6 @@ admin.initializeApp({
     databaseURL: "https://status-ba6c4-default-rtdb.firebaseio.com"
 });
 const db = admin.database();
-function hourKeyUTC(date = new Date()) {
-    return (
-        date.getUTCFullYear() +
-        "-" +
-        String(date.getUTCMonth() + 1).padStart(2, "0") +
-        "-" +
-        String(date.getUTCDate()).padStart(2, "0") +
-        "-" +
-        String(date.getUTCHours()).padStart(2, "0")
-    );
-}
-async function safeFetch(url) {
-    try {
-        const res = await axios.get(url, {
-            timeout: 7000,
-            headers: { "User-Agent": "StatusMonitor" },
-            validateStatus: () => true
-        });
-        if (res.status >= 400) return false;
-        const html = typeof res.data === "string" ? res.data.toLowerCase() : "";
-        if (
-            html.includes("there isn't a github pages site here") ||
-            html.includes("github pages site not found") ||
-            (html.includes("404") && html.includes("github"))
-        ) return false;
-        return true;
-    } catch (err) {
-        console.log("NETWORK ERROR:", url, err.code || err.message);
-        return false;
-    }
-}
 let running = false;
 async function checkSites() {
     if (running) return;
@@ -89,6 +58,37 @@ async function checkSites() {
         }
     }
     running = false;
+}
+function hourKeyUTC(date = new Date()) {
+    return (
+        date.getUTCFullYear() +
+        "-" +
+        String(date.getUTCMonth() + 1).padStart(2, "0") +
+        "-" +
+        String(date.getUTCDate()).padStart(2, "0") +
+        "-" +
+        String(date.getUTCHours()).padStart(2, "0")
+    );
+}
+async function safeFetch(url) {
+    try {
+        const res = await axios.get(url, {
+            timeout: 7000,
+            headers: { "User-Agent": "StatusMonitor" },
+            validateStatus: () => true
+        });
+        if (res.status >= 400) return false;
+        const html = typeof res.data === "string" ? res.data.toLowerCase() : "";
+        if (
+            html.includes("there isn't a github pages site here") ||
+            html.includes("github pages site not found") ||
+            (html.includes("404") && html.includes("github"))
+        ) return false;
+        return true;
+    } catch (err) {
+        console.log("NETWORK ERROR:", url, err.code || err.message);
+        return false;
+    }
 }
 app.get("/", (req, res) => {
     res.send("Status Monitor Running");

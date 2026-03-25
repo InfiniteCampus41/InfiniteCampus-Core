@@ -11,7 +11,6 @@ const WEBHOOKS = {
     2: "REDACTED",
     3: null
 };
-
 const colors = {
     reset: "\x1b[0m",
     red: "\x1b[31m",
@@ -57,17 +56,6 @@ function saveURLs() {
 }
 function sortURLs() {
     URLS.sort((a, b) => a.order - b.order);
-}
-function renderBox({ url }, index, result) {
-    let statusColor = colors.green;
-    if (!result.up) statusColor = colors.red;
-    else if (result.latency > 500) statusColor = colors.yellow;
-    return [
-        `${statusColor}╔${"═".repeat(BOX_WIDTH - 2)}╗${colors.reset}`,
-        `${statusColor}║${colors.reset} ${index + 1}. ${result.up ? "UP" : "DN"} ${url.slice(0, BOX_WIDTH - 10).padEnd(BOX_WIDTH - 10)}${statusColor}║${colors.reset}`,
-        `${statusColor}║${colors.reset} ${result.latency}ms | ${result.status}`.padEnd(BOX_WIDTH - 1) + `${statusColor}║${colors.reset}`,
-        `${statusColor}╚${"═".repeat(BOX_WIDTH - 2)}╝${colors.reset}`
-    ];
 }
 let previous = {};
 let downCount = {};

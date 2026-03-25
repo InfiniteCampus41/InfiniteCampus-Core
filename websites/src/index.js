@@ -48,10 +48,6 @@ function isBlockedHost(host) {
     }
     return null;
 }
-function isPageRequest(url) {
-    const pathname = new URL(url).pathname.toLowerCase();
-    return !pathname.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|webp|mp4|mp3|woff|woff2|ttf)$/);
-}
 function applySafeSearch(urlObj) {
     const host = urlObj.hostname;
     if (host.includes("google.")) {

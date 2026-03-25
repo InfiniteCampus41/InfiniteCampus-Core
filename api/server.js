@@ -466,52 +466,67 @@ app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
 });
 app.get(ROUTES.LIST_APPLY, (req, res) => {
     try {
-        const files = fs.readdirSync(APPLY_DIR)
-            .filter(f => !f.endsWith(".json"));
-        const list = files.map(file => {
+        const diskFiles = new Set(
+            fs.readdirSync(APPLY_DIR).filter(f => !f.endsWith(".json"))
+        );
+        let applyDataRaw = {};
+        try {
+            if (fs.existsSync(APPLY_JSON)) {
+                applyDataRaw = JSON.parse(fs.readFileSync(APPLY_JSON, "utf8"));
+            }
+        } catch (e) {
+            console.error("Failed to read apply.json:", e);
+        }
+        let applyData = [];
+        if (applyDataRaw && typeof applyDataRaw === "object") {
+            applyData = Object.entries(applyDataRaw).map(([file, data]) => ({
+                file,
+                ...data
+            }));
+        }
+        const allFiles = new Set([
+            ...diskFiles,
+            ...applyData.map(a => a.file || a.filename).filter(Boolean),
+            ...acceptStatus.keys()
+        ]);
+        const list = Array.from(allFiles).map(file => {
             const full = path.join(APPLY_DIR, file);
-            const stats = fs.statSync(full);
+            let stats = null;
+            if (fs.existsSync(full)) {
+                try {
+                    stats = fs.statSync(full);
+                } catch {}
+            }
             const statusObj = acceptStatus.get(file);
             let status = "idle";
             let percent = null;
             if (statusObj) {
-                status = statusObj.status || "idle";
+                status = statusObj.status || "processing";
                 if (statusObj.percent !== undefined) {
                     percent = String(Math.round(statusObj.percent));
                 }
             }
-            let uploadedBy = null;
-            const jsonPath = path.join(APPLY_DIR, `${file}.json`);
-            if (fs.existsSync(jsonPath)) {
-                try {
-                    const raw = fs.readFileSync(jsonPath, "utf8");
-                    const parsed = JSON.parse(raw);
-                    uploadedBy = parsed.uploadedBy || null;
-                } catch (err) {
-                    console.error("Failed To Read Metadata For", file, err);
-                }
-            }
+            const applyEntry = applyData.find(a =>
+                a.file === file || a.filename === file
+            );            
             return {
                 file,
-                size: stats.size,
-                mtime: stats.mtime,
-                humanSize: formatBytes(stats.size),
+                size: stats?.size || applyEntry?.size || 0,
+                mtime: stats?.mtime || null,
+                humanSize: stats ? formatBytes(stats.size) : "Processing...",
                 status,
                 percent,
-                uploadedBy
+                uploadedBy: applyEntry?.uploader || null
             };
         });
-        const applyData = loadApplyJSON();
         res.json({
             ok: true,
             files: list,
-            apply: applyData
+            apply: applyDataRaw
         });
     } catch (err) {
         console.error(err);
-        res.status(500).json({
-            ok: false
-        });
+        res.status(500).json({ ok: false });
     }
 });
 app.get(ROUTES.LIST_VIDEOS, (req, res) => {
@@ -1600,7 +1615,14 @@ async function finishAccept(movieName) {
         data: { embeds: [embed], components: [] },
         headers: { "Content-Type": "application/json" }
     });
-    deleteApply(movieName);
+    setTimeout(() => {
+        clearCompletedApplies();
+        acceptStatus.delete(movieName);
+        if (acceptIntervals.has(movieName)) {
+            clearInterval(acceptIntervals.get(movieName));
+            acceptIntervals.delete(movieName);
+        }
+    }, 5000);
 }
 async function finishReject(movieName) {
     const msgId = applicantMessages.get(movieName);
@@ -1965,6 +1987,22 @@ async function watchForNewUsers() {
         }
     }, 5000);
 }
+function clearCompletedApplies() {
+    try {
+        let data = {};
+        if (fs.existsSync(APPLY_JSON)) {
+            data = JSON.parse(fs.readFileSync(APPLY_JSON, "utf8"));
+        }
+        for (const movie in data) {
+            if (data[movie]?.status === "Completed") {
+                delete data[movie];
+            }
+        }
+        fs.writeFileSync(APPLY_JSON, JSON.stringify(data, null, 2));
+    } catch (err) {
+        console.error("Failed To Clear Completed Applies:", err);
+    }
+}
 function deleteApply(movieName) {
     const data = loadApplyJSON();
     delete data[movieName];
@@ -2042,15 +2080,6 @@ function formatSize(bytes) {
     }
     const gb = mb / 1024;
     return gb.toFixed(2) + " GB";
-}
-function getFolderSize(folderPath) {
-    const files = fs.readdirSync(folderPath);
-    let total = 0;
-    for (const f of files) {
-        const stats = fs.statSync(path.join(folderPath, f));
-        if (stats.isFile()) total += stats.size;
-    }
-    return total;
 }
 function getNextOrder(moviesJson) {
     const orders = Object.values(moviesJson).map(m => m.order);
@@ -2472,6 +2501,7 @@ setInterval(async () => {
 }, 1000);
 setInterval(() => {
     pruneOldLogs();
+    clearCompletedApplies();
 }, 10 * 1000);
 setInterval(() => {
     const now = Date.now();

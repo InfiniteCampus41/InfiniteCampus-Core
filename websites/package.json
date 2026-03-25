@@ -1,7 +1,7 @@
 {
-	"name": "icprxy",
+	"name": "infinite-campus-site",
 	"version": "2.0.0",
-	"description": "icprxy",
+	"description": "This Is The Server For The Infinite Capus Site",
 	"type": "module",
 	"engines": {
 		"npm": ">=7.0.0",
