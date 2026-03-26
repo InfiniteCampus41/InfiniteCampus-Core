@@ -766,8 +766,71 @@ app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
         return res.json({ ok: false, message: err.message });
     }
 });
-app.post("/checkout", async (req, res) => {
-    const { uid, amount } = req.body;
+app.post("/changename", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        let { displayName } = req.body;
+        if (!displayName) {
+            return res.statusCode(400).json({ error: "Missing Display Name"});
+        }
+        const testerSnap = await admin.database().ref(`users/${uid}/profile/isTester`).get();
+        const ownerSnap = await admin.database().ref(`users/${uid}/profile/isOwner`).get();
+        const isTester = testerSnap.exists() && testerSnap.val() === true;
+        const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
+        if (isOwner || isTester) {
+            displayName = displayName;
+        } else {
+            displayName = displayName.trim();
+            if (displayName.length > 20) {
+                return res.status(400).json({ error: "Too Many Charachters (Max 20)"})
+            }
+            const valid = /^[a-zA-Z0-9 _.\-!@#$%^&*()+=\[\]{};:'",<>/?\\|`~]+$/;
+            if (!valid.test(displayName)) {
+                return res.status(400).json({ error: "Invalid characters" });
+            }
+        }
+        await admin.auth().updateUser(uid, {
+            displayName
+        });
+        await admin.database().ref(`users/${uid}/profile`).update({
+            displayName
+        });
+        res.json({ success: true, displayName });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed To Update Display Name" });
+    }
+});
+app.post("/changebio", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        let { bio } = req.body;
+        if (!bio) {
+            return res.statusCode(400).json({ error: "Missing Bio"});
+        }
+        const testerSnap = await admin.database().ref(`users/${uid}/profile/isTester`).get();
+        const ownerSnap = await admin.database().ref(`users/${uid}/profile/isOwner`).get();
+        const isTester = testerSnap.exists() && testerSnap.val() === true;
+        const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
+        if (isOwner || isTester) {
+            bio = bio;
+        } else {
+            if (bio.length > 50) {
+                return res.status(400).json({ error: "Too Many Charachters (Max 50)"})
+            }
+        }
+        await admin.database().ref(`users/${uid}/profile`).update({
+            bio
+        });
+        res.json({ success: true, bio });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed To Update Bio" });
+    }
+});
+app.post("/checkout", verifyFirebaseToken, async (req, res) => {
+    const uid = req.user.uid;
+    const { amount } = req.body;
     const cents = Math.round(amount * 100);
     const session = await stripe.checkout.sessions.create({
         mode: "payment",
@@ -806,11 +869,11 @@ app.post("/check_pass", (req, res) => {
     console.log("Password Incorrect");
     return res.status(401).json({ status: "invalid" });
 });
-app.post("/discordVerify", async (req, res) => {
+app.post("/discordVerify", verifyFirebaseToken, async (req, res) => {
     try {
         const { username, uid } = req.body;
         if (!username || !uid) {
-            return res.status(400).json({ error: "Missing Username Or uid" });
+            return res.status(400).json({ error: "Missing Username Or Uid" });
         }
         const GUILD_ID = process.env.DISCORD_GUILD_ID;
         const response = await axios.get(
@@ -1156,7 +1219,7 @@ app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (re
         }
     }
 );
-app.post("/upload-pfp", uploadPfp.single("file"), async (req, res) => {
+app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (req, res) => {
     try {
         const { uid } = req.body;
         const file = req.file;
@@ -1253,7 +1316,7 @@ app.post("/upload-pfp", uploadPfp.single("file"), async (req, res) => {
 });
 app.post("/uploadthis", async (req, res) => {
     if (LOCKDOWN) return res.status(403).json({ error: "Uploads Locked Down" });
-    const userId = req.headers["x-user-id"];
+    const userId = req.user.uid;
     let maxAllowedSize = MAX_SIZE_NON_PREMIUM;
     if (userId) {
         try {
@@ -1965,6 +2028,20 @@ async function startAcceptProcess(movieName) {
             }
         }
     }, 60000);
+}
+async function verifyFirebaseToken(req, res, next) {
+    const header = req.headers.authorization || "";
+    const token = header.split("Bearer ")[1];
+    if (!token) {
+        return res.status(401).json({ error: "No Token Provided" });
+    }
+    try {
+        const decoded = await admin.auth().verifyIdToken(token);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: "Invalid Token" });
+    }
 }
 async function watchForNewUsers() {
     const snap = await db.ref("users").once("value");
