@@ -87,7 +87,7 @@ const APPLY_JSON = path.join(__dirname, "apply.json");
 const AUTO_DELETE_MS = 5 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
 const client = new Client({
-    environment: Environment.Sandbox,
+    environment: Environment.Production,
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
 });
 const CREATE_COOLDOWN = 1500;
