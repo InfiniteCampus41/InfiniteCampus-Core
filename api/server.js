@@ -1,8 +1,10 @@
 import admin from "firebase-admin";
 import axios from "axios";
 import child_process from "child_process";
+import { Client, Environment, WebhooksHelper } from "square";
 import cors from "cors";
 import { createServer } from "http";
+import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
 import fetch from "node-fetch";
@@ -16,7 +18,6 @@ import readline from "readline";
 import sanitize from "sanitize-filename";
 import { Server as IOServer } from "socket.io";
 import { spawn } from "child_process";
-import Stripe from "stripe";
 import util from "util";
 dotenv.config();
 const app = express();
@@ -30,6 +31,37 @@ app.use((req, res, next) => {
     next();
 });
 app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: [ "Content-Type", "Authorization", "ngrok-skip-browser-warning", "x-admin-password", "fileId", "chunkIndex", "totalChunks", "filename", "x-user-id", "X-File-Id", "X-Chunk-Number", "X-Total-Chunks", "X-User-Id", "uploadedby"]}));
+const SQUARE_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
+const SQUARE_WEBHOOK_URL = "https://api.infinitecampus.xyz/square-webhook";
+app.post("/square-webhook",
+    express.raw({ type: "application/json" }),
+    async (req, res) => {
+        try {
+            const signature = req.headers['x-square-hmacsha256-signature'];
+            const isValid = WebhooksHelper.isValidWebhookEventSignature(
+                req.body,
+                signature,
+                SQUARE_SIGNATURE_KEY,
+                SQUARE_WEBHOOK_URL
+            );
+            if (!isValid) {
+                console.log("Webhook Signature Verification Failed.");
+                return res.sendStatus(403);
+            }
+            const event = JSON.parse(req.body.toString());
+            if (event.type === "payment.created") {
+                const payment = event.data.object.payment;
+                const uid = payment.note;
+                const amount = payment.amount_money.amount;
+                if (uid) await grantPremium(uid, amount);
+            }
+            res.sendStatus(200);
+        } catch (err) {
+            console.error("Error Processing Square Webhook:", err);
+            res.sendStatus(500);
+        }
+    }
+);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname, "public")));
@@ -54,6 +86,10 @@ const APPLY_DIR = path.join(__dirname, "apply");
 const APPLY_JSON = path.join(__dirname, "apply.json");
 const AUTO_DELETE_MS = 5 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
+const client = new Client({
+    environment: Environment.Sandbox,
+    accessToken: process.env.SQUARE_ACCESS_TOKEN,
+});
 const CREATE_COOLDOWN = 1500;
 const creating = new Map();
 const db = admin.database();
@@ -127,7 +163,6 @@ const storageApply = multer.diskStorage({
     destination: (req, file, cb) => cb(null, APPLY_DIR),
     filename: (req, file, cb) => cb(null, safeName(file.originalname)),
 });
-const stripe = new Stripe(process.env.STRIPE_SECRET);
 const tempUploadActivity = new Map();
 const TEMP_UPLOAD_TIMEOUT = 3 * 60 * 60 * 1000;
 const uploadApply = multer({
@@ -828,29 +863,6 @@ app.post("/changebio", verifyFirebaseToken, async (req, res) => {
         res.status(500).json({ error: "Failed To Update Bio" });
     }
 });
-app.post("/checkout", verifyFirebaseToken, async (req, res) => {
-    const uid = req.user.uid;
-    const { amount } = req.body;
-    const cents = Math.round(amount * 100);
-    const session = await stripe.checkout.sessions.create({
-        mode: "payment",
-        payment_method_types: ["card"],
-        line_items: [{
-            price_data: {
-                currency: "usd",
-                product_data: { name: "Infinite Campus Premium" },
-                unit_amount: cents
-            },
-            quantity: 1
-        }],
-        metadata: {
-            firebaseUID: uid
-        },
-        success_url: `https://www.infinitecampus.xyz/InfiniteDonaters.html?success.${amount}`,
-        cancel_url: "https://www.infinitecampus.xyz/InfiniteDonaters.html?cancel"
-    });
-    res.json({ id: session.id });
-});
 app.post("/check_pass", (req, res) => {
     const pass = req.body.password;
     if (!pass) {
@@ -1099,6 +1111,38 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
         res.status(500).json({ ok: false, message: err.message });
     }
 });
+app.post("/pay", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { token, amount } = req.body;
+        if (!token || !amount) {
+            return res.status(400).json({ error: "Missing Token Or Amount" });
+        }
+        const response = await client.paymentsApi.createPayment({
+            sourceId: token,
+            idempotencyKey: crypto.randomUUID(),
+            amountMoney: {
+                amount,
+                currency: "USD",
+            },
+            locationId: process.env.SQUARE_LOCATION_ID,
+            note: uid,
+        });
+        const safeResult = JSON.parse(
+            JSON.stringify(response.result, (_, value) =>
+                typeof value === "bigint" ? value.toString() : value
+            )
+        );
+        res.json(safeResult);
+    } catch (err) {
+        console.error("Payment Error:", err);
+        if (err instanceof Error) {
+            res.status(500).json({ error: err.message });
+        } else {
+            res.status(500).json({ error: "Unknown Error" });
+        }
+    }
+});
 app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (req, res) => {
     const { message, channelId } = req.body;
     const file = req.file;
@@ -1145,29 +1189,6 @@ app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (re
         console.error("Discord Error:", err.response?.data || err.message);
         res.status(500).send("Failed To Send Message");
     }
-});
-app.post("/stripe-webhook",
-    express.raw({ type: "application/json" }),
-    async (req, res) => {
-    const sig = req.headers["stripe-signature"];
-    let event;
-    try {
-        event = stripe.webhooks.constructEvent(
-            req.body,
-            sig,
-            process.env.STRIPE_WEBHOOK_SECRET
-        );
-    } catch (err) {
-        console.log("Webhook signature failed.");
-        return res.sendStatus(400);
-    }
-    if (event.type === "checkout.session.completed") {
-        const session = event.data.object;
-        const uid = session.metadata.firebaseUID;
-        const amount = session.amount_total;
-        await grantPremium(uid, amount);
-    }
-    res.sendStatus(200);
 });
 app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (req, res) => {
     const { channelId } = req.body;
