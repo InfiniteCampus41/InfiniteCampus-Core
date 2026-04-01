@@ -165,6 +165,7 @@ const storageApply = multer.diskStorage({
 });
 const tempUploadActivity = new Map();
 const TEMP_UPLOAD_TIMEOUT = 3 * 60 * 60 * 1000;
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const uploadApply = multer({
     storage: storageApply,
     limits: { fileSize: MAX_FILE_BYTES },
@@ -1676,6 +1677,34 @@ async function discordRequestForce({ method = "get", url, headers = {}, data = n
     };
     return enqueueDiscordRequest(config);
 }
+async function findMovieId(movieName) {
+    try {
+        const searchRes = await fetch(
+            `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&query=${encodeURIComponent(movieName)}`
+        );
+        const searchData = await searchRes.json();
+        if (!searchData.results || searchData.results.length === 0) {
+            return { id: null, cover: null, vote_average: null };
+        }
+        const bestMatch = searchData.results[0];
+        let coverUrl = null;
+        if (bestMatch.poster_path) {
+            coverUrl = `https://image.tmdb.org/t/p/w500${bestMatch.poster_path}`;
+        }
+        let rating = null;
+        if (bestMatch.vote_average) {
+            rating = Math.round((bestMatch.vote_average / 2) * 10) / 10;
+        }
+        return {
+            id: bestMatch.id,
+            cover: coverUrl,
+            rating: rating
+        };
+    } catch (err) {
+        console.error(err);
+        return { id: null, cover: null, rating: null };
+    }
+}
 async function finishAccept(movieName) {
     const msgId = applicantMessages.get(movieName);
     if (!msgId) return;
@@ -1841,8 +1870,8 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
                     });
                     const pct = Math.round(percent);
                     const etaText = formatETA(remainingSec);
-                    pinnedAcceptLine =
-                        `ACCEPTING: ${filenameLabel} | ${humanLabel} | ${pct}% | ETA ${etaText}`;
+                    // pinnedAcceptLine =
+                        // `ACCEPTING: ${filenameLabel} | ${humanLabel} | ${pct}% | ETA ${etaText}`;
                     renderPinnedAccept();
                     socket.emit("jobProgress", {
                         workId,
@@ -1860,7 +1889,7 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
         });
         ff.on("close", (code) => {
             if (code === 0) {
-                pinnedAcceptLine = `ACCEPT COMPLETE: ${filenameLabel}`;
+                // pinnedAcceptLine = `ACCEPT COMPLETE: ${filenameLabel}`;
                 renderPinnedAccept();
                 setTimeout(() => {
                     pinnedAcceptLine = null;
@@ -2253,7 +2282,10 @@ function listMovies() {
             mtime: stats.mtime,
             humanSize: formatBytes(stats.size),
             order: moviesJson[f]?.order ?? 99999999,
-            uploadedBy: moviesJson[f]?.uploadedBy || "User"
+            uploadedBy: moviesJson[f]?.uploadedBy || "User",
+            db_id: moviesJson[f]?.db_id || null,
+            cover: moviesJson[f]?.cover || null,
+            rating: moviesJson[f]?.rating || null
         };
     });
     list.sort((a, b) => a.order - b.order);
@@ -2513,10 +2545,16 @@ function setupSocketHandlers(ioInstance, label) {
                 } catch (e) {
                     console.error("Failed To Load Uploader Metadata");
                 }
-		        if (!moviesJson[baseName]) {
-    		        moviesJson[baseName] = {
+                const idBasename = path.basename(finalDest, ".mp4");
+                const cleanName = idBasename.replace(/_\d+$/, "");
+                const tmdbData = await findMovieId(cleanName);
+                if (!moviesJson[baseName]) {
+                    moviesJson[baseName] = {
                         order: getNextOrder(moviesJson),
-                        uploadedBy: uploaderUid
+                        uploadedBy: uploaderUid,
+                        db_id: tmdbData.id || null,
+                        cover: tmdbData.cover || null,
+                        rating: tmdbData.rating || null
                     };
                     saveMoviesJSON(moviesJson);
                 }
