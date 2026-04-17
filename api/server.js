@@ -1336,103 +1336,119 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
         res.status(500).json({ error: "Upload Failed" });
     }
 });
-app.post("/uploadthis", async (req, res) => {
+const uploadChunk = multer({ storage: multer.memoryStorage() });
+app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (req, res) => {
     if (LOCKDOWN) return res.status(403).json({ error: "Uploads Locked Down" });
-    const userId = req.user.uid;
-    let maxAllowedSize = MAX_SIZE_NON_PREMIUM;
-    if (userId) {
-        try {
-            const pre1Snap = await admin.database().ref(`users/${userId}/profile/premium1`).get();
-            const pre2Snap = await admin.database().ref(`users/${userId}/profile/premium2`).get();
-            const pre3Snap = await admin.database().ref(`users/${userId}/profile/premium3`).get();
-            const devSnap = await admin.database().ref(`users/${userId}/profile/isDev`).get();
-            const adminSnap = await admin.database().ref(`users/${userId}/profile/isAdmin`).get();
-            const HAdminSnap = await admin.database().ref(`users/${userId}/profile/isHAdmin`).get();
-            const coOwnerSnap = await admin.database().ref(`users/${userId}/profile/isCoOwner`).get();
-            const testerSnap = await admin.database().ref(`users/${userId}/profile/isTester`).get();
-            const ownerSnap = await admin.database().ref(`users/${userId}/profile/isOwner`).get();
-            const partnerSnap = await admin.database().ref(`users/${userId}/profile/isPartner`).get();
-            const isPartner = partnerSnap.exists() && partnerSnap.val() === true;
-            const isPre1 = pre1Snap.exists() && pre1Snap.val() === true;
-            const isPre2 = pre2Snap.exists() && pre2Snap.val() === true;
-            const isPre3 = pre3Snap.exists() && pre3Snap.val() === true;
-            const isDev = devSnap.exists() && devSnap.val() === true;
-            const isAdmin = adminSnap.exists() && adminSnap.val() === true;
-            const isHAdmin = HAdminSnap.exists() && HAdminSnap.val() === true;
-            const isCoOwner = coOwnerSnap.exists() && coOwnerSnap.val() === true;
-            const isTester = testerSnap.exists() && testerSnap.val() === true;
-            const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
-            if (isPre1 || isPre2 || isPre3 || isDev || isAdmin || isHAdmin || isCoOwner || isTester || isOwner || isPartner) {
-                maxAllowedSize = MAX_SIZE_PREMIUM;
+    try {
+        const userId = req.user?.uid;
+        let maxAllowedSize = MAX_SIZE_NON_PREMIUM;
+        if (userId) {
+            try {
+                const [
+                    pre1Snap, pre2Snap, pre3Snap,
+                    devSnap, adminSnap, HAdminSnap,
+                    coOwnerSnap, testerSnap, ownerSnap, partnerSnap
+                ] = await Promise.all([
+                    admin.database().ref(`users/${userId}/profile/premium1`).get(),
+                    admin.database().ref(`users/${userId}/profile/premium2`).get(),
+                    admin.database().ref(`users/${userId}/profile/premium3`).get(),
+                    admin.database().ref(`users/${userId}/profile/isDev`).get(),
+                    admin.database().ref(`users/${userId}/profile/isAdmin`).get(),
+                    admin.database().ref(`users/${userId}/profile/isHAdmin`).get(),
+                    admin.database().ref(`users/${userId}/profile/isCoOwner`).get(),
+                    admin.database().ref(`users/${userId}/profile/isTester`).get(),
+                    admin.database().ref(`users/${userId}/profile/isOwner`).get(),
+                    admin.database().ref(`users/${userId}/profile/isPartner`).get()
+                ]);
+                const isPremium =
+                    (pre1Snap.exists() && pre1Snap.val()) ||
+                    (pre2Snap.exists() && pre2Snap.val()) ||
+                    (pre3Snap.exists() && pre3Snap.val()) ||
+                    (devSnap.exists() && devSnap.val()) ||
+                    (adminSnap.exists() && adminSnap.val()) ||
+                    (HAdminSnap.exists() && HAdminSnap.val()) ||
+                    (coOwnerSnap.exists() && coOwnerSnap.val()) ||
+                    (testerSnap.exists() && testerSnap.val()) ||
+                    (ownerSnap.exists() && ownerSnap.val()) ||
+                    (partnerSnap.exists() && partnerSnap.val());
+                if (isPremium) {
+                    maxAllowedSize = MAX_SIZE_PREMIUM;
+                }
+            } catch (err) {
+                console.error("Premium check failed:", err);
             }
-        } catch (err) {
-            console.error("Firebase Admin SDK Error:", err);
         }
-    }
-    const fileId = req.headers["x-file-id"];
-    const chunkNumber = parseInt(req.headers["x-chunk-number"], 10);
-    const totalChunks = parseInt(req.headers["x-total-chunks"], 10);
-    const originalFilename = req.headers["x-filename"];
-    if (!fileId || isNaN(chunkNumber) || isNaN(totalChunks) || !originalFilename) {
-        return res.status(400).json({ error: "Missing Required Headers For Chunked Upload" });
-    }
-    const tmpDir = path.join(UPLOADS_DIR, "tmp", fileId);
-    await fs.promises.mkdir(tmpDir, { recursive: true });
-    const chunkPath = path.join(tmpDir, `chunk-${chunkNumber}`);
-    const writeStream = fs.createWriteStream(chunkPath);
-    let uploadedBytes = 0;
-    req.on("data", (chunk) => {
-        uploadedBytes += chunk.length;
-        writeStream.write(chunk);
-    });
-    req.on("end", async () => {
-        writeStream.end();
+        const fileId = req.headers["x-file-id"];
+        const chunkNumber = parseInt(req.headers["x-chunk-number"], 10);
+        const totalChunks = parseInt(req.headers["x-total-chunks"], 10);
+        const originalFilename = req.headers["x-filename"];
+        if (!fileId || isNaN(chunkNumber) || isNaN(totalChunks) || !originalFilename) {
+            return res.status(400).json({ error: "Missing Required Headers For Chunked Upload" });
+        }
+        if (!req.file) {
+            return res.status(400).json({ error: "No file chunk received" });
+        }
+        const tmpDir = path.join(UPLOADS_DIR, "tmp", fileId);
+        await fs.promises.mkdir(tmpDir, { recursive: true });
+        const chunkPath = path.join(tmpDir, `chunk-${chunkNumber}`);
+        fs.writeFileSync(chunkPath, req.file.buffer);
         const chunkFiles = fs.readdirSync(tmpDir);
         if (chunkFiles.length === totalChunks) {
-            const finalFilename = `${Date.now()}-${originalFilename}`;
+            const safeName = sanitize(originalFilename);
+            const finalFilename = `${Date.now()}-${safeName}`;
             const finalPath = path.join(UPLOADS_DIR, finalFilename);
             const finalStream = fs.createWriteStream(finalPath);
             for (let i = 1; i <= totalChunks; i++) {
                 const chunkFile = path.join(tmpDir, `chunk-${i}`);
-                const data = fs.readFileSync(chunkFile);
-                finalStream.write(data);
+                await new Promise((resolve, reject) => {
+                    const rs = fs.createReadStream(chunkFile);
+                    rs.on("error", reject);
+                    rs.on("end", resolve);
+                    rs.pipe(finalStream, { end: false });
+                });
                 fs.unlinkSync(chunkFile);
             }
             finalStream.end();
             fs.rmdirSync(tmpDir);
             let deleteDelay = AUTO_DELETE_MS;
             try {
-                const userId = req.headers["x-user-id"];
                 if (userId) {
-                    const pre1Snap = await admin.database().ref(`users/${userId}/profile/premium1`).get();
-                    const pre2Snap = await admin.database().ref(`users/${userId}/profile/premium2`).get();
-                    const pre3Snap = await admin.database().ref(`users/${userId}/profile/premium3`).get();
-                    const devSnap = await admin.database().ref(`users/${userId}/profile/isDev`).get();
-                    const adminSnap = await admin.database().ref(`users/${userId}/profile/isAdmin`).get();
-                    const HAdminSnap = await admin.database().ref(`users/${userId}/profile/isHAdmin`).get();
-                    const coOwnerSnap = await admin.database().ref(`users/${userId}/profile/isCoOwner`).get();
-                    const testerSnap = await admin.database().ref(`users/${userId}/profile/isTester`).get();
-                    const ownerSnap = await admin.database().ref(`users/${userId}/profile/isOwner`).get();
-                    const partnerSnap = await admin.database().ref(`users/${userId}/profile/isPartner`).get();
-                    const isPartner = partnerSnap.exists() && partnerSnap.val() === true;
-                    const isPre1 = pre1Snap.exists() && pre1Snap.val() === true;
-                    const isPre2 = pre2Snap.exists() && pre2Snap.val() === true;
-                    const isPre3 = pre3Snap.exists() && pre3Snap.val() === true;
-                    const isDev = devSnap.exists() && devSnap.val() === true;
-                    const isAdmin = adminSnap.exists() && adminSnap.val() === true;
-                    const isHAdmin = HAdminSnap.exists() && HAdminSnap.val() === true;
-                    const isCoOwner = coOwnerSnap.exists() && coOwnerSnap.val() === true;
-                    const isTester = testerSnap.exists() && testerSnap.val() === true;
-                    const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
-                    if (isPre1 || isPre2 || isPre3 || isDev || isAdmin || isHAdmin || isCoOwner || isTester || isOwner || isPartner) {
+                    const [
+                        pre1Snap, pre2Snap, pre3Snap,
+                        devSnap, adminSnap, HAdminSnap,
+                        coOwnerSnap, testerSnap, ownerSnap, partnerSnap
+                    ] = await Promise.all([
+                        admin.database().ref(`users/${userId}/profile/premium1`).get(),
+                        admin.database().ref(`users/${userId}/profile/premium2`).get(),
+                        admin.database().ref(`users/${userId}/profile/premium3`).get(),
+                        admin.database().ref(`users/${userId}/profile/isDev`).get(),
+                        admin.database().ref(`users/${userId}/profile/isAdmin`).get(),
+                        admin.database().ref(`users/${userId}/profile/isHAdmin`).get(),
+                        admin.database().ref(`users/${userId}/profile/isCoOwner`).get(),
+                        admin.database().ref(`users/${userId}/profile/isTester`).get(),
+                        admin.database().ref(`users/${userId}/profile/isOwner`).get(),
+                        admin.database().ref(`users/${userId}/profile/isPartner`).get()
+                    ]);
+                    const isPremium =
+                        (pre1Snap.exists() && pre1Snap.val()) ||
+                        (pre2Snap.exists() && pre2Snap.val()) ||
+                        (pre3Snap.exists() && pre3Snap.val()) ||
+                        (devSnap.exists() && devSnap.val()) ||
+                        (adminSnap.exists() && adminSnap.val()) ||
+                        (HAdminSnap.exists() && HAdminSnap.val()) ||
+                        (coOwnerSnap.exists() && coOwnerSnap.val()) ||
+                        (testerSnap.exists() && testerSnap.val()) ||
+                        (ownerSnap.exists() && ownerSnap.val()) ||
+                        (partnerSnap.exists() && partnerSnap.val());
+                    if (isPremium) {
                         deleteDelay = AUTO_DELETE_PM_MS;
                     }
                 }
             } catch (err) {
-                console.error("Premium check failed:", err);
+                console.error("Delete timing check failed:", err);
             }
             setTimeout(() => fs.unlink(finalPath, () => {}), deleteDelay);
-            pushUploadLog(finalFilename, uploadedBytes);
+            pushUploadLog(finalFilename, req.file.size);
             return res.json({
                 fileUrl: `${req.protocol}://${req.get("host")}/files/${finalFilename}`,
                 message: "File Uploaded And Combined Successfully"
@@ -1442,12 +1458,10 @@ app.post("/uploadthis", async (req, res) => {
                 message: `Chunk ${chunkNumber} Uploaded Successfully`
             });
         }
-    });
-    req.on("error", (err) => {
-        console.error(err);
-        writeStream.end();
-        res.status(500).json({ error: "Chunk Upload Failed" });
-    });
+    } catch (err) {
+        console.error("Upload Error:", err);
+        res.status(500).json({ error: "Upload Failed" });
+    }
 });
 app.put("/api/movies-json", requireAdminPassword, (req, res) => {
     const pass = req.headers["x-admin-password"];
