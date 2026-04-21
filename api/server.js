@@ -53,7 +53,7 @@ app.post("/square-webhook",
                 const payment = event.data.object.payment;
                 const uid = payment.note;
                 const amount = payment.amount_money.amount;
-                const amountFormatted = amount / 100;
+                const amountDollars = amount / 100;
                 const donationRef = db.ref(`donations/amount`);
                 await donationRef.transaction((current) => {
                     return (current || 0) + amountDollars;
