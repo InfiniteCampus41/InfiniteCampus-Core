@@ -53,7 +53,21 @@ app.post("/square-webhook",
                 const payment = event.data.object.payment;
                 const uid = payment.note;
                 const amount = payment.amount_money.amount;
-                if (uid) await grantPremium(uid, amount);
+                const amountFormatted = amount / 100;
+                const donationRef = db.ref(`donations/amount`);
+                await donationRef.transaction((current) => {
+                    return (current || 0) + amountDollars;
+                });
+                if (uid) {
+                    await grantPremium(uid, amount);
+                    logEvent("payments", {
+                        id: payment.id || `payment_${Date.now()}`,
+                        data: {
+                            author: uid,
+                            amount: `$${(amount / 100).toFixed(2)}`
+                        }
+                    });
+                }
             }
             res.sendStatus(200);
         } catch (err) {
@@ -139,6 +153,8 @@ const memoryUpload = multer({
 });
 const MOVIES_DIR = path.join(__dirname, "movies");
 const MOVIES_JSON = path.join(__dirname, "movies.json");
+const REPORT_JSON = path.join(__dirname, "report.json");
+const ARCHIVE_DIR = path.join(__dirname, "archive");
 const PFP_COOLDOWN_MS = 3 * 60 * 1000;
 const pfpStorage = multer.memoryStorage();
 const pfpUploadCooldown = new Map();
@@ -211,6 +227,7 @@ if (!fs.existsSync(MOVIES_DIR)) fs.mkdirSync(MOVIES_DIR, { recursive: true });
 if (!fs.existsSync(READY_DIR)) fs.mkdirSync(READY_DIR, { recursive: true });
 if (!fs.existsSync(QUEUE_DIR)) fs.mkdirSync(QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(DISCORD_QUEUE_DIR)) fs.mkdirSync(DISCORD_QUEUE_DIR, { recursive: true });
+if (!fs.existsSync(ARCHIVE_DIR)) fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 rl.setPrompt("> ");
 function requireAdminPassword(req, res, next) {
     const adminRoutes = [
@@ -1090,6 +1107,13 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
                         uploader: uploadedBy,
                         timestamp: Date.now()
                     });
+                    logEvent("submitted-movies", {
+                        id: safeFile,
+                        data: {
+                            author: uploadedBy,
+                            accepted: "pending"
+                        }
+                    });
                     res.json({
                         ok: true,
                         filename: safeFile,
@@ -1177,6 +1201,12 @@ app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (re
                 data: formData,
                 headers: formData.getHeaders(),
             });
+            const report = loadReportJSON();
+            const day = new Date().getDate().toString();
+            if (!report.report[day]) report.report[day] = {};
+            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
+            report.report[day]["sent"].count += 2;
+            saveReportJSON(report);
         } else {
             await discordRequest({
                 method: "post",
@@ -1184,6 +1214,12 @@ app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (re
                 data: { content: message },
                 headers: { "Content-Type": "application/json" },
             });
+            const report = loadReportJSON();
+            const day = new Date().getDate().toString();
+            if (!report.report[day]) report.report[day] = {};
+            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
+            report.report[day]["sent"].count++;
+            saveReportJSON(report);
         }
         res.status(200).send("Message Sent");
     } catch (err) {
@@ -1227,6 +1263,12 @@ app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (re
                 url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
                 data: formData,
                 headers: formData.getHeaders(),
+            });
+            logEvent("file-uploads", {
+                id: `file_${Date.now()}`,
+                data: {
+                    author: req.headers["x-user-id"] || "unknown"
+                }
             });
             fs.unlink(file.path, (err) => {
                 if (err) console.error("Failed to delete temp file:", err);
@@ -1335,6 +1377,100 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
         console.error("PFP Upload Error:", err.response?.data || err.message);
         res.status(500).json({ error: "Upload Failed" });
     }
+});
+const ACCLOGS_PATH = path.join(__dirname, "acclogs.json");
+if (!fs.existsSync(ACCLOGS_PATH)) {
+    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify({}), "utf8");
+}
+function formatTimes(date) {
+    return date.toLocaleString("en-US", {
+        hour12: true
+    });
+}
+function getIP(req) {
+    return req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
+}
+function loadAccLogs() {
+    return JSON.parse(fs.readFileSync(ACCLOGS_PATH, "utf8") || "{}");
+}
+function saveAccLogs(data) {
+    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify(data, null, 2));
+}
+function cleanupLogsIfNeeded() {
+    const CLEAR_DAY = parseInt(process.env.CLEAR_LOG_DAY || "1");
+    const today = new Date().getDate();
+    if (today === CLEAR_DAY) {
+        saveAccLogs({});
+        console.log("acclogs.json cleared for monthly reset");
+    }
+}
+function markExpiredTokens() {
+    const logs = loadAccLogs();
+    const now = Date.now();
+    for (const uid in logs) {
+        const entry = logs[uid];
+        if (entry.expiresRaw && now > entry.expiresRaw) {
+            entry.expires = "expired";
+        }
+    }
+    saveAccLogs(logs);
+}
+setInterval(() => {
+    cleanupLogsIfNeeded();
+    markExpiredTokens();
+}, 60 * 1000);
+app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const { targetUid } = req.body;
+        if (!targetUid) {
+            return res.status(400).json({ error: "Missing targetUid" });
+        }
+        const roleSnap = await admin.database()
+            .ref(`users/${requesterUid}/profile/isOwner`)
+            .get();
+        if (!roleSnap.exists() || roleSnap.val() !== true) {
+            return res.status(403).json({ error: "Not authorized" });
+        }
+        const customToken = await admin.auth().createCustomToken(targetUid);
+        const now = new Date();
+        const expiresDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const logs = loadAccLogs();
+        logs[targetUid] = {
+            token: customToken,
+            expires: formatTimes(expiresDate),
+            expiresRaw: expiresDate.getTime(),
+            created: formatTimes(now),
+            author: requesterUid,
+            ip: getIP(req),
+            uses: logs[targetUid]?.uses || 0
+        };
+        saveAccLogs(logs);
+        const report = loadReportJSON();
+        const day = now.getDate().toString();
+        if (!report.report[day]) report.report[day] = {};
+        if (!report.report[day]["tokens"]) report.report[day]["tokens"] = { count: 0 };
+        report.report[day]["tokens"].count++;
+        saveReportJSON(report);
+        res.json({
+            success: true,
+            token: customToken,
+            expires: logs[targetUid].expires
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to create token" });
+    }
+});
+app.post("/tokenUsed", async (req, res) => {
+    const { uid } = req.body;
+    if (!uid) return res.sendStatus(400);
+    const logs = loadAccLogs();
+    if (logs[uid]) {
+        logs[uid].uses = (logs[uid].uses || 0) + 1;
+        saveAccLogs(logs);
+    }
+    res.sendStatus(200);
 });
 const uploadChunk = multer({ storage: multer.memoryStorage() });
 app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (req, res) => {
@@ -1736,6 +1872,21 @@ async function finishAccept(movieName) {
         percent: 100,
         eta: 0
     });
+    const report = loadReportJSON();
+    const day = new Date().getDate().toString();
+    if (!report.report[day]) report.report[day] = {};
+    const movieFiles = fs.readdirSync(MOVIES_DIR).filter(f => f.endsWith('.mp4'));
+    report.report[day]["movies"] = { count: movieFiles.length };
+    for (const dayKey in report.report) {
+        if (report.report[dayKey]["submitted-movies"]) {
+            for (const submittedId in report.report[dayKey]["submitted-movies"]) {
+                if (submittedId !== "count" && submittedId === movieName) {
+                    report.report[dayKey]["submitted-movies"][submittedId].accepted = "true";
+                }
+            }
+        }
+    }
+    saveReportJSON(report);
     await discordRequest({
         method: "patch",
         url: `https://discord.com/api/v10/channels/${logid}/messages/${msgId}`,
@@ -1766,6 +1917,17 @@ async function finishReject(movieName) {
     updateApply(movieName, {
         status: "Rejected"
     });
+    const report = loadReportJSON();
+    for (const dayKey in report.report) {
+        if (report.report[dayKey]["submitted-movies"]) {
+            for (const submittedId in report.report[dayKey]["submitted-movies"]) {
+                if (submittedId !== "count" && submittedId === movieName) {
+                    report.report[dayKey]["submitted-movies"][submittedId].accepted = "false";
+                }
+            }
+        }
+    }
+    saveReportJSON(report);
     try {
         await discordRequest({
             method: "patch",
@@ -1779,15 +1941,15 @@ async function finishReject(movieName) {
 }
 async function grantPremium(uid, amount) {
     try {
-        if (amount >= 500) {
+        if (amount >= 200) {
             const expireDate = new Date();
             expireDate.setMonth(expireDate.getMonth() + 3);
             const updates = {
                 preExpire: expireDate.getTime()
             };
-            if (amount >= 1500) updates.premium3 = true;
-            else if (amount >= 1000) updates.premium2 = true;
-            else if (amount >= 500) updates.premium1 = true;
+            if (amount >= 1000) updates.premium3 = true;
+            else if (amount >= 500) updates.premium2 = true;
+            else if (amount >= 200) updates.premium1 = true;
             await db.ref(`users/${uid}/profile`).update(updates);
         } else {
             await db.ref(`users/${uid}/profile`).update({
@@ -1795,7 +1957,7 @@ async function grantPremium(uid, amount) {
             });
         }
         const displayName = (await db.ref(`users/${uid}/profile/displayName`).get()).val();
-        if (amount >= 1500) {
+        if (amount >= 1000) {
             await sendDiscordEmbedPre({
                 title: "Premium T3 Purchased",
                 color: 0xFF0000,
@@ -1807,7 +1969,7 @@ async function grantPremium(uid, amount) {
                 timestamp: new Date().toISOString()
             });
             console.log("Premium T3 Granted:", uid);
-        } else if (amount >= 1000) {
+        } else if (amount >= 500) {
             await sendDiscordEmbedPre({
                 title: "Premium T2 Purchased",
                 color: 0xFFA500,
@@ -1819,7 +1981,7 @@ async function grantPremium(uid, amount) {
                 timestamp: new Date().toISOString()
             });
             console.log("Premium T2 Granted:", uid);
-        } else if (amount >= 500) {
+        } else if (amount >= 200) {
             await sendDiscordEmbedPre({
                 title: "Premium T1 Purchased",
                 color: 0xFFFF00,
@@ -1884,8 +2046,6 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
                     });
                     const pct = Math.round(percent);
                     const etaText = formatETA(remainingSec);
-                    // pinnedAcceptLine =
-                        // `ACCEPTING: ${filenameLabel} | ${humanLabel} | ${pct}% | ETA ${etaText}`;
                     renderPinnedAccept();
                     socket.emit("jobProgress", {
                         workId,
@@ -1903,7 +2063,6 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
         });
         ff.on("close", (code) => {
             if (code === 0) {
-                // pinnedAcceptLine = `ACCEPT COMPLETE: ${filenameLabel}`;
                 renderPinnedAccept();
                 setTimeout(() => {
                     pinnedAcceptLine = null;
@@ -2337,6 +2496,66 @@ function loadMoviesJSON() {
         return {};
     }
 }
+function loadReportJSON() {
+    if (!fs.existsSync(REPORT_JSON)) {
+        return { report: {} };
+    }
+    try {
+        return JSON.parse(fs.readFileSync(REPORT_JSON, "utf8"));
+    } catch {
+        return { report: {} };
+    }
+}
+function saveReportJSON(data) {
+    fs.writeFileSync(REPORT_JSON, JSON.stringify(data, null, 2));
+}
+function formatTime(timestamp) {
+    const date = new Date(timestamp);
+    let hours = date.getHours();
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12;
+    return `${hours}:${minutes} ${ampm}`;
+}
+function logEvent(eventType, eventData) {
+    const now = new Date();
+    const day = now.getDate().toString();
+    const report = loadReportJSON();
+    if (!report.report[day]) {
+        report.report[day] = {};
+    }
+    if (!report.report[day][eventType]) {
+        report.report[day][eventType] = { count: 0 };
+    }
+    report.report[day][eventType].count++;
+    if (eventData.id) {
+        report.report[day][eventType][eventData.id] = {
+            time: formatTimes(now),
+            ...eventData.data
+        };
+    }
+    saveReportJSON(report);
+}
+function ensureArchiveDir() {
+    if (!fs.existsSync(ARCHIVE_DIR)) {
+        fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+    }
+}
+function archiveReport() {
+    const now = new Date();
+    const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const month = monthNames[now.getMonth()];
+    const year = now.getFullYear();
+    const archiveName = `${month}${year}report.json`;
+    ensureArchiveDir();
+    if (fs.existsSync(REPORT_JSON)) {
+        const archivePath = path.join(ARCHIVE_DIR, archiveName);
+        fs.copyFileSync(REPORT_JSON, archivePath);
+        console.log(`Report archived as ${archiveName}`);
+    }
+    saveReportJSON({ report: {} });
+}
 function mainMenu() {
     liveMode = false;
     if (liveInterval) {
@@ -2716,6 +2935,15 @@ setInterval(() => {
         acceptStatus.clear();
     }
 }, 10 * 60 * 1000);
+setInterval(() => {
+    const now = new Date();
+    const day = now.getDate();
+    const hour = now.getHours();
+    const minute = now.getMinutes();
+    if (day === 1 && hour === 0 && minute === 0) {
+        archiveReport();
+    }
+}, 60 * 1000);
 process.on("SIGINT", () => {
     console.clear();
     console.log("\nExiting");
