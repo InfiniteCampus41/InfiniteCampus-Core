@@ -811,10 +811,10 @@ app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
     if (!fs.existsSync(full)) return res.json({ ok: false, message: "Not Found" });
     try {
         fs.unlinkSync(full);
-	    finishReject(filename);
-	    applicantMessages.delete(filename);
-	    acceptStatus.delete(filename);
-	    return res.json({ ok: true });
+        finishReject(filename);
+        applicantMessages.delete(filename);
+        acceptStatus.delete(filename);
+        return res.json({ ok: true });
     } catch (err) {
         return res.json({ ok: false, message: err.message });
     }
@@ -2216,10 +2216,18 @@ async function startAcceptProcess(movieName) {
     const interval = setInterval(async () => {
         const status = acceptStatus.get(movieName);
         if (status) {
+            let realSize = 0;
+            try{
+                const fullpath = path.join(APPLY_DIR, movieName);
+                if (fs.existsSync(fullPath)) {
+                    realSize = fs.statSync(fullPath).size;
+                }
+            } catch {}
             updateApply(movieName, {
                 status: status.message || "Processing",
                 percent: Math.round(status.percent ?? 0),
-                eta: status.remainingSec ?? 0
+                eta: status.remainingSec ?? 0,
+                size: realSize
             });
         }
         if (!status) return;
@@ -2227,10 +2235,10 @@ async function startAcceptProcess(movieName) {
             title: `ACCEPTING: ${movieName}`,
             color: 0xf1c40f,
             fields: [
-  		{ name: "Status", value: status.message || "Processing" },
-  		{ name: "Percent", value: `${status.percent ?? 0}%` },
-  		{ name: "Time Left", value: formatETA(status.remainingSec ?? 0) }
-	    ]
+        { name: "Status", value: status.message || "Processing" },
+        { name: "Percent", value: `${status.percent ?? 0}%` },
+        { name: "Time Left", value: formatETA(status.remainingSec ?? 0) }
+        ]
         };
         try {
             const result = await discordRequest({
@@ -2703,7 +2711,7 @@ function setupSocketHandlers(ioInstance, label) {
                 message: "Job Started",
                 updated: Date.now()
             });
-	        await startAcceptProcess(safeFile);
+            await startAcceptProcess(safeFile);
             try {
                 socket.emit("jobLog", { filename: safeFile, text: "Probing File For Duration..." });
                 const probeCmd = `ffprobe -v quiet -print_format json -show_format "${srcPath.replace(/"/g, '\\"')}"`;
