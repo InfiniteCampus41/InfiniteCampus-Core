@@ -285,13 +285,6 @@ app.delete("/admin/files/:filename", (req, res) => {
     }
     res.status(404).json({ error: "File Not Found" });
 });
-app.delete(ROUTES.DELETE_VIDEO, (req, res) => {
-    const name = path.basename(req.params.name);
-    const file = path.join(MOVIES_DIR, name + ".mp4");
-    if (!fs.existsSync(file)) return res.status(404).send("Not Found");
-    fs.unlinkSync(file);
-    res.json({ ok: true });
-});
 app.get("/", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "index.html"));
 });
