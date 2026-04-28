@@ -11,6 +11,7 @@ import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import FormData from "form-data";
 import fs from "fs";
+import https from "https";
 import multer from "multer";
 import os from "os";
 import path from "path";
@@ -19,6 +20,7 @@ import sanitize from "sanitize-filename";
 import { Server as IOServer } from "socket.io";
 import { spawn } from "child_process";
 import util from "util";
+import { WebSocketServer } from "ws";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -54,10 +56,10 @@ app.post("/square-webhook",
                 const uid = payment.note;
                 const amount = payment.amount_money.amount;
                 const amountDollars = amount / 100;
-                const donationRef = db.ref(`donations/amount`);
-                await donationRef.transaction((current) => {
-                    return (current || 0) + amountDollars;
-                });
+                const donationData = getDataCache();
+                if (!donationData.donations) donationData.donations = {};
+                donationData.donations.amount = (donationData.donations.amount || 0) + amountDollars;
+                saveData(donationData);
                 if (uid) {
                     await grantPremium(uid, amount);
                     logEvent("payments", {
@@ -106,7 +108,6 @@ const client = new Client({
 });
 const CREATE_COOLDOWN = 1500;
 const creating = new Map();
-const db = admin.database();
 const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const discordQueue = [];
@@ -220,6 +221,43 @@ let LOCKDOWN = false;
 let pinnedAcceptLine = null;
 let testEnabled = false;
 let vm;
+let _dataCache = null;
+let _dataCacheDirty = false;
+function getDataCache() {
+    if (_dataCache === null) {
+        _dataCache = JSON.parse(fs.readFileSync("./data.json", "utf-8"));
+    }
+    return _dataCache;
+}
+function invalidateDataCache() {
+    _dataCache = null;
+}
+class DataSnapshot {
+    constructor(data) {
+        this.data = data;
+    }
+    child(path) {
+        const keys = path.split("/");
+        let current = this.data;
+        for (const key of keys) {
+            if (current == null) return new DataSnapshot(undefined);
+            current = current[key];
+        }
+        return new DataSnapshot(current);
+    }
+    val() {
+        return this.data;
+    }
+    exists() {
+        return this.data !== undefined && this.data !== null;
+    }
+    isNumber() {
+        return typeof this.data === "number";
+    }
+    isString() {
+        return typeof this.data === "string";
+    }
+}
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(APPLY_DIR)) fs.mkdirSync(APPLY_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_TEMP_DIR)) fs.mkdirSync(UPLOADS_TEMP_DIR, { recursive: true });
@@ -229,6 +267,39 @@ if (!fs.existsSync(QUEUE_DIR)) fs.mkdirSync(QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(DISCORD_QUEUE_DIR)) fs.mkdirSync(DISCORD_QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(ARCHIVE_DIR)) fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 rl.setPrompt("> ");
+const ACCLOGS_PATH = path.join(__dirname, "acclogs.json");
+if (!fs.existsSync(ACCLOGS_PATH)) {
+    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify({}), "utf8");
+}
+function loadAccLogs() {
+    return JSON.parse(fs.readFileSync(ACCLOGS_PATH, "utf8") || "{}");
+}
+function saveAccLogs(data) {
+    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify(data, null, 2));
+}
+function cleanupLogsIfNeeded() {
+    const CLEAR_DAY = parseInt(process.env.CLEAR_LOG_DAY || "1");
+    const today = new Date().getDate();
+    if (today === CLEAR_DAY) {
+        saveAccLogs({});
+        console.log("acclogs.json cleared for monthly reset");
+    }
+}
+function markExpiredTokens() {
+    const logs = loadAccLogs();
+    const now = Date.now();
+    for (const uid in logs) {
+        const entry = logs[uid];
+        if (entry.expiresRaw && now > entry.expiresRaw) {
+            entry.expires = "expired";
+        }
+    }
+    saveAccLogs(logs);
+}
+setInterval(() => {
+    cleanupLogsIfNeeded();
+    markExpiredTokens();
+}, 60 * 1000);
 function requireAdminPassword(req, res, next) {
     const adminRoutes = [
         `/hyperadminvm`,
@@ -284,6 +355,13 @@ app.delete("/admin/files/:filename", (req, res) => {
         return res.json({ success: true });
     }
     res.status(404).json({ error: "File Not Found" });
+});
+app.delete(ROUTES.DELETE_VIDEO, (req, res) => {
+    const name = path.basename(req.params.name);
+    const file = path.join(MOVIES_DIR, name + ".mp4");
+    if (!fs.existsSync(file)) return res.status(404).send("Not Found");
+    fs.unlinkSync(file);
+    res.json({ ok: true });
 });
 app.get("/", (req, res) => {
     res.sendFile(path.join(__dirname, "public", "index.html"));
@@ -503,6 +581,13 @@ app.get("/hypervm", async (req, res) => {
         console.error(err.response?.data || err.message);
         res.status(500).send("Failed to create VM");
     }
+});
+app.get('/ping', (req, res) => {
+    const now = Date.now();
+    res.json({
+        ok: true,
+        serverTime: now
+    });
 });
 app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
@@ -812,67 +897,56 @@ app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
         return res.json({ ok: false, message: err.message });
     }
 });
-app.post("/changename", verifyFirebaseToken, async (req, res) => {
+app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
     try {
-        const uid = req.user.uid;
-        let { displayName } = req.body;
-        if (!displayName) {
-            return res.statusCode(400).json({ error: "Missing Display Name"});
+        const requesterUid = req.user.uid;
+        const { targetUid } = req.body;
+        if (!targetUid) {
+            return res.status(400).json({ error: "Missing targetUid" });
         }
-        const testerSnap = await admin.database().ref(`users/${uid}/profile/isTester`).get();
-        const ownerSnap = await admin.database().ref(`users/${uid}/profile/isOwner`).get();
-        const isTester = testerSnap.exists() && testerSnap.val() === true;
-        const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
-        if (isOwner || isTester) {
-            displayName = displayName;
-        } else {
-            displayName = displayName.trim();
-            if (displayName.length > 20) {
-                return res.status(400).json({ error: "Too Many Charachters (Max 20)"})
-            }
-            const valid = /^[a-zA-Z0-9 _.\-!@#$%^&*()+=\[\]{};:'",<>/?\\|`~]+$/;
-            if (!valid.test(displayName)) {
-                return res.status(400).json({ error: "Invalid characters" });
-            }
+        const isOwner = readDataPath(`users/${requesterUid}/profile/isOwner`);
+        if (!isOwner) {
+            return res.status(403).json({ error: "Not authorized" });
         }
-        await admin.auth().updateUser(uid, {
-            displayName
+        const customToken = await admin.auth().createCustomToken(targetUid);
+        const now = new Date();
+        const expiresDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const logs = loadAccLogs();
+        logs[targetUid] = {
+            token: customToken,
+            expires: formatTimes(expiresDate),
+            expiresRaw: expiresDate.getTime(),
+            created: formatTimes(now),
+            author: requesterUid,
+            ip: getIP(req),
+            uses: logs[targetUid]?.uses || 0
+        };
+        saveAccLogs(logs);
+        const report = loadReportJSON();
+        const day = now.getDate().toString();
+        if (!report.report[day]) report.report[day] = {};
+        if (!report.report[day]["tokens"]) report.report[day]["tokens"] = { count: 0 };
+        report.report[day]["tokens"].count++;
+        saveReportJSON(report);
+        res.json({
+            success: true,
+            token: customToken,
+            expires: logs[targetUid].expires
         });
-        await admin.database().ref(`users/${uid}/profile`).update({
-            displayName
-        });
-        res.json({ success: true, displayName });
     } catch (err) {
         console.error(err);
-        res.status(500).json({ error: "Failed To Update Display Name" });
+        res.status(500).json({ error: "Failed to create token" });
     }
 });
-app.post("/changebio", verifyFirebaseToken, async (req, res) => {
-    try {
-        const uid = req.user.uid;
-        let { bio } = req.body;
-        if (!bio) {
-            return res.statusCode(400).json({ error: "Missing Bio"});
-        }
-        const testerSnap = await admin.database().ref(`users/${uid}/profile/isTester`).get();
-        const ownerSnap = await admin.database().ref(`users/${uid}/profile/isOwner`).get();
-        const isTester = testerSnap.exists() && testerSnap.val() === true;
-        const isOwner = ownerSnap.exists() && ownerSnap.val() === true;
-        if (isOwner || isTester) {
-            bio = bio;
-        } else {
-            if (bio.length > 50) {
-                return res.status(400).json({ error: "Too Many Charachters (Max 50)"})
-            }
-        }
-        await admin.database().ref(`users/${uid}/profile`).update({
-            bio
-        });
-        res.json({ success: true, bio });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Failed To Update Bio" });
+app.post("/tokenUsed", async (req, res) => {
+    const { uid } = req.body;
+    if (!uid) return res.sendStatus(400);
+    const logs = loadAccLogs();
+    if (logs[uid]) {
+        logs[uid].uses = (logs[uid].uses || 0) + 1;
+        saveAccLogs(logs);
     }
+    res.sendStatus(200);
 });
 app.post("/check_pass", (req, res) => {
     const pass = req.body.password;
@@ -891,6 +965,64 @@ app.post("/check_pass", (req, res) => {
     }
     console.log("Password Incorrect");
     return res.status(401).json({ status: "invalid" });
+});
+app.post("/delete", async (req, res) => {
+    try {
+        const uid = await verifyToken(req);
+        const { path } = req.body;
+        if (!Array.isArray(path)) {
+            return res.status(400).json({ error: "Path must be array" });
+        }
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        let parent = dataJson;
+        for (let i = 0; i < path.length - 1; i++) {
+            parent = parent?.[path[i]];
+            if (parent == null) {
+                return res.json({ success: true });
+            }
+        }
+        const key = path[path.length - 1];
+        const oldValue = parent?.[key];
+        const dataSnap = new DataSnapshot(oldValue);
+        const newDataSnap = new DataSnapshot(null);
+        const userProfile = dataJson?.users?.[uid]?.profile || {};
+        const auth = { uid, ...userProfile };
+        const { rule, wildcards } = getRuleForOperation(rules, path, "write");
+        if (
+            !rule ||
+            !evaluate(rule, {
+                auth,
+                root,
+                data: dataSnap,
+                newData: newDataSnap,
+                wildcards,
+            })
+        ) {
+            return res.status(403).json({ error: "Delete denied" });
+        }
+        const validateRule = getRuleForOperation(rules, path, "validate").rule;
+        if (
+            validateRule &&
+            !evaluate(validateRule, {
+                auth,
+                root,
+                data: dataSnap,
+                newData: newDataSnap,
+                wildcards,
+            })
+        ) {
+            return res.status(403).json({ error: "Validation failed" });
+        }
+        delete parent[key];
+        saveData(dataJson);
+        broadcastUpdate(path, null);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(401).json({ error: "Unauthorized" });
+    }
 });
 app.post("/discordVerify", verifyFirebaseToken, async (req, res) => {
     try {
@@ -962,9 +1094,7 @@ app.post("/discordVerifyConfirm", async (req, res) => {
     if (verify.code !== code) {
         return res.status(400).json({ error: "Invalid Code" });
     }
-    await admin.database()
-        .ref(`users/${uid}/profile`)
-        .update({ dUsername: verify.username });
+    updateDataPath(`users/${uid}/profile`, { dUsername: verify.username });
     discordVerifications.delete(uid);
     res.json({
         success: true,
@@ -1045,6 +1175,95 @@ app.post("/github-webhook", express.json({ type: "application/json" }),async (re
     } catch (err) {
         console.error(err);
         res.sendStatus(500);
+    }
+});
+app.post("/limit-to-last", async (req, res) => {
+    try {
+        let uid = null;
+        let auth = null;
+        const header = req.headers.authorization;
+        if (header?.startsWith("Bearer ")) {
+            try {
+                uid = (await admin.auth().verifyIdToken(header.split("Bearer ")[1])).uid;
+            } catch {
+                return res.status(401).json({ error: "Invalid Token" });
+            }
+        }
+        const { path, limit = 50 } = req.body;
+        if (!Array.isArray(path)) return res.status(400).json({ error: "Path Must Be Array" });
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        if (uid) auth = { uid, ...dataJson?.users?.[uid]?.profile };
+        const { rule, wildcards } = getRuleForOperation(rules, path, "read");
+        if (!rule || !evaluate(rule, { auth, root, data: new DataSnapshot(dataJson), newData: new DataSnapshot(dataJson), wildcards }))
+            return res.status(403).json({ error: "Permission denied" });
+        let current = dataJson;
+        for (const p of path) current = current?.[p];
+        if (current && typeof current === "object" && !Array.isArray(current)) {
+            const keys = Object.keys(current).slice(-limit);
+            current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
+        } else if (Array.isArray(current)) {
+            current = current.slice(-limit);
+        }
+        const filtered = filterDataByRules(current, path, auth, root, rules);
+        res.json({ data: filtered });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Server error" });
+    }
+});
+app.post("/load-more-messages", async (req, res) => {
+    try {
+        let uid = null;
+        let auth = null;
+        const header = req.headers.authorization;
+        if (header?.startsWith("Bearer ")) {
+            try {
+                uid = (await admin.auth().verifyIdToken(header.split("Bearer ")[1])).uid;
+            } catch {
+                return res.status(401).json({ error: "Invalid token" });
+            }
+        }
+        const { path, before } = req.body;
+        const limit = Math.min(req.body.limit || 25, 50);
+        if (!Array.isArray(path)) {
+            return res.status(400).json({ error: "Path Must Be Array" });
+        }
+        if (typeof before !== "number") {
+            return res.status(400).json({ error: "Before Must Be A Number (Timestamp)" });
+        }
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        if (uid) {
+            const userProfile = dataJson?.users?.[uid]?.profile || {};
+            auth = { uid, ...userProfile };
+        }
+        const { rule, wildcards } = getRuleForOperation(rules, path, "read");
+        if (rule) {
+            const allowed = evaluate(rule, { auth, root, data: root, newData: root, wildcards });
+            if (!allowed) return res.json({ data: null });
+        }
+        let node = dataJson;
+        for (const p of path) node = node?.[p];
+        if (!node || typeof node !== "object") {
+            return res.json({ data: null });
+        }
+        const filtered = Object.entries(node).filter(([, v]) => v && typeof v.timestamp === "number" && v.timestamp < before);
+        filtered.sort((b, a) => a[1].timestamp - b[1].timestamp);
+        const entries = filtered.slice(0, limit);
+        if (entries.length === 0) {
+            return res.json({ data: null });
+        }
+        const result = entries.map(([k, v]) => ({
+            id: k,
+            ...v
+        }));
+        res.json({ data: result });
+    } catch (err) {
+        console.error("Load More Messages Error", err);
+        res.status(500).json({ error: "Server Error" });
     }
 });
 app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) => {
@@ -1159,6 +1378,45 @@ app.post("/pay", verifyFirebaseToken, async (req, res) => {
         } else {
             res.status(500).json({ error: "Unknown Error" });
         }
+    }
+});
+app.post("/read", async (req, res) => {
+    try {
+        let uid = null;
+        let auth = null;
+        const header = req.headers.authorization;
+        if (header?.startsWith("Bearer ")) {
+            try {
+                uid = (await admin.auth().verifyIdToken(header.split("Bearer ")[1])).uid;
+            } catch {
+                return res.status(401).json({ error: "Invalid token" });
+            }
+        }
+        const { path } = req.body;
+        if (!Array.isArray(path)) return res.status(400).json({ error: "Path must be array" });
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        if (uid) {
+            const userProfile = dataJson?.users?.[uid]?.profile || {};
+            auth = { uid, ...userProfile };
+        }
+        let current = dataJson;
+        for (const p of path) current = current?.[p];
+        const dataSnap = new DataSnapshot(current);
+        const { rule, wildcards } = getRuleForOperation(rules, path, "read");
+        let allowed = true;
+        if (rule) {
+            allowed = evaluate(rule, { auth, root, data: dataSnap, newData: dataSnap, wildcards });
+        }
+        if (!allowed) {
+            return res.json({ data: null });
+        }
+        const filteredData = filterDataByRules(current, path, auth, root, rules);
+        res.json({ data: filteredData ?? null });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Server error" });
     }
 });
 app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (req, res) => {
@@ -1357,9 +1615,7 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
                 }
             }
         );
-        await admin.database().ref(`users/${uid}/profile`).update({
-            pic: nextNumber - 1
-        });
+        updateDataPath(`users/${uid}/profile`, { pic: nextNumber - 1 });
         res.json({
             success: true,
             file: newFileName,
@@ -1371,100 +1627,6 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
         res.status(500).json({ error: "Upload Failed" });
     }
 });
-const ACCLOGS_PATH = path.join(__dirname, "acclogs.json");
-if (!fs.existsSync(ACCLOGS_PATH)) {
-    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify({}), "utf8");
-}
-function formatTimes(date) {
-    return date.toLocaleString("en-US", {
-        hour12: true
-    });
-}
-function getIP(req) {
-    return req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
-}
-function loadAccLogs() {
-    return JSON.parse(fs.readFileSync(ACCLOGS_PATH, "utf8") || "{}");
-}
-function saveAccLogs(data) {
-    fs.writeFileSync(ACCLOGS_PATH, JSON.stringify(data, null, 2));
-}
-function cleanupLogsIfNeeded() {
-    const CLEAR_DAY = parseInt(process.env.CLEAR_LOG_DAY || "1");
-    const today = new Date().getDate();
-    if (today === CLEAR_DAY) {
-        saveAccLogs({});
-        console.log("acclogs.json cleared for monthly reset");
-    }
-}
-function markExpiredTokens() {
-    const logs = loadAccLogs();
-    const now = Date.now();
-    for (const uid in logs) {
-        const entry = logs[uid];
-        if (entry.expiresRaw && now > entry.expiresRaw) {
-            entry.expires = "expired";
-        }
-    }
-    saveAccLogs(logs);
-}
-setInterval(() => {
-    cleanupLogsIfNeeded();
-    markExpiredTokens();
-}, 60 * 1000);
-app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
-    try {
-        const requesterUid = req.user.uid;
-        const { targetUid } = req.body;
-        if (!targetUid) {
-            return res.status(400).json({ error: "Missing targetUid" });
-        }
-        const roleSnap = await admin.database()
-            .ref(`users/${requesterUid}/profile/isOwner`)
-            .get();
-        if (!roleSnap.exists() || roleSnap.val() !== true) {
-            return res.status(403).json({ error: "Not authorized" });
-        }
-        const customToken = await admin.auth().createCustomToken(targetUid);
-        const now = new Date();
-        const expiresDate = new Date(Date.now() + 24 * 60 * 60 * 1000);
-        const logs = loadAccLogs();
-        logs[targetUid] = {
-            token: customToken,
-            expires: formatTimes(expiresDate),
-            expiresRaw: expiresDate.getTime(),
-            created: formatTimes(now),
-            author: requesterUid,
-            ip: getIP(req),
-            uses: logs[targetUid]?.uses || 0
-        };
-        saveAccLogs(logs);
-        const report = loadReportJSON();
-        const day = now.getDate().toString();
-        if (!report.report[day]) report.report[day] = {};
-        if (!report.report[day]["tokens"]) report.report[day]["tokens"] = { count: 0 };
-        report.report[day]["tokens"].count++;
-        saveReportJSON(report);
-        res.json({
-            success: true,
-            token: customToken,
-            expires: logs[targetUid].expires
-        });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ error: "Failed to create token" });
-    }
-});
-app.post("/tokenUsed", async (req, res) => {
-    const { uid } = req.body;
-    if (!uid) return res.sendStatus(400);
-    const logs = loadAccLogs();
-    if (logs[uid]) {
-        logs[uid].uses = (logs[uid].uses || 0) + 1;
-        saveAccLogs(logs);
-    }
-    res.sendStatus(200);
-});
 const uploadChunk = multer({ storage: multer.memoryStorage() });
 app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (req, res) => {
     if (LOCKDOWN) return res.status(403).json({ error: "Uploads Locked Down" });
@@ -1473,33 +1635,11 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
         let maxAllowedSize = MAX_SIZE_NON_PREMIUM;
         if (userId) {
             try {
-                const [
-                    pre1Snap, pre2Snap, pre3Snap,
-                    devSnap, adminSnap, HAdminSnap,
-                    coOwnerSnap, testerSnap, ownerSnap, partnerSnap
-                ] = await Promise.all([
-                    admin.database().ref(`users/${userId}/profile/premium1`).get(),
-                    admin.database().ref(`users/${userId}/profile/premium2`).get(),
-                    admin.database().ref(`users/${userId}/profile/premium3`).get(),
-                    admin.database().ref(`users/${userId}/profile/isDev`).get(),
-                    admin.database().ref(`users/${userId}/profile/isAdmin`).get(),
-                    admin.database().ref(`users/${userId}/profile/isHAdmin`).get(),
-                    admin.database().ref(`users/${userId}/profile/isCoOwner`).get(),
-                    admin.database().ref(`users/${userId}/profile/isTester`).get(),
-                    admin.database().ref(`users/${userId}/profile/isOwner`).get(),
-                    admin.database().ref(`users/${userId}/profile/isPartner`).get()
-                ]);
+                const _upProfile = getDataCache()?.users?.[userId]?.profile || {};
                 const isPremium =
-                    (pre1Snap.exists() && pre1Snap.val()) ||
-                    (pre2Snap.exists() && pre2Snap.val()) ||
-                    (pre3Snap.exists() && pre3Snap.val()) ||
-                    (devSnap.exists() && devSnap.val()) ||
-                    (adminSnap.exists() && adminSnap.val()) ||
-                    (HAdminSnap.exists() && HAdminSnap.val()) ||
-                    (coOwnerSnap.exists() && coOwnerSnap.val()) ||
-                    (testerSnap.exists() && testerSnap.val()) ||
-                    (ownerSnap.exists() && ownerSnap.val()) ||
-                    (partnerSnap.exists() && partnerSnap.val());
+                    _upProfile.premium1 || _upProfile.premium2 || _upProfile.premium3 ||
+                    _upProfile.isDev || _upProfile.isAdmin || _upProfile.isHAdmin ||
+                    _upProfile.isCoOwner || _upProfile.isTester || _upProfile.isOwner || _upProfile.isPartner;
                 if (isPremium) {
                     maxAllowedSize = MAX_SIZE_PREMIUM;
                 }
@@ -1523,8 +1663,8 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
         fs.writeFileSync(chunkPath, req.file.buffer);
         const chunkFiles = fs.readdirSync(tmpDir);
         if (chunkFiles.length === totalChunks) {
-            const safeName = sanitize(originalFilename);
-            const finalFilename = `${Date.now()}-${safeName}`;
+            const safeFileName = sanitize(originalFilename);
+            const finalFilename = `${Date.now()}-${safeFileName}`;
             const finalPath = path.join(UPLOADS_DIR, finalFilename);
             const finalStream = fs.createWriteStream(finalPath);
             for (let i = 1; i <= totalChunks; i++) {
@@ -1542,33 +1682,11 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
             let deleteDelay = AUTO_DELETE_MS;
             try {
                 if (userId) {
-                    const [
-                        pre1Snap, pre2Snap, pre3Snap,
-                        devSnap, adminSnap, HAdminSnap,
-                        coOwnerSnap, testerSnap, ownerSnap, partnerSnap
-                    ] = await Promise.all([
-                        admin.database().ref(`users/${userId}/profile/premium1`).get(),
-                        admin.database().ref(`users/${userId}/profile/premium2`).get(),
-                        admin.database().ref(`users/${userId}/profile/premium3`).get(),
-                        admin.database().ref(`users/${userId}/profile/isDev`).get(),
-                        admin.database().ref(`users/${userId}/profile/isAdmin`).get(),
-                        admin.database().ref(`users/${userId}/profile/isHAdmin`).get(),
-                        admin.database().ref(`users/${userId}/profile/isCoOwner`).get(),
-                        admin.database().ref(`users/${userId}/profile/isTester`).get(),
-                        admin.database().ref(`users/${userId}/profile/isOwner`).get(),
-                        admin.database().ref(`users/${userId}/profile/isPartner`).get()
-                    ]);
+                    const _upProfile2 = getDataCache()?.users?.[userId]?.profile || {};
                     const isPremium =
-                        (pre1Snap.exists() && pre1Snap.val()) ||
-                        (pre2Snap.exists() && pre2Snap.val()) ||
-                        (pre3Snap.exists() && pre3Snap.val()) ||
-                        (devSnap.exists() && devSnap.val()) ||
-                        (adminSnap.exists() && adminSnap.val()) ||
-                        (HAdminSnap.exists() && HAdminSnap.val()) ||
-                        (coOwnerSnap.exists() && coOwnerSnap.val()) ||
-                        (testerSnap.exists() && testerSnap.val()) ||
-                        (ownerSnap.exists() && ownerSnap.val()) ||
-                        (partnerSnap.exists() && partnerSnap.val());
+                        _upProfile2.premium1 || _upProfile2.premium2 || _upProfile2.premium3 ||
+                        _upProfile2.isDev || _upProfile2.isAdmin || _upProfile2.isHAdmin ||
+                        _upProfile2.isCoOwner || _upProfile2.isTester || _upProfile2.isOwner || _upProfile2.isPartner;
                     if (isPremium) {
                         deleteDelay = AUTO_DELETE_PM_MS;
                     }
@@ -1590,6 +1708,38 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
     } catch (err) {
         console.error("Upload Error:", err);
         res.status(500).json({ error: "Upload Failed" });
+    }
+});
+app.post("/write", async (req, res) => {
+    try {
+        const uid = await verifyToken(req);
+        const { path, value } = req.body;
+        if (!Array.isArray(path)) return res.status(400).json({ error: "Path must be array" });
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        let parent = dataJson;
+        for (let i = 0; i < path.length - 1; i++) parent = parent[path[i]] ||= {};
+        const key = path[path.length - 1];
+        const oldValue = parent[key];
+        const newValue = value;
+        const dataSnap = new DataSnapshot(oldValue);
+        const newDataSnap = new DataSnapshot(newValue);
+        const userProfile = dataJson?.users?.[uid]?.profile || {};
+        const auth = { uid, ...userProfile };
+        const { rule, wildcards } = getRuleForOperation(rules, path, "write");
+        if (!rule || !evaluate(rule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards }))
+            return res.status(403).json({ error: "Write denied" });
+        const validateRule = getRuleForOperation(rules, path, "validate").rule;
+        if (validateRule && !evaluate(validateRule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards }))
+            return res.status(403).json({ error: "Validation failed" });
+        parent[key] = newValue;
+        saveData(dataJson);
+        broadcastUpdate(path, newValue);
+        res.json({ success: true });
+    } catch (err) {
+        console.error(err);
+        res.status(401).json({ error: "Unauthorized" });
     }
 });
 app.put("/api/movies-json", requireAdminPassword, (req, res) => {
@@ -1683,14 +1833,15 @@ async function cleanupAndReindexPfps() {
     const indexJson = JSON.parse(
         Buffer.from(indexRes.data.content, "base64").toString()
     );
-    const usersSnap = await admin.database().ref("users").once("value");
+    const _pfpData = getDataCache();
+    const _pfpUsers = _pfpData.users || {};
     const usedIndexes = new Set();
-    usersSnap.forEach(userSnap => {
-        const pic = userSnap.child("profile/pic").val();
+    for (const userData of Object.values(_pfpUsers)) {
+        const pic = userData?.profile?.pic;
         if (typeof pic === "number") {
             usedIndexes.add(pic);
         }
-    });
+    }
     const usedFiles = indexJson.filter((_, i) => usedIndexes.has(i));
     const oldToNew = {};
     let newIndex = 0;
@@ -1766,17 +1917,16 @@ async function cleanupAndReindexPfps() {
         },
         { headers: { Authorization: `token ${githubToken}` } }
     );
-    const updates = {};
-    usersSnap.forEach(userSnap => {
-        const uid = userSnap.key;
-        const oldPic = userSnap.child("profile/pic").val();
+    const _pfpUpdateData = getDataCache();
+    let _pfpChanged = false;
+    for (const [_userId, _userData] of Object.entries(_pfpUpdateData.users || {})) {
+        const oldPic = _userData?.profile?.pic;
         if (typeof oldPic === "number" && oldToNew.hasOwnProperty(oldPic)) {
-            updates[`users/${uid}/profile/pic`] = oldToNew[oldPic];
+            _pfpUpdateData.users[_userId].profile.pic = oldToNew[oldPic];
+            _pfpChanged = true;
         }
-    });
-    if (Object.keys(updates).length > 0) {
-        await admin.database().ref().update(updates);
     }
+    if (_pfpChanged) saveData(_pfpUpdateData);
 }
 async function createVM(apiKey) {
     const now = Date.now();
@@ -1827,7 +1977,7 @@ async function findMovieId(movieName) {
         );
         const searchData = await searchRes.json();
         if (!searchData.results || searchData.results.length === 0) {
-            return { id: null, cover: null, vote_average: null };
+            return { id: null, cover: null, rating: null };
         }
         const bestMatch = searchData.results[0];
         let coverUrl = null;
@@ -1943,13 +2093,11 @@ async function grantPremium(uid, amount) {
             if (amount >= 1000) updates.premium3 = true;
             else if (amount >= 500) updates.premium2 = true;
             else if (amount >= 200) updates.premium1 = true;
-            await db.ref(`users/${uid}/profile`).update(updates);
+            updateDataPath(`users/${uid}/profile`, updates);
         } else {
-            await db.ref(`users/${uid}/profile`).update({
-                isDonater: true
-            });
+            updateDataPath(`users/${uid}/profile`, { isDonater: true });
         }
-        const displayName = (await db.ref(`users/${uid}/profile/displayName`).get()).val();
+        const displayName = readDataPath(`users/${uid}/profile/displayName`) || "Unknown";
         if (amount >= 1000) {
             await sendDiscordEmbedPre({
                 title: "Premium T3 Purchased",
@@ -2000,6 +2148,14 @@ async function grantPremium(uid, amount) {
     } catch (err) {
         console.error("Premium Grant Error:", err, uid);
     }
+}
+async function loadData() {
+    const data = await fs.promises.readFile("./data.json", "utf-8");
+    return JSON.parse(data);
+}
+async function loadRules() {
+    const data = await fs.promises.readFile("./rules.json", "utf-8");
+    return JSON.parse(data).rules;
 }
 async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, inputPath, outputPath, knownDuration, ffmpegArgs, humanLabel ) {
     return new Promise((resolve, reject) => {
@@ -2139,20 +2295,15 @@ async function sendDiscordEmbedPre(embed) {
     });
 }
 async function sendVerificationNotification(uid, displayName) {
-    const usersSnap = await db.ref("users").once("value");
+    const _svData = getDataCache();
     const tokens = [];
-    for (const user of Object.keys(usersSnap.val() || {})) {
-        const profile = usersSnap.child(user).child("profile");
-        if (
-            profile.child("isOwner").val() === true ||
-            profile.child("isTester").val() === true ||
-            profile.child("isCoOwner").val() === true ||
-            profile.child("isDev").val() === true
-        ) {
-            const tokenSnap = await db.ref(`pushTokens/${user}`).once("value");
-            tokenSnap.forEach(token => {
-                tokens.push(token.key);
-            });
+    for (const [user, userData] of Object.entries(_svData.users || {})) {
+        const profile = userData?.profile || {};
+        if (profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev) {
+            const pushTokens = _svData?.pushTokens?.[user] || {};
+            for (const tokenKey of Object.keys(pushTokens)) {
+                tokens.push(tokenKey);
+            }
         }
     }
     if (tokens.length === 0) {
@@ -2209,18 +2360,10 @@ async function startAcceptProcess(movieName) {
     const interval = setInterval(async () => {
         const status = acceptStatus.get(movieName);
         if (status) {
-            let realSize = 0;
-            try{
-                const fullpath = path.join(APPLY_DIR, movieName);
-                if (fs.existsSync(fullPath)) {
-                    realSize = fs.statSync(fullPath).size;
-                }
-            } catch {}
             updateApply(movieName, {
                 status: status.message || "Processing",
                 percent: Math.round(status.percent ?? 0),
-                eta: status.remainingSec ?? 0,
-                size: realSize
+                eta: status.remainingSec ?? 0
             });
         }
         if (!status) return;
@@ -2234,7 +2377,7 @@ async function startAcceptProcess(movieName) {
         ]
         };
         try {
-            const result = await discordRequest({
+            await discordRequest({
                 method: "patch",
                 url: `https://discord.com/api/v10/channels/${logid}/messages/${messageId}`,
                 data: { embeds: [updatedEmbed] },
@@ -2244,10 +2387,11 @@ async function startAcceptProcess(movieName) {
             console.error("Discord Error:", err.response?.data || err.message);
         }
     }, 5000);
+    acceptIntervals.set(movieName, interval);
     setInterval(() => {
-        for (const [movie, interval] of acceptIntervals) {
+        for (const [movie, ivl] of acceptIntervals) {
             if (!acceptStatus.has(movie)) {
-                clearInterval(interval);
+                clearInterval(ivl);
                 acceptIntervals.delete(movie);
             }
         }
@@ -2267,17 +2411,32 @@ async function verifyFirebaseToken(req, res, next) {
         return res.status(401).json({ error: "Invalid Token" });
     }
 }
+async function verifyToken(reqOrToken) {
+    let token;
+    if (typeof reqOrToken === "string") {
+        token = reqOrToken;
+    } else if (reqOrToken?.headers?.authorization) {
+        const header = reqOrToken.headers.authorization;
+        if (!header.startsWith("Bearer ")) throw new Error("Missing token");
+        token = header.split("Bearer ")[1];
+    } else {
+        throw new Error("Missing token");
+    }
+    const decoded = await admin.auth().verifyIdToken(token);
+    return decoded.uid;
+}
 async function watchForNewUsers() {
-    const snap = await db.ref("users").once("value");
-    snap.forEach(child => {
-        seenUsers.add(child.key);
-    });
+    const _initData = getDataCache();
+    for (const userId of Object.keys(_initData.users || {})) {
+        seenUsers.add(userId);
+    }
     setInterval(async () => {
-        const usersSnap = await db.ref("users").once("value");
-        for (const child of Object.keys(usersSnap.val() || {})) {
+        invalidateDataCache();
+        const _wuData = getDataCache();
+        for (const [child, userData] of Object.entries(_wuData.users || {})) {
             if (!seenUsers.has(child)) {
                 seenUsers.add(child);
-                const profile = usersSnap.child(child).child("profile").val();
+                const profile = userData?.profile || {};
                 const displayName = profile?.displayName || "Unknown";
                 const verified = profile?.verified || false;
                 if (!verified) {
@@ -2287,6 +2446,28 @@ async function watchForNewUsers() {
             }
         }
     }, 5000);
+}
+function broadcastUpdate(changedPath, newValue) {
+    for (const [ws, clientInfo] of wsClients.entries()) {
+        if (ws.readyState !== ws.OPEN) continue;
+        if (!pathsMatch(clientInfo.path, changedPath)) continue;
+        try {
+            const dataJson = getDataCache();
+            const root = new DataSnapshot(dataJson);
+            let current = dataJson;
+            for (const p of clientInfo.path) current = current?.[p];
+            if (current && typeof current === "object" && !Array.isArray(current)) {
+                const keys = Object.keys(current).slice(-clientInfo.limit);
+                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
+            }
+            const filtered = filterDataByRules(current, clientInfo.path, clientInfo.auth, root, clientInfo.rules);
+            const snapshotStr = JSON.stringify(filtered);
+            ws.send(snapshotStr);
+            clientInfo.lastData = snapshotStr;
+        } catch (e) {
+            console.error("WS broadcastUpdate error:", e);
+        }
+    }
 }
 function clearCompletedApplies() {
     try {
@@ -2341,6 +2522,64 @@ function enqueueDiscordRequest(axiosConfig) {
         });
     });
 }
+function evaluate(rule, context) {
+    try {
+        const fn = new Function(
+            "auth",
+            "root",
+            "data",
+            "newData",
+            "now",
+            ...Object.keys(context.wildcards),
+            `return (${rule});`
+        );
+        return fn(
+            context.auth,
+            context.root,
+            context.data,
+            context.newData,
+            Date.now(),
+            ...Object.values(context.wildcards)
+        );
+    } catch (err) {
+        console.error("Rule error:", err);
+        return false;
+    }
+}
+function filterDataByRules(data, pathParts, auth, root, rules) {
+    if (data == null) return data;
+    const { rule, wildcards } = getRuleForOperation(rules, pathParts, "read");
+    const dataSnap = new DataSnapshot(data);
+    let allowed = true;
+    if (rule) {
+        allowed = evaluate(rule, {
+            auth,
+            root,
+            data: dataSnap,
+            newData: dataSnap,
+            wildcards
+        });
+    }
+    if (typeof data !== "object") {
+        return allowed ? data : undefined;
+    }
+    const result = Array.isArray(data) ? [] : {};
+    for (const key in data) {
+        const filteredChild = filterDataByRules(
+            data[key],
+            [...pathParts, key],
+            auth,
+            root,
+            rules
+        );
+        if (filteredChild !== undefined) {
+            result[key] = filteredChild;
+        }
+    }
+    if (allowed) return result;
+    if (Object.keys(result).length > 0) return result;
+    return undefined;
+}
 function folderSizeBytes(folder) {
     const files = fs.existsSync(folder) ? fs.readdirSync(folder) : [];
     return files.reduce((sum, f) => {
@@ -2382,10 +2621,45 @@ function formatSize(bytes) {
     const gb = mb / 1024;
     return gb.toFixed(2) + " GB";
 }
+function formatTime(timestamp) {
+    const date = new Date(timestamp);
+    let hours = date.getHours();
+    const minutes = date.getMinutes().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12;
+    hours = hours ? hours : 12;
+    return `${hours}:${minutes} ${ampm}`;
+}
+function formatTimes(date) {
+    return date.toLocaleString("en-US", {
+        hour12: true
+    });
+}
+function getIP(req) {
+    return req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
+}
 function getNextOrder(moviesJson) {
     const orders = Object.values(moviesJson).map(m => m.order);
     if (orders.length === 0) return 1;
     return Math.max(...orders) + 1;
+}
+function getRuleForOperation(rules, pathParts, type) {
+    let current = rules;
+    let lastRule = null;
+    let wildcards = {};
+    for (const part of pathParts) {
+        if (current["." + type] !== undefined) lastRule = current["." + type];
+        if (current[part]) current = current[part];
+        else {
+            const wildcardKey = Object.keys(current).find((k) => k.startsWith("$"));
+            if (wildcardKey) {
+                wildcards[wildcardKey] = part;
+                current = current[wildcardKey];
+            } else break;
+        }
+    }
+    if (current?.["." + type] !== undefined) lastRule = current["." + type];
+    return { rule: lastRule, wildcards };
 }
 function listFilesLive() {
     liveMode = true;
@@ -2489,6 +2763,9 @@ function loadApplyJSON() {
     }
     return data;
 }
+function loadDataSync() {
+    return getDataCache();
+}
 function loadMoviesJSON() {
     if (!fs.existsSync(MOVIES_JSON)) return {};
     try {
@@ -2509,15 +2786,6 @@ function loadReportJSON() {
 }
 function saveReportJSON(data) {
     fs.writeFileSync(REPORT_JSON, JSON.stringify(data, null, 2));
-}
-function formatTime(timestamp) {
-    const date = new Date(timestamp);
-    let hours = date.getHours();
-    const minutes = date.getMinutes().toString().padStart(2, '0');
-    const ampm = hours >= 12 ? 'PM' : 'AM';
-    hours = hours % 12;
-    hours = hours ? hours : 12;
-    return `${hours}:${minutes} ${ampm}`;
 }
 function logEvent(eventType, eventData) {
     const now = new Date();
@@ -2589,6 +2857,13 @@ function mainMenu() {
                 mainMenu();
         }
     });
+}
+function pathsMatch(clientPath, updatePath) {
+    if (updatePath.length < clientPath.length) return false;
+    for (let i = 0; i < clientPath.length; i++) {
+        if (clientPath[i] !== updatePath[i]) return false;
+    }
+    return true;
 }
 function pruneOldLogs() {
     const cutoff = Date.now() - 5 * 60 * 1000;
@@ -2665,6 +2940,37 @@ function safeName(original) {
 }
 function saveApplyJSON(data) {
     fs.writeFileSync(APPLY_JSON, JSON.stringify(data, null, 4));
+}
+function saveData(data) {
+    _dataCache = data;
+    fs.writeFileSync("./data.json", JSON.stringify(data, null, 2));
+}
+function updateDataPath(pathStr, updates) {
+    const data = getDataCache();
+    const keys = pathStr.split("/").filter(Boolean);
+    let cur = data;
+    for (let i = 0; i < keys.length - 1; i++) {
+        if (!cur[keys[i]] || typeof cur[keys[i]] !== "object") cur[keys[i]] = {};
+        cur = cur[keys[i]];
+    }
+    const last = keys[keys.length - 1];
+    if (!cur[last] || typeof cur[last] !== "object") cur[last] = {};
+    for (const [k, v] of Object.entries(updates)) {
+        if (v === null || v === undefined) delete cur[last][k];
+        else cur[last][k] = v;
+    }
+    saveData(data);
+    return data;
+}
+function readDataPath(pathStr) {
+    const data = getDataCache();
+    const keys = pathStr.split("/").filter(Boolean);
+    let cur = data;
+    for (const k of keys) {
+        if (cur == null) return null;
+        cur = cur[k];
+    }
+    return cur ?? null;
 }
 function saveMoviesJSON(data) {
     fs.writeFileSync(MOVIES_JSON, JSON.stringify(data, null, 4));
@@ -2769,9 +3075,7 @@ function setupSocketHandlers(ioInstance, label) {
                     }
                     if (uploaderUid && uploaderUid !== "unknown") {
                         try {
-                            await db.ref(`users/${uploaderUid}/profile`).update({
-                                isUploader: true
-                            });
+                            updateDataPath(`users/${uploaderUid}/profile`, { isUploader: true });
                         } catch (err) {
                             console.error("Failed To Grant Uploader Role:", err);
                         }
@@ -2909,23 +3213,23 @@ setInterval(() => {
 setInterval(async () => {
     try {
         const now = Date.now();
-        const snap = await db.ref("users").once("value");
-        if (!snap.exists()) return;
-        const updates = {};
-        snap.forEach(userSnap => {
-            const uid = userSnap.key;
-            const profile = userSnap.child("profile").val();
-            if (!profile) return;
-            if ((profile.premium1 || profile.premium2 || profile.premium3) === true  && profile.preExpire && now >= profile.preExpire) {
-                updates[`users/${uid}/profile/premium1`] = null;
-                updates[`users/${uid}/profile/premium2`] = null;
-                updates[`users/${uid}/profile/premium3`] = null;
-                updates[`users/${uid}/profile/preExpire`] = null;
+        const _expData = getDataCache();
+        if (!_expData.users) return;
+        let _expiredCount = 0;
+        for (const [_expUid, _expUserData] of Object.entries(_expData.users)) {
+            const profile = _expUserData?.profile;
+            if (!profile) continue;
+            if ((profile.premium1 || profile.premium2 || profile.premium3) && profile.preExpire && now >= profile.preExpire) {
+                delete profile.premium1;
+                delete profile.premium2;
+                delete profile.premium3;
+                delete profile.preExpire;
+                _expiredCount++;
             }
-        });
-        if (Object.keys(updates).length > 0) {
-            await db.ref().update(updates);
-            console.log("Expired Premium Removed For Users:", Object.keys(updates).length / 2);
+        }
+        if (_expiredCount > 0) {
+            saveData(_expData);
+            console.log("Expired Premium Removed For Users:", _expiredCount);
         }
     } catch (err) {
         console.error("Premium Expiration Job Error:", err);
@@ -2945,17 +3249,123 @@ setInterval(() => {
         archiveReport();
     }
 }, 60 * 1000);
+const WS_POLL_INTERVAL_NORMAL = 3000;
+const WS_POLL_INTERVAL_TYPING = 1000;
+setInterval(async () => {
+    if (wsClients.size === 0) return;
+    let dataJson;
+    try {
+        dataJson = getDataCache();
+    } catch (e) {
+        return;
+    }
+    const root = new DataSnapshot(dataJson);
+    const now = Date.now();
+    for (const [ws, clientInfo] of wsClients.entries()) {
+        if (ws.readyState !== ws.OPEN) continue;
+        const isTypingPath = clientInfo.path.includes("typing");
+        if (!isTypingPath && now - (clientInfo.lastPollAt || 0) < WS_POLL_INTERVAL_NORMAL) continue;
+        clientInfo.lastPollAt = now;
+        try {
+            let current = dataJson;
+            for (const p of clientInfo.path) current = current?.[p];
+            if (current && typeof current === "object" && !Array.isArray(current)) {
+                const keys = Object.keys(current).slice(-clientInfo.limit);
+                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
+            }
+            const filtered = filterDataByRules(current, clientInfo.path, clientInfo.auth, root, clientInfo.rules);
+            const snapshotStr = JSON.stringify(filtered);
+            if (isTypingPath || snapshotStr !== clientInfo.lastData) {
+                ws.send(snapshotStr);
+                clientInfo.lastData = snapshotStr;
+            }
+        } catch (err) {
+            console.error("WS Poll Error:", err);
+        }
+    }
+}, WS_POLL_INTERVAL_TYPING);
 process.on("SIGINT", () => {
     console.clear();
     console.log("\nExiting");
     process.exit(0);
 });
-httpServer.listen(PORT, () => {
+const server = httpServer.listen(PORT, () => {
     console.log(`Infinite Campus Server Running At http://localhost:${PORT}`);
     httpServer.setTimeout(0);
     httpServer.keepAliveTimeout = 0;
     httpServer.headersTimeout = 0;
     mainMenu();
+});
+const wss = new WebSocketServer({ noServer: true });
+httpServer.on("upgrade", (request, socket, head) => {
+    const pathname = new URL(request.url, `http://${request.headers.host}`).pathname;
+    if (
+        pathname.startsWith("/socket_io_live_" + UNIQUE_SUFFIX) ||
+        pathname.startsWith("/socket_io_realtime_" + UNIQUE_SUFFIX)
+    ) {
+        return;
+    }
+    wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+    });
+});
+const wsClients = new Map();
+wss.on("connection", async (ws, req) => {
+    try {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+        const token = url.searchParams.get("token");
+        const wsPath = JSON.parse(url.searchParams.get("path") || "[]");
+        const limit = Number(url.searchParams.get("limit") || 50);
+        let uid = null;
+        if (token) {
+            try {
+                uid = await verifyToken(token);
+            } catch {
+                uid = null;
+            }
+        }
+        const dataJson = getDataCache();
+        const rules = await loadRules();
+        const root = new DataSnapshot(dataJson);
+        let auth = null;
+        if (uid) {
+            const userProfile = dataJson?.users?.[uid]?.profile || {};
+            auth = { uid, ...userProfile };
+        }
+        const { rule, wildcards } = getRuleForOperation(rules, wsPath, "read");
+        if (rule && !evaluate(rule, {
+            auth,
+            root,
+            data: root,
+            newData: root,
+            wildcards
+        })) {
+            return ws.close();
+        }
+        try {
+            let current = dataJson;
+            for (const p of wsPath) current = current?.[p];
+            if (current && typeof current === "object" && !Array.isArray(current)) {
+                const keys = Object.keys(current).slice(-limit);
+                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
+            }
+            const filtered = filterDataByRules(current, wsPath, auth, root, rules);
+            const snapshotStr = JSON.stringify(filtered);
+            ws.send(snapshotStr);
+            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: snapshotStr, rules, lastPollAt: Date.now() });
+        } catch (e) {
+            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: null, rules, lastPollAt: 0 });
+        }
+        ws.on("close", () => {
+            wsClients.delete(ws);
+        });
+        ws.on("error", () => {
+            wsClients.delete(ws);
+        });
+    } catch (err) {
+        console.error("WS connection error:", err);
+        ws.close();
+    }
 });
 setupSocketHandlers(ioLive, "LIVE");
 setupSocketHandlers(ioRealtime, "REALTIME");

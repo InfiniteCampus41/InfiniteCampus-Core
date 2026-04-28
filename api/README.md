@@ -1,19 +1,23 @@
 This Folder Is The Source Code For https://api.infinitecampus.xyz
 
-To Deploy The Code, You Need Node.js And NPM
-
-Step 1:
-Download The Folder And Open The Directory In The Terminal
-
-Step 2:
-Run npm install
-
-Step 3:
-Run node server.js
+To Deploy The Code, You Need Node.js And NPM. I Believe You Also Need ffmpeg And Its Dependancies
 
 IMPORTANT --
-1. You Need To Have A Discord Bot Token In The .env File
-2. You Need A CHANNEL_ID In The .env File
-The Next Few Are Reccommendations
-3. At Least 1 Admin Password In The .env File
-4. If You Want PFPs On Your Repo, Add GITHUB_TOKEN To The .env File
+You Need To Have The Following In The .env File
+DISCORD_BOT_TOKEN
+CHANNEL_ID
+PORT
+ADMIN_PASSWORD
+ADMIN_PASSWORD_2
+DON_PASS_1
+YOYOMASTER
+NITRIX67
+GITHUB_TOKEN
+DISCORD_GUILD_ID
+HB_API_TEST_KEY
+HB_API_KEY
+SQUARE_ACCESS_TOKEN
+SQUARE_LOCATION_ID
+SQUARE_WEBHOOK_SIGNATURE_KEY
+TMDB_API_KEY
+CLEAR_LOG_DAY

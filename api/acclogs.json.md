@@ -1,0 +1,1 @@
+This File Is For Logging When An Admin Logs In As Another Person. This Is To Prevent Abuse If A Security Issue Were To Be Discovered

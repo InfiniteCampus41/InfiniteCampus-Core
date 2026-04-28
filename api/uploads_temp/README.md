@@ -1,1 +1,1 @@
-This Folder Is For Where The Movie Applicant Chunks Go When Uploaded
+This Folder Is For Where The Movie Applicant Chunks Go While Being Uploaded

@@ -1,1 +1,1 @@
-This File Is For Storing The Data For The Movie Applicants. It Is Still A WIP
+This File Is For Storing The Data For The Movie Applicants.
