@@ -1564,9 +1564,10 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
         const indexJson = await indexRes.json();
         const numbers = indexJson.map(name =>
             parseInt(name.split(".")[0], 10)
-        );
-        const nextNumber = Math.max(...numbers) + 1;
+        ).filter(n => !isNaN(n));
+        const nextNumber = (numbers.length > 0 ? numbers.reduce((a, b) => Math.max(a, b), 0) : 0) + 1;
         const newFileName = `${nextNumber}${ext}`;
+        const newPicIndex = indexJson.length;
         indexJson.push(newFileName);
         const updatedIndexContent = Buffer.from(
             JSON.stringify(indexJson, null, 2)
@@ -1615,11 +1616,11 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
                 }
             }
         );
-        updateDataPath(`users/${uid}/profile`, { pic: nextNumber - 1 });
+        updateDataPath(`users/${uid}/profile`, { pic: newPicIndex });
         res.json({
             success: true,
             file: newFileName,
-            picIndex: nextNumber - 1
+            picIndex: newPicIndex
         });
         await cleanupAndReindexPfps();
     } catch (err) {
@@ -1921,9 +1922,14 @@ async function cleanupAndReindexPfps() {
     let _pfpChanged = false;
     for (const [_userId, _userData] of Object.entries(_pfpUpdateData.users || {})) {
         const oldPic = _userData?.profile?.pic;
-        if (typeof oldPic === "number" && oldToNew.hasOwnProperty(oldPic)) {
-            _pfpUpdateData.users[_userId].profile.pic = oldToNew[oldPic];
-            _pfpChanged = true;
+        if (typeof oldPic === "number") {
+            if (oldToNew.hasOwnProperty(oldPic)) {
+                _pfpUpdateData.users[_userId].profile.pic = oldToNew[oldPic];
+                _pfpChanged = true;
+            } else {
+                delete _pfpUpdateData.users[_userId].profile.pic;
+                _pfpChanged = true;
+            }
         }
     }
     if (_pfpChanged) saveData(_pfpUpdateData);
