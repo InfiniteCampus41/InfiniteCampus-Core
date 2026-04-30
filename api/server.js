@@ -897,6 +897,44 @@ app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
         return res.json({ ok: false, message: err.message });
     }
 });
+const RULES_PATH = path.join(__dirname, "rules.json");
+app.all("/admin/modify-rules", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isHAdmin || profile.isDev)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        if (req.method === "GET") {
+            if (!fs.existsSync(RULES_PATH)) {
+                return res.status(404).json({ error: "rules.json Not Found" });
+            }
+            const raw = fs.readFileSync(RULES_PATH, "utf8");
+            return res.json({ rules: JSON.parse(raw) });
+        }
+        if (req.method === "POST") {
+            const { rules } = req.body;
+            if (!rules || typeof rules !== "object") {
+                return res.status(400).json({ error: "Missing or invalid rules object" });
+            }
+            const newContent = JSON.stringify(rules, null, 2);
+            fs.writeFileSync(RULES_PATH, newContent, "utf8");
+            const report = loadReportJSON();
+            const day = new Date().getDate().toString();
+            if (!report.report[day]) report.report[day] = {};
+            if (!report.report[day]["rules-modified"]) report.report[day]["rules-modified"] = { count: 0 };
+            report.report[day]["rules-modified"].count++;
+            if (!report.timesRulesModified) report.timesRulesModified = 0;
+            report.timesRulesModified++;
+            saveReportJSON(report);
+            return res.json({ ok: true, timesRulesModified: report.timesRulesModified });
+        }
+        return res.status(405).json({ error: "Method Not Allowed" });
+    } catch (err) {
+        console.error("modify-rules error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
 app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterUid = req.user.uid;
