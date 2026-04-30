@@ -175,6 +175,7 @@ const ROUTES = {
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
 };
 const seenUsers = new Set();
+const onlineLastSeen = new Map();
 const sessions = new Map();
 const storageApply = multer.diskStorage({
     destination: (req, file, cb) => cb(null, APPLY_DIR),
@@ -1385,6 +1386,16 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
         console.error("Chunk Upload Error:", err);
         res.status(500).json({ ok: false, message: err.message });
     }
+});
+app.post("/online", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        updateDataPath(`users/${uid}/profile`, { online: true });
+        onlineLastSeen.set(uid, Date.now());
+        res.json({
+            success: true
+        });
+    } catch{}
 });
 app.post("/pay", verifyFirebaseToken, async (req, res) => {
     try {
@@ -3286,6 +3297,16 @@ setInterval(async () => {
         console.error("Premium Expiration Job Error:", err);
     }
 }, 5 * 60 * 1000);
+setInterval(() => {
+    const now = Date.now();
+    const ONLINE_TIMEOUT = 5 * 60 * 1000;
+    for (const [uid, lastSeen] of onlineLastSeen.entries()) {
+        if (now - lastSeen > ONLINE_TIMEOUT) {
+            updateDataPath(`users/${uid}/profile`, { online: null });
+            onlineLastSeen.delete(uid);
+        }
+    }
+}, 60 * 1000);
 setInterval(() => {
     if (acceptStatus.size > 500) {
         acceptStatus.clear();
