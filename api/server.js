@@ -3123,6 +3123,13 @@ function setupSocketHandlers(ioInstance, label) {
                         } catch (err) {
                             console.error("Failed To Grant Uploader Role:", err);
                         }
+                        try {
+                            const currentUploads = readDataPath(`users/${uploaderUid}/profile/uploads`);
+                            const newUploads = (typeof currentUploads === "number" ? currentUploads : 0) + 1;
+                            updateDataPath(`users/${uploaderUid}/profile`, { uploads: newUploads });
+                        } catch (err) {
+                            console.error("Failed To Increment Upload Count:", err);
+                        }
                     }
                 } catch (e) {
                     console.error("Failed To Load Uploader Metadata");
