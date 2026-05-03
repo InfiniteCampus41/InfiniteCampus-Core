@@ -936,6 +936,36 @@ app.all("/admin/modify-rules", verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
+const DATA_PATH = path.join(__dirname, "data.json");
+app.all("/admin/modify-data", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !profile.isOwner) {
+            return res.status(403).json({ error: "Not Authorized: Owner Only" });
+        }
+        if (req.method === "GET") {
+            if (!fs.existsSync(DATA_PATH)) {
+                return res.status(404).json({ error: "data.json Not Found" });
+            }
+            const raw = fs.readFileSync(DATA_PATH, "utf8");
+            return res.json({ data: JSON.parse(raw) });
+        }
+        if (req.method === "POST") {
+            const { data } = req.body;
+            if (!data || typeof data !== "object") {
+                return res.status(400).json({ error: "Missing Or Invalid Data Object" });
+            }
+            saveData(data);
+            console.log(`[admin/modify-data] data.json Overwritten By Owner ${uid}`);
+            return res.json({ ok: true });
+        }
+        return res.status(405).json({ error: "Method Not Allowed" });
+    } catch (err) {
+        console.error("modify-data error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
 app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterUid = req.user.uid;
@@ -2869,8 +2899,9 @@ function ensureArchiveDir() {
 function archiveReport() {
     const now = new Date();
     const monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-    const month = monthNames[now.getMonth()];
-    const year = now.getFullYear();
+    const prevMonth = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const month = monthNames[prevMonth.getMonth()];
+    const year = prevMonth.getFullYear();
     const archiveName = `${month}${year}report.json`;
     ensureArchiveDir();
     if (fs.existsSync(REPORT_JSON)) {
