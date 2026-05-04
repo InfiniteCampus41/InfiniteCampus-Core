@@ -1254,6 +1254,59 @@ app.post("/discordVerifyConfirm", async (req, res) => {
         message: "Discord Account Verified"
     });
 });
+app.post("/admin/verify-user", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const profile = readDataPath(`users/${requesterUid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        const { uid } = req.body;
+        if (!uid) return res.status(400).json({ error: "Missing uid" });
+        const targetProfile = readDataPath(`users/${uid}/profile`);
+        if (!targetProfile) return res.status(404).json({ error: "User Not Found" });
+        if (targetProfile.verified) return res.json({ success: true, message: "User Already Verified" });
+        updateDataPath(`users/${uid}/profile`, { verified: true });
+        logEvent("notifications", {
+            id: `verified_${uid}_${Date.now()}`,
+            data: { type: "userVerified", uid, verifiedBy: requesterUid }
+        });
+        console.log(`User ${uid} verified by ${requesterUid}`);
+        res.json({ success: true, message: "User Verified" });
+    } catch (err) {
+        console.error("verify-user error:", err);
+        res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
+app.get("/admin/verify-user", async (req, res) => {
+    const { uid, token } = req.query;
+    if (!uid) return res.status(400).send("Missing uid");
+    let requesterUid = null;
+    if (token) {
+        try {
+            const decoded = await admin.auth().verifyIdToken(token);
+            requesterUid = decoded.uid;
+        } catch {
+            return res.status(401).send("Invalid token");
+        }
+    } else {
+        return res.redirect(`/InfiniteAdminChats.html?verifyUid=${encodeURIComponent(uid)}`);
+    }
+    const profile = readDataPath(`users/${requesterUid}/profile`);
+    if (!profile || !(profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev)) {
+        return res.status(403).send("Not Authorized");
+    }
+    const targetProfile = readDataPath(`users/${uid}/profile`);
+    if (!targetProfile) return res.status(404).send("User Not Found");
+    if (targetProfile.verified) return res.send("User Already Verified");
+    updateDataPath(`users/${uid}/profile`, { verified: true });
+    logEvent("notifications", {
+        id: `verified_${uid}_${Date.now()}`,
+        data: { type: "userVerified", uid, verifiedBy: requesterUid }
+    });
+    console.log(`User ${uid} verified by ${requesterUid} via GET`);
+    res.send(`<html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2>✅ User Verified Successfully</h2><p>The user has been verified and can now access the chat.</p><a href="/InfiniteAdminChats.html" style="color:#4fa3ff">Back to Admin Chat</a></div></body></html>`);
+});
 app.post("/github-webhook", express.json({ type: "application/json" }),async (req, res) => {    
     const event = req.headers["x-github-event"];
     const payload = req.body;
@@ -2513,7 +2566,7 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
         if (!tokens.length) return;
         const data = getDataCache();
         const reactorName = data?.users?.[reactorUid]?.profile?.displayName || "Someone";
-        const url = `/InfiniteChat.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
             notification: {
@@ -2523,8 +2576,12 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
             data: { type: "reaction", url, channel: channel || "", msgId: String(msgId) },
             webpush: { fcmOptions: { link: url } }
         });
+        logEvent("notifications", {
+            id: `reaction_${Date.now()}`,
+            data: { type: "reaction", to: targetUid, from: reactorUid, emoji, channel: channel || "", msgId: String(msgId) }
+        });
     } catch (e) {
-        console.error("Reaction notification error:", e.message || e);
+        console.error("Reaction Notification Error:", e.message || e);
     }
 }
 async function sendMentionNotification(targetUid, senderUid, channel, msgId, text) {
@@ -2534,7 +2591,7 @@ async function sendMentionNotification(targetUid, senderUid, channel, msgId, tex
         const data = getDataCache();
         const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
         const preview = (text || "").substring(0, 80);
-        const url = `/InfiniteChat.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
             notification: {
@@ -2544,8 +2601,12 @@ async function sendMentionNotification(targetUid, senderUid, channel, msgId, tex
             data: { type: "mention", url, channel: channel || "", msgId: String(msgId) },
             webpush: { fcmOptions: { link: url } }
         });
+        logEvent("notifications", {
+            id: `mention_${Date.now()}`,
+            data: { type: "mention", to: targetUid, from: senderUid, channel: channel || "", msgId: String(msgId) }
+        });
     } catch (e) {
-        console.error("Mention notification error:", e.message || e);
+        console.error("Mention Notification Error:", e.message || e);
     }
 }
 async function sendDMNotification(targetUid, senderUid, text) {
@@ -2555,7 +2616,7 @@ async function sendDMNotification(targetUid, senderUid, text) {
         const data = getDataCache();
         const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
         const preview = (text || "").substring(0, 80);
-        const url = `/InfiniteChat.html?dm=${encodeURIComponent(senderUid)}`;
+        const url = `/InfiniteChatters.html?dm=${encodeURIComponent(senderUid)}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
             notification: {
@@ -2565,8 +2626,12 @@ async function sendDMNotification(targetUid, senderUid, text) {
             data: { type: "dm", url, senderUid },
             webpush: { fcmOptions: { link: url } }
         });
+        logEvent("notifications", {
+            id: `dm_${Date.now()}`,
+            data: { type: "dm", to: targetUid, from: senderUid }
+        });
     } catch (e) {
-        console.error("DM notification error:", e.message || e);
+        console.error("DM Notification Error:", e.message || e);
     }
 }
 async function getUidByDisplayNameServer(displayName) {
@@ -2652,11 +2717,13 @@ async function sendVerificationNotification(uid, displayName) {
         console.log("No Admin Tokens Found.");
         return;
     }
+    const verifyUrl = `/admin/verify-user?uid=${encodeURIComponent(uid)}`;
     const message = {
         data: {
             type: "verifyUser",
             uid: uid,
-            url: `/InfiniteAdminChats.html`
+            url: `/InfiniteAdminChats.html`,
+            verifyUrl
         },
         notification: {
             title: "A New User Has Signed Up!",
@@ -2664,12 +2731,25 @@ async function sendVerificationNotification(uid, displayName) {
         },
         tokens: tokens,
         webpush: {
-            fcmOptions: { link: `/InfiniteAdminChats.html` }
+            fcmOptions: { link: `/InfiniteAdminChats.html` },
+            notification: {
+                title: "A New User Has Signed Up!",
+                body: `User ${displayName} Is Awaiting Verification`,
+                actions: [
+                    { action: "verify", title: "Verify User" },
+                    { action: "dismiss", title: "Dismiss" }
+                ],
+                data: { type: "verifyUser", uid, verifyUrl }
+            }
         }
     };
     const response = await admin.messaging().sendEachForMulticast(message);
     console.log("Verification Notification Sent.");
     console.log("Success:", response.successCount);
+    logEvent("notifications", {
+        id: `verify_${uid}_${Date.now()}`,
+        data: { type: "verifyUser", uid, displayName }
+    });
 }
 async function startAcceptProcess(movieName) {
     updateApply(movieName, {
