@@ -27,12 +27,12 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
     res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, uploadedby, ngrok-skip-browser-warning, x-admin-password, fileId, chunkIndex, totalChunks, filename, x-user-id, X-File-Id, X-Chunk-Number, X-Total-Chunks, X-Filename, X-User-Id");
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
 });
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"], allowedHeaders: [ "Content-Type", "Authorization", "ngrok-skip-browser-warning", "x-admin-password", "fileId", "chunkIndex", "totalChunks", "filename", "x-user-id", "X-File-Id", "X-Chunk-Number", "X-Total-Chunks", "X-User-Id", "uploadedby"]}));
+app.use(cors({ origin: "*", methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"], allowedHeaders: [ "Content-Type", "Authorization", "ngrok-skip-browser-warning", "x-admin-password", "fileId", "chunkIndex", "totalChunks", "filename", "x-user-id", "X-File-Id", "X-Chunk-Number", "X-Total-Chunks", "X-User-Id", "uploadedby"]}));
 const SQUARE_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
 const SQUARE_WEBHOOK_URL = "https://api.infinitecampus.xyz/square-webhook";
 app.post("/square-webhook",
@@ -78,8 +78,8 @@ app.post("/square-webhook",
         }
     }
 );
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
@@ -959,6 +959,32 @@ app.all("/admin/modify-data", verifyFirebaseToken, async (req, res) => {
             saveData(data);
             console.log(`[admin/modify-data] data.json Overwritten By Owner ${uid}`);
             return res.json({ ok: true });
+        }
+        if (req.method === "PATCH") {
+            const { patches } = req.body;
+            if (!Array.isArray(patches) || patches.length === 0) {
+                return res.status(400).json({ error: "Missing Or Invalid Patches Array" });
+            }
+            const data = getDataCache();
+            for (const { path: patchPath, value } of patches) {
+                if (typeof patchPath !== "string") continue;
+                const keys = patchPath.split("/").filter(Boolean);
+                if (keys.length === 0) continue;
+                let cur = data;
+                for (let i = 0; i < keys.length - 1; i++) {
+                    if (!cur[keys[i]] || typeof cur[keys[i]] !== "object") cur[keys[i]] = {};
+                    cur = cur[keys[i]];
+                }
+                const last = keys[keys.length - 1];
+                if (value === null || value === undefined) {
+                    delete cur[last];
+                } else {
+                    cur[last] = value;
+                }
+            }
+            saveData(data);
+            console.log(`[admin/modify-data PATCH] ${patches.length} patch(es) applied by ${uid}`);
+            return res.json({ ok: true, patches: patches.length });
         }
         return res.status(405).json({ error: "Method Not Allowed" });
     } catch (err) {
