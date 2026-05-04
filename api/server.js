@@ -162,6 +162,64 @@ const pfpUploadCooldown = new Map();
 const PORT = process.env.PORT || 4000;
 const QUEUE_DIR = path.join(__dirname, "queue");
 const rateLimitLogs = [];
+const RATE_LIMIT_ENABLED = true;
+const RATE_LIMITS = {
+    read:    { max: 200,  window: 10_000 },  // 200 reads  / 10 s
+    write:   { max: 25,  window: 10_000 },  // 25 writes / 10 s
+    delete:  { max: 15,  window: 10_000 },  // 15 deletes/ 10 s
+    react:   { max: 20,  window: 10_000 },  // 20 reacts / 10 s
+    online:  { max: 20,   window: 30_000 },  // 20  pings  / 30 s  (client calls every 20 s)
+    upload:  { max: 10,  window: 60_000 },  // 10 uploads/ 60 s
+    default: { max: 40,  window: 10_000 },  // misc fallback
+};
+const _rateLimitStore = new Map();
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of _rateLimitStore.entries()) {
+        if (now >= entry.resetAt) _rateLimitStore.delete(key);
+    }
+}, 60_000);
+function _checkRateLimit(identifier, endpoint) {
+    if (!RATE_LIMIT_ENABLED) return null;
+    const cfg = RATE_LIMITS[endpoint] || RATE_LIMITS.default;
+    const key = `${identifier}:${endpoint}`;
+    const now = Date.now();
+    let entry = _rateLimitStore.get(key);
+    if (!entry || now >= entry.resetAt) {
+        entry = { count: 0, resetAt: now + cfg.window };
+        _rateLimitStore.set(key, entry);
+    }
+    entry.count++;
+    if (entry.count > cfg.max) {
+        const retryAfter = Math.ceil((entry.resetAt - now) / 1000);
+        return { retryAfter, max: cfg.max, endpoint };
+    }
+    return null;
+}
+function rateLimit(endpoint) {
+    return async (req, res, next) => {
+        if (!RATE_LIMIT_ENABLED) return next();
+        let identifier = null;
+        const header = req.headers.authorization;
+        if (header?.startsWith("Bearer ")) {
+            try {
+                identifier = (await admin.auth().verifyIdToken(header.split("Bearer ")[1])).uid;
+            } catch { }
+        }
+        if (!identifier) identifier = getIP(req);
+        const hit = _checkRateLimit(identifier, endpoint);
+        if (hit) {
+            const msg = `[RateLimit] ${endpoint} exceeded by ${identifier} (${hit.max}/window)`;
+            rateLimitLogs.push({ message: msg, ts: Date.now() });
+            if (rateLimitLogs.length > 2000) rateLimitLogs.shift();
+            return res.status(429).json({
+                error: `Rate limit exceeded for "${endpoint}". Try again in ${hit.retryAfter}s.`,
+                retryAfter: hit.retryAfter
+            });
+        }
+        next();
+    };
+}
 const READY_DIR = path.join(__dirname, "ready");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ROUTES = {
@@ -1061,7 +1119,7 @@ app.post("/check_pass", (req, res) => {
     console.log("Password Incorrect");
     return res.status(401).json({ status: "invalid" });
 });
-app.post("/delete", async (req, res) => {
+app.post("/delete", rateLimit("delete"), async (req, res) => {
     try {
         const uid = await verifyToken(req);
         const { path } = req.body;
@@ -1443,7 +1501,7 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
         res.status(500).json({ ok: false, message: err.message });
     }
 });
-app.post("/online", verifyFirebaseToken, async (req, res) => {
+app.post("/online", verifyFirebaseToken, rateLimit("online"), async (req, res) => {
     try {
         const uid = req.user.uid;
         updateDataPath(`users/${uid}/profile`, { online: true });
@@ -1485,7 +1543,7 @@ app.post("/pay", verifyFirebaseToken, async (req, res) => {
         }
     }
 });
-app.post("/read", async (req, res) => {
+app.post("/read", rateLimit("read"), async (req, res) => {
     try {
         let uid = null;
         let auth = null;
@@ -1816,7 +1874,7 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
         res.status(500).json({ error: "Upload Failed" });
     }
 });
-app.post("/write", async (req, res) => {
+app.post("/write", rateLimit("write"), async (req, res) => {
     try {
         const uid = await verifyToken(req);
         const { path, value } = req.body;
@@ -1843,6 +1901,45 @@ app.post("/write", async (req, res) => {
         saveData(dataJson);
         broadcastUpdate(path, newValue);
         res.json({ success: true });
+        (async () => {
+            try {
+                if (
+                    path.length === 3 &&
+                    path[0] === "messages" &&
+                    newValue &&
+                    typeof newValue === "object" &&
+                    newValue.text &&
+                    newValue.sender
+                ) {
+                    const channel = path[1];
+                    const msgId   = path[2];
+                    const matches = [...(newValue.text.matchAll(/@([^\s<]+)/g))];
+                    for (const [, name] of matches) {
+                        if (name.toLowerCase() === "support") continue;
+                        const targetUid = await getUidByDisplayNameServer(name);
+                        if (targetUid && targetUid !== uid) {
+                            await sendMentionNotification(targetUid, uid, channel, msgId, newValue.text);
+                        }
+                    }
+                }
+                if (
+                    path.length === 4 &&
+                    path[0] === "private" &&
+                    newValue &&
+                    typeof newValue === "object" &&
+                    newValue.text &&
+                    newValue.sender
+                ) {
+                    const [uidA, uidB] = [path[1], path[2]];
+                    const recipientUid = newValue.sender === uidA ? uidB : uidA;
+                    if (recipientUid && recipientUid !== uid) {
+                        await sendDMNotification(recipientUid, uid, newValue.text);
+                    }
+                }
+            } catch (notifErr) {
+                console.error("Post-write notification error:", notifErr.message || notifErr);
+            }
+        })();
     } catch (err) {
         console.error(err);
         res.status(401).json({ error: "Unauthorized" });
@@ -2405,6 +2502,140 @@ async function sendDiscordEmbedPre(embed) {
         headers: { "Content-Type": "application/json", "Authorization": `Bot ${DISCORD_BOT_TOKEN}` }
     });
 }
+async function _getPushTokensForUser(uid) {
+    const data = getDataCache();
+    const tokenMap = data?.pushTokens?.[uid] || {};
+    return Object.keys(tokenMap);
+}
+async function sendReactionNotification(targetUid, reactorUid, emoji, channel, msgId) {
+    try {
+        const tokens = await _getPushTokensForUser(targetUid);
+        if (!tokens.length) return;
+        const data = getDataCache();
+        const reactorName = data?.users?.[reactorUid]?.profile?.displayName || "Someone";
+        const url = `/InfiniteChat.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: {
+                title: "New Reaction",
+                body:  `${reactorName} Reacted ${emoji} To Your Message`
+            },
+            data: { type: "reaction", url, channel: channel || "", msgId: String(msgId) },
+            webpush: { fcmOptions: { link: url } }
+        });
+    } catch (e) {
+        console.error("Reaction notification error:", e.message || e);
+    }
+}
+async function sendMentionNotification(targetUid, senderUid, channel, msgId, text) {
+    try {
+        const tokens = await _getPushTokensForUser(targetUid);
+        if (!tokens.length) return;
+        const data = getDataCache();
+        const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
+        const preview = (text || "").substring(0, 80);
+        const url = `/InfiniteChat.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: {
+                title: `${senderName} Mentioned You`,
+                body:  preview
+            },
+            data: { type: "mention", url, channel: channel || "", msgId: String(msgId) },
+            webpush: { fcmOptions: { link: url } }
+        });
+    } catch (e) {
+        console.error("Mention notification error:", e.message || e);
+    }
+}
+async function sendDMNotification(targetUid, senderUid, text) {
+    try {
+        const tokens = await _getPushTokensForUser(targetUid);
+        if (!tokens.length) return;
+        const data = getDataCache();
+        const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
+        const preview = (text || "").substring(0, 80);
+        const url = `/InfiniteChat.html?dm=${encodeURIComponent(senderUid)}`;
+        await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: {
+                title: `DM From ${senderName}`,
+                body:  preview
+            },
+            data: { type: "dm", url, senderUid },
+            webpush: { fcmOptions: { link: url } }
+        });
+    } catch (e) {
+        console.error("DM notification error:", e.message || e);
+    }
+}
+async function getUidByDisplayNameServer(displayName) {
+    const data = getDataCache();
+    const clean = (displayName || "").replace(/ 💎/g, "").toLowerCase();
+    for (const [uid, userData] of Object.entries(data.users || {})) {
+        const dn = userData?.profile?.displayName;
+        if (dn && dn.replace(/ 💎/g, "").toLowerCase() === clean) return uid;
+    }
+    return null;
+}
+app.post("/react", verifyFirebaseToken, rateLimit("react"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { path: msgPath, emoji, channel } = req.body;
+        if (!Array.isArray(msgPath) || !emoji || typeof emoji !== "string") {
+            return res.status(400).json({ error: "Missing path or emoji" });
+        }
+        if (emoji.length > 8) {
+            return res.status(400).json({ error: "Invalid emoji" });
+        }
+        const dataJson = getDataCache();
+        let msg = dataJson;
+        for (const p of msgPath) msg = msg?.[p];
+        if (!msg || typeof msg !== "object") {
+            return res.status(404).json({ error: "Message not found" });
+        }
+        const reactions = msg.reactions ? { ...msg.reactions } : {};
+        const emojiReactors = reactions[emoji] ? { ...reactions[emoji] } : {};
+        const alreadyReacted = !!emojiReactors[uid];
+        if (alreadyReacted) {
+            delete emojiReactors[uid];
+            if (Object.keys(emojiReactors).length === 0) {
+                delete reactions[emoji];
+            } else {
+                reactions[emoji] = emojiReactors;
+            }
+        } else {
+            if (!reactions[emoji] && Object.keys(reactions).length >= MAX_REACTIONS_PER_MSG) {
+                return res.status(400).json({ error: `Max ${MAX_REACTIONS_PER_MSG} different reactions per message` });
+            }
+            let userReactionCount = 0;
+            for (const e of Object.keys(reactions)) {
+                if (reactions[e]?.[uid]) userReactionCount++;
+            }
+            if (userReactionCount >= MAX_REACTIONS_PER_USER_MSG) {
+                return res.status(400).json({ error: `Max ${MAX_REACTIONS_PER_USER_MSG} reactions per user per message` });
+            }
+            reactions[emoji] = { ...emojiReactors, [uid]: true };
+            const authorUid = msg.sender;
+            if (authorUid && authorUid !== uid) {
+                const msgId = msgPath[msgPath.length - 1];
+                sendReactionNotification(authorUid, uid, emoji, channel || msgPath[1] || "General", msgId).catch(() => {});
+            }
+        }
+        let parent = dataJson;
+        for (let i = 0; i < msgPath.length - 1; i++) parent = parent[msgPath[i]] ||= {};
+        const msgKey = msgPath[msgPath.length - 1];
+        parent[msgKey] = { ...parent[msgKey], reactions };
+        saveData(dataJson);
+        broadcastUpdate(msgPath, parent[msgKey]);
+        res.json({ success: true, reactions });
+    } catch (err) {
+        console.error("/react error:", err);
+        res.status(500).json({ error: "Internal server error" });
+    }
+});
+const MAX_REACTIONS_PER_MSG = 5;
+const MAX_REACTIONS_PER_USER_MSG = 20;
 async function sendVerificationNotification(uid, displayName) {
     const _svData = getDataCache();
     const tokens = [];
@@ -2431,7 +2662,10 @@ async function sendVerificationNotification(uid, displayName) {
             title: "A New User Has Signed Up!",
             body: `User ${displayName} Is Awaiting Verification`
         },
-        tokens: tokens
+        tokens: tokens,
+        webpush: {
+            fcmOptions: { link: `/InfiniteAdminChats.html` }
+        }
     };
     const response = await admin.messaging().sendEachForMulticast(message);
     console.log("Verification Notification Sent.");
