@@ -277,7 +277,7 @@ let lastCreateTime = 0;
 let liveInterval = null;
 let liveMode = false;
 let LOCKDOWN = false;
-let pinnedAcceptLine = null;
+const pinnedAcceptLines = new Map();
 let testEnabled = false;
 let vm;
 let _dataCache = null;
@@ -2312,6 +2312,7 @@ async function finishAccept(movieName) {
     setTimeout(() => {
         clearCompletedApplies();
         acceptStatus.delete(movieName);
+        pinnedAcceptLines.delete(movieName);
         if (acceptIntervals.has(movieName)) {
             clearInterval(acceptIntervals.get(movieName));
             acceptIntervals.delete(movieName);
@@ -2468,6 +2469,7 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
                     });
                     const pct = Math.round(percent);
                     const etaText = formatETA(remainingSec);
+                    pinnedAcceptLines.set(statusKey, `${statusKey}: ${humanLabel} ${pct}% ETA ${etaText}`);
                     renderPinnedAccept();
                     socket.emit("jobProgress", {
                         workId,
@@ -2485,11 +2487,8 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
         });
         ff.on("close", (code) => {
             if (code === 0) {
+                pinnedAcceptLines.delete(statusKey);
                 renderPinnedAccept();
-                setTimeout(() => {
-                    pinnedAcceptLine = null;
-                    renderPinnedAccept();
-                }, 3000);
                 socket.emit("jobProgress", {
                     workId,
                     filename: filenameLabel,
@@ -3341,12 +3340,12 @@ function pushUploadLog(filename, sizeBytes) {
     console.log(msg);
 }
 function renderPinnedAccept() {
-    if (!pinnedAcceptLine) return;
+    if (pinnedAcceptLines.size === 0) return;
     const currentInput = rl.line || "";
     const prompt = rl.getPrompt() || "> ";
     readline.cursorTo(process.stdout, 0, 0);
     readline.clearLine(process.stdout, 0);
-    process.stdout.write(pinnedAcceptLine);
+    process.stdout.write([...pinnedAcceptLines.values()].join(" | "));
     readline.cursorTo(process.stdout, prompt.length + currentInput.length);
 }
 function renderScreen(lines) {
@@ -3444,12 +3443,16 @@ function scheduleDailyClear() {
 function setupSocketHandlers(ioInstance, label) {
     ioInstance.on("connection", (socket) => {
         console.log(`${label} Admin Socket Connected:`, socket.id);
-        socket.on("acceptApplicant", async (payload) => {
+        socket.on("acceptApplicant", (payload) => {
             const { filename, targetName } = payload;
             const safeFile = path.basename(filename);
             const srcPath = path.join(APPLY_DIR, safeFile);
             if (!fs.existsSync(srcPath)) {
                 return socket.emit("jobError", { filename: safeFile, message: "Source File Not Found" });
+            }
+            const existing = acceptStatus.get(safeFile);
+            if (existing && existing.status === "running" || existing?.status === "copying" || existing?.status === "scaling") {
+                return socket.emit("jobError", { filename: safeFile, message: "This File Is Already Being Processed" });
             }
             const workId = `${safeFile}_${Date.now()}`;
             socket.emit("jobStarted", { filename: safeFile, workId });
@@ -3460,125 +3463,127 @@ function setupSocketHandlers(ioInstance, label) {
                 message: "Job Started",
                 updated: Date.now()
             });
-            await startAcceptProcess(safeFile);
-            try {
-                socket.emit("jobLog", { filename: safeFile, text: "Probing File For Duration..." });
-                const probeCmd = `ffprobe -v quiet -print_format json -show_format "${srcPath.replace(/"/g, '\\"')}"`;
-                let probeOut = "";
+            (async () => {
+                await startAcceptProcess(safeFile);
                 try {
-                    const { stdout } = await execProm(probeCmd);
-                    probeOut = stdout;
-                } catch (e) {
-                    probeOut = "";
-                }
-                let duration = 0;
-                try {
-                    const probeJson = probeOut ? JSON.parse(probeOut) : null;
-                    duration = parseFloat((probeJson && probeJson.format && probeJson.format.duration) || 0);
-                } catch (e) {
-                    console.warn("Ffprobe Parse Failed", e);
-                    duration = 0;
-                }
-                socket.emit("jobLog", { filename: safeFile, text: `Duration: ${duration ? duration.toFixed(2) + "s" : "unknown"}` });
-                const baseTarget = sanitize((targetName && targetName.trim()) ? targetName.replace(/\s+/g, "_") : path.parse(safeFile).name);
-                const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
-                const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
-                const copyPath = path.join(APPLY_DIR, copyName);
-                const scaledPathTemp = path.join(APPLY_DIR, scaledName);
-                acceptStatus.set(safeFile, {
-                    status: "copying",
-                    percent: 0,
-                    remainingSec: null,
-                    message: "Copying Container",
-                    updated: Date.now()
-                });
-                await runFfmpegWithProgress(socket, workId, safeFile, safeFile, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container" );
-                try { fs.unlinkSync(srcPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Original" }); } catch (e) { socket.emit("jobLog", { filename: safeFile, text: "Could Not Delete Original (Non-Fatal)." }); }
-                await new Promise(r => setTimeout(r, 500));
-                acceptStatus.set(safeFile, {
-                    status: "scaling",
-                    percent: 0,
-                    remainingSec: null,
-                    message: "Scaling",
-                    updated: Date.now()
-                });
-                await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360" );
-                try { fs.unlinkSync(copyPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Intermediate Copy." }); } catch (e) {}
-                const finalFileName = `${baseTarget}.mp4`;
-                const destination = path.join(MOVIES_DIR, finalFileName);
-                let finalDest = destination;
-                let counter = 1;
-                while (fs.existsSync(finalDest)) {
-                    finalDest = path.join(MOVIES_DIR, `${baseTarget}_${counter}.mp4`);
-                    counter++;
-                }
-                fs.renameSync(scaledPathTemp, finalDest);
-                const moviesJson = loadMoviesJSON();
-                const baseName = path.basename(finalDest);
-                let uploaderUid = null;
-                try {
-                    const metaPath = path.join(APPLY_DIR, safeFile + ".json");
-                    if (fs.existsSync(metaPath)) {
-                        const meta = JSON.parse(fs.readFileSync(metaPath));
-                        uploaderUid = meta.uid || meta.uploadedBy || null;
-                        fs.unlinkSync(metaPath);
+                    socket.emit("jobLog", { filename: safeFile, text: "Probing File For Duration..." });
+                    const probeCmd = `ffprobe -v quiet -print_format json -show_format "${srcPath.replace(/"/g, '\\"')}"`;
+                    let probeOut = "";
+                    try {
+                        const { stdout } = await execProm(probeCmd);
+                        probeOut = stdout;
+                    } catch (e) {
+                        probeOut = "";
                     }
-                    if (uploaderUid && uploaderUid !== "unknown") {
-                        try {
-                            updateDataPath(`users/${uploaderUid}/profile`, { isUploader: true });
-                        } catch (err) {
-                            console.error("Failed To Grant Uploader Role:", err);
-                        }
-                        try {
-                            const currentUploads = readDataPath(`users/${uploaderUid}/profile/uploads`);
-                            const newUploads = (typeof currentUploads === "number" ? currentUploads : 0) + 1;
-                            updateDataPath(`users/${uploaderUid}/profile`, { uploads: newUploads });
-                        } catch (err) {
-                            console.error("Failed To Increment Upload Count:", err);
-                        }
+                    let duration = 0;
+                    try {
+                        const probeJson = probeOut ? JSON.parse(probeOut) : null;
+                        duration = parseFloat((probeJson && probeJson.format && probeJson.format.duration) || 0);
+                    } catch (e) {
+                        console.warn("Ffprobe Parse Failed", e);
+                        duration = 0;
                     }
-                } catch (e) {
-                    console.error("Failed To Load Uploader Metadata");
-                }
-                const idBasename = path.basename(finalDest, ".mp4");
-                const cleanName = idBasename.replace(/_\d+$/, "");
-                const tmdbData = await findMovieId(cleanName);
-                if (!moviesJson[baseName]) {
-                    moviesJson[baseName] = {
-                        order: getNextOrder(moviesJson),
-                        uploadedBy: uploaderUid,
-                        db_id: tmdbData.id || null,
-                        cover: tmdbData.cover || null,
-                        rating: tmdbData.rating || null
-                    };
-                    saveMoviesJSON(moviesJson);
-                }
-                acceptStatus.set(safeFile, {
-                    status: "completed",
-                    percent: 100,
-                    remainingSec: 0,
-                    message: "Completed",
-                    updated: Date.now()
-                });
-                socket.emit("jobDone", { filename: safeFile, finalName: path.basename(finalDest) });
-                await finishAccept(safeFile);
-            } catch (err) {
-                pinnedAcceptLine = `ACCEPT FAILED: ${safeFile}`;
-                renderPinnedAccept();
-                setTimeout(() => {
-                    pinnedAcceptLine = null;
+                    socket.emit("jobLog", { filename: safeFile, text: `Duration: ${duration ? duration.toFixed(2) + "s" : "unknown"}` });
+                    const baseTarget = sanitize((targetName && targetName.trim()) ? targetName.replace(/\s+/g, "_") : path.parse(safeFile).name);
+                    const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
+                    const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
+                    const copyPath = path.join(APPLY_DIR, copyName);
+                    const scaledPathTemp = path.join(APPLY_DIR, scaledName);
+                    acceptStatus.set(safeFile, {
+                        status: "copying",
+                        percent: 0,
+                        remainingSec: null,
+                        message: "Copying Container",
+                        updated: Date.now()
+                    });
+                    await runFfmpegWithProgress(socket, workId, safeFile, safeFile, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container" );
+                    try { fs.unlinkSync(srcPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Original" }); } catch (e) { socket.emit("jobLog", { filename: safeFile, text: "Could Not Delete Original (Non-Fatal)." }); }
+                    await new Promise(r => setTimeout(r, 500));
+                    acceptStatus.set(safeFile, {
+                        status: "scaling",
+                        percent: 0,
+                        remainingSec: null,
+                        message: "Scaling",
+                        updated: Date.now()
+                    });
+                    await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360" );
+                    try { fs.unlinkSync(copyPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Intermediate Copy." }); } catch (e) {}
+                    const finalFileName = `${baseTarget}.mp4`;
+                    const destination = path.join(MOVIES_DIR, finalFileName);
+                    let finalDest = destination;
+                    let counter = 1;
+                    while (fs.existsSync(finalDest)) {
+                        finalDest = path.join(MOVIES_DIR, `${baseTarget}_${counter}.mp4`);
+                        counter++;
+                    }
+                    fs.renameSync(scaledPathTemp, finalDest);
+                    const moviesJson = loadMoviesJSON();
+                    const baseName = path.basename(finalDest);
+                    let uploaderUid = null;
+                    try {
+                        const metaPath = path.join(APPLY_DIR, safeFile + ".json");
+                        if (fs.existsSync(metaPath)) {
+                            const meta = JSON.parse(fs.readFileSync(metaPath));
+                            uploaderUid = meta.uid || meta.uploadedBy || null;
+                            fs.unlinkSync(metaPath);
+                        }
+                        if (uploaderUid && uploaderUid !== "unknown") {
+                            try {
+                                updateDataPath(`users/${uploaderUid}/profile`, { isUploader: true });
+                            } catch (err) {
+                                console.error("Failed To Grant Uploader Role:", err);
+                            }
+                            try {
+                                const currentUploads = readDataPath(`users/${uploaderUid}/profile/uploads`);
+                                const newUploads = (typeof currentUploads === "number" ? currentUploads : 0) + 1;
+                                updateDataPath(`users/${uploaderUid}/profile`, { uploads: newUploads });
+                            } catch (err) {
+                                console.error("Failed To Increment Upload Count:", err);
+                            }
+                        }
+                    } catch (e) {
+                        console.error("Failed To Load Uploader Metadata");
+                    }
+                    const idBasename = path.basename(finalDest, ".mp4");
+                    const cleanName = idBasename.replace(/_\d+$/, "");
+                    const tmdbData = await findMovieId(cleanName);
+                    if (!moviesJson[baseName]) {
+                        moviesJson[baseName] = {
+                            order: getNextOrder(moviesJson),
+                            uploadedBy: uploaderUid,
+                            db_id: tmdbData.id || null,
+                            cover: tmdbData.cover || null,
+                            rating: tmdbData.rating || null
+                        };
+                        saveMoviesJSON(moviesJson);
+                    }
+                    acceptStatus.set(safeFile, {
+                        status: "completed",
+                        percent: 100,
+                        remainingSec: 0,
+                        message: "Completed",
+                        updated: Date.now()
+                    });
+                    socket.emit("jobDone", { filename: safeFile, finalName: path.basename(finalDest) });
+                    await finishAccept(safeFile);
+                } catch (err) {
+                    pinnedAcceptLines.set(safeFile, `ACCEPT FAILED: ${safeFile}`);
                     renderPinnedAccept();
-                }, 5000);
-                acceptStatus.set(safeFile, {
-                    status: "error",
-                    percent: 0,
-                    remainingSec: null,
-                    message: err.message || "Unknown Error",
-                    updated: Date.now()
-                });
-                console.error("Accept Failed", err);
-                socket.emit("jobError", { filename: safeFile, message: err.message || String(err) });
-            }
+                    setTimeout(() => {
+                        pinnedAcceptLines.delete(safeFile);
+                        renderPinnedAccept();
+                    }, 5000);
+                    acceptStatus.set(safeFile, {
+                        status: "error",
+                        percent: 0,
+                        remainingSec: null,
+                        message: err.message || "Unknown Error",
+                        updated: Date.now()
+                    });
+                    console.error("Accept Failed", err);
+                    socket.emit("jobError", { filename: safeFile, message: err.message || String(err) });
+                }
+            })();
         });
     });
 }
