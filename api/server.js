@@ -1952,6 +1952,18 @@ app.post("/write", rateLimit("write"), async (req, res) => {
             return res.status(403).json({ error: "Validation failed" });
         parent[key] = newValue;
         saveData(dataJson);
+        if (path.length >= 2 && path[0] === "pushTokens") {
+            const tokenUid = path[1];
+            if (!dataJson.notifications) dataJson.notifications = {};
+            if (!dataJson.notifications[tokenUid]) dataJson.notifications[tokenUid] = {};
+            if (!dataJson.notifications[tokenUid].tokens) dataJson.notifications[tokenUid].tokens = {};
+            if (path.length === 3) {
+                dataJson.notifications[tokenUid].tokens[path[2]] = newValue;
+            } else if (path.length === 2 && newValue && typeof newValue === "object") {
+                dataJson.notifications[tokenUid].tokens = { ...dataJson.notifications[tokenUid].tokens, ...newValue };
+            }
+            saveData(dataJson);
+        }
         broadcastUpdate(path, newValue);
         res.json({ success: true });
         (async () => {
@@ -2557,7 +2569,7 @@ async function sendDiscordEmbedPre(embed) {
 }
 async function _getPushTokensForUser(uid) {
     const data = getDataCache();
-    const tokenMap = data?.pushTokens?.[uid] || {};
+    const tokenMap = data?.notifications?.[uid]?.tokens || {};
     return Object.keys(tokenMap);
 }
 async function sendReactionNotification(targetUid, reactorUid, emoji, channel, msgId) {
@@ -2565,6 +2577,10 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
         const data = getDataCache();
+        const reactorProfile = data?.users?.[reactorUid]?.profile || {};
+        const senderIsOwner = !!(reactorProfile.isOwner || reactorProfile.isCoOwner);
+        const settings = data?.notifications?.[targetUid]?.settings || {};
+        if (settings.reactions === false && !senderIsOwner) return;
         const reactorName = data?.users?.[reactorUid]?.profile?.displayName || "Someone";
         const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
         await admin.messaging().sendEachForMulticast({
@@ -2589,6 +2605,10 @@ async function sendMentionNotification(targetUid, senderUid, channel, msgId, tex
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
         const data = getDataCache();
+        const senderProfile = data?.users?.[senderUid]?.profile || {};
+        const senderIsOwner = !!(senderProfile.isOwner || senderProfile.isCoOwner);
+        const settings = data?.notifications?.[targetUid]?.settings || {};
+        if (settings.mentions === false && !senderIsOwner) return;
         const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
         const preview = (text || "").substring(0, 80);
         const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
@@ -2614,6 +2634,10 @@ async function sendDMNotification(targetUid, senderUid, text) {
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
         const data = getDataCache();
+        const senderProfile = data?.users?.[senderUid]?.profile || {};
+        const senderIsOwner = !!(senderProfile.isOwner || senderProfile.isCoOwner);
+        const settings = data?.notifications?.[targetUid]?.settings || {};
+        if (settings.dms === false && !senderIsOwner) return;
         const senderName = data?.users?.[senderUid]?.profile?.displayName || "Someone";
         const preview = (text || "").substring(0, 80);
         const url = `/InfiniteChatters.html?dm=${encodeURIComponent(senderUid)}`;
@@ -2707,7 +2731,7 @@ async function sendVerificationNotification(uid, displayName) {
     for (const [user, userData] of Object.entries(_svData.users || {})) {
         const profile = userData?.profile || {};
         if (profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev) {
-            const pushTokens = _svData?.pushTokens?.[user] || {};
+            const pushTokens = _svData?.notifications?.[user]?.tokens || {};
             for (const tokenKey of Object.keys(pushTokens)) {
                 tokens.push(tokenKey);
             }
