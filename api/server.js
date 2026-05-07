@@ -1586,6 +1586,20 @@ app.post("/pay", verifyFirebaseToken, async (req, res) => {
                 typeof value === "bigint" ? value.toString() : value
             )
         );
+        const payment = safeResult?.payment;
+        if (payment && payment.status !== "COMPLETED") {
+            const declinedAmount = payment.amount_money?.amount ?? req.body.amount;
+            const declineReason = payment.status || "UNKNOWN";
+            console.warn(`Payment declined for uid ${uid}: status=${declineReason}`);
+            discordRequestForce({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${logid}/messages`,
+                data: {
+                    content: `**Payment Declined**\nUser: \`${uid}\`\nAmount: $${(declinedAmount / 100).toFixed(2)}\nStatus: \`${declineReason}\``
+                },
+                headers: { "Content-Type": "application/json" }
+            }).catch(err => console.error("Failed to send declined payment log:", err));
+        }
         res.json(safeResult);
     } catch (err) {
         console.error("Payment Error:", err);
@@ -3639,6 +3653,37 @@ setInterval(() => {
     pruneOldLogs();
     clearCompletedApplies();
 }, 10 * 1000);
+const STALE_CLEANUP_DIRS = [
+    UPLOADS_TEMP_DIR,
+    path.join(UPLOADS_DIR, "tmp")
+];
+const STALE_CLEANUP_MS = 3 * 60 * 60 * 1000;
+setInterval(() => {
+    const now = Date.now();
+    for (const dir of STALE_CLEANUP_DIRS) {
+        if (!fs.existsSync(dir)) continue;
+        let entries;
+        try {
+            entries = fs.readdirSync(dir);
+        } catch (err) {
+            console.error(`Stale Cleanup: Failed To Read ${dir}:`, err.message);
+            continue;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry);
+            try {
+                const stat = fs.statSync(fullPath);
+                const lastModified = stat.mtimeMs;
+                if (now - lastModified >= STALE_CLEANUP_MS) {
+                    fs.rmSync(fullPath, { recursive: true, force: true });
+                    console.log(`Stale Cleanup: Deleted ${fullPath} (Last Modified ${Math.floor((now - lastModified) / 60000)}m Ago)`);
+                }
+            } catch (err) {
+                console.error(`Stale Cleanup: Error Processing ${fullPath}:`, err.message);
+            }
+        }
+    }
+}, STALE_CLEANUP_MS);
 setInterval(() => {
     const now = Date.now();
     for (const [file, status] of acceptStatus.entries()) {
@@ -3699,7 +3744,7 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 setInterval(() => {
     const now = Date.now();
-    const ONLINE_TIMEOUT = 5 * 60 * 1000;
+    const ONLINE_TIMEOUT = 2 * 60 * 1000;
     for (const [uid, lastSeen] of onlineLastSeen.entries()) {
         if (now - lastSeen > ONLINE_TIMEOUT) {
             updateDataPath(`users/${uid}/profile`, { online: null });
