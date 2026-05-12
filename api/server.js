@@ -648,6 +648,92 @@ app.get('/ping', (req, res) => {
         serverTime: now
     });
 });
+app.get("/music/search", async (req, res) => {
+    const q = req.query.q;
+    try {
+        const response = await fetch(`https://api.deezer.com/search?q=${encodeURIComponent(q)}`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Deezer" });
+    }
+});
+app.get("/music/artist/:id", async (req, res) => {
+    try {
+        const response = await fetch(`https://api.deezer.com/artist/${req.params.id}`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Artist" });
+    }
+});
+app.get("/music/artist/:id/albums", async (req, res) => {
+    try {
+        const response = await fetch(`https://api.deezer.com/artist/${req.params.id}/albums`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Albums" });
+    }
+});
+app.get("/music/artist/:id/top", async (req, res) => {
+    try {
+        const response = await fetch(`https://api.deezer.com/artist/${req.params.id}/top?limit=20`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Top Tracks" });
+    }
+});
+app.get("/music/album/:id", async (req, res) => {
+    try {
+        const response = await fetch(`https://api.deezer.com/album/${req.params.id}`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Album" });
+    }
+});
+app.get("/music/track/:id", async (req, res) => {
+    try {
+        const response = await fetch(`https://api.deezer.com/track/${req.params.id}`);
+        const data = await response.text();
+        res.type("application/json").send(data);
+    } catch {
+        res.status(500).json({ error: "Failed To Fetch Track" });
+    }
+});
+const SC_SEARCH_BASE = "https://sc1.maid.zone/_/api/v2/search/tracks?q=";
+const SC_PLAY_URL    = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}`;
+const SC_DL_URL      = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}?redirect=true`;
+app.get("/music/resolve", async (req, res) => {
+    const { artist, title } = req.query;
+    if (!artist || !title) {
+        return res.status(400).json({ error: "Missing Artist Or Title" });
+    }
+    try {
+        const q = encodeURIComponent(`${artist} ${title}`);
+        const response = await fetch(`${SC_SEARCH_BASE}${q}&limit=5`);
+        const data = await response.json();
+        const hit = (data.collection || [])[0];
+        if (!hit) {
+            return res.status(404).json({ error: "Track Not Found On SoundCloud" });
+        }
+        const userPermalink  = hit.user.permalink;
+        const trackPermalink = hit.permalink;
+        res.json({
+            userPermalink,
+            trackPermalink,
+            streamUrl:   SC_PLAY_URL(userPermalink, trackPermalink),
+            downloadUrl: SC_DL_URL(userPermalink, trackPermalink),
+            artUrl: hit.artwork_url
+                ? hit.artwork_url.replace("-large", "-t500x500")
+                : (hit.user?.avatar_url || null)
+        });
+    } catch (err) {
+        res.status(500).json({ error: "Failed To Resolve Track" });
+    }
+});
 app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
     const file = path.join(MOVIES_DIR, name + ".mp4");
