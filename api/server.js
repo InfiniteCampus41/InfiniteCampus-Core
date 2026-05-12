@@ -704,8 +704,8 @@ app.get("/music/track/:id", async (req, res) => {
     }
 });
 const SC_SEARCH_BASE = "https://sc1.maid.zone/_/api/v2/search/tracks?q=";
-const SC_PLAY_URL    = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}`;
-const SC_DL_URL      = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}?redirect=true`;
+const SC_PLAY_URL = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}`;
+const SC_DL_URL = (u, t) => `https://sc1.maid.zone/_/api/progressive/${u}/${t}?redirect=true`;
 app.get("/music/resolve", async (req, res) => {
     const { artist, title } = req.query;
     if (!artist || !title) {
