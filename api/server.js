@@ -1376,7 +1376,7 @@ app.get("/admin/verify-user", async (req, res) => {
             return res.status(401).send("Invalid token");
         }
     } else {
-        return res.redirect(`/InfiniteAdminChats.html?verifyUid=${encodeURIComponent(uid)}`);
+        return res.redirect(`/InfiniteAdmins.html?chat=true&verifyUid=${encodeURIComponent(uid)}`);
     }
     const profile = readDataPath(`users/${requesterUid}/profile`);
     if (!profile || !(profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev)) {
@@ -1391,7 +1391,7 @@ app.get("/admin/verify-user", async (req, res) => {
         data: { type: "userVerified", uid, verifiedBy: requesterUid }
     });
     console.log(`User ${uid} verified by ${requesterUid} via GET`);
-    res.send(`<html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2>✅ User Verified Successfully</h2><p>The user has been verified and can now access the chat.</p><a href="/InfiniteAdminChats.html" style="color:#4fa3ff">Back to Admin Chat</a></div></body></html>`);
+    res.send(`<html><body style="background:#111;color:#fff;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0"><div style="text-align:center"><h2>✅ User Verified Successfully</h2><p>The user has been verified and can now access the chat.</p><a href="/InfiniteAdmins.html?chat=true" style="color:#4fa3ff">Back to Admin Chat</a></div></body></html>`);
 });
 app.post("/github-webhook", express.json({ type: "application/json" }),async (req, res) => {    
     const event = req.headers["x-github-event"];
@@ -1624,7 +1624,7 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
                         size: fileSize
                     });
                     let movieName = `${safeFile}`;
-                    let watchLink = 'https://www.infinitecampus.xyz/InfiniteAdminMovies.html';
+                    let watchLink = 'https://www.infinitecampus.xyz/InfiniteAdmins.html?movies=true';
                     let rejectLink = `${watchLink}`;
                     let acceptLink = `${watchLink}`;
                     sendApplicantEmbed(movieName, acceptLink, watchLink, rejectLink, fileSize);
@@ -2845,7 +2845,7 @@ async function sendVerificationNotification(uid, displayName) {
         data: {
             type: "verifyUser",
             uid: uid,
-            url: `/InfiniteAdminChats.html`,
+            url: `/InfiniteAdmins.html?chat=true`,
             verifyUrl
         },
         notification: {
@@ -2854,7 +2854,7 @@ async function sendVerificationNotification(uid, displayName) {
         },
         tokens: tokens,
         webpush: {
-            fcmOptions: { link: `/InfiniteAdminChats.html` },
+            fcmOptions: { link: `/InfiniteAdmins.html?chat=true` },
             notification: {
                 title: "A New User Has Signed Up!",
                 body: `User ${displayName} Is Awaiting Verification`,
