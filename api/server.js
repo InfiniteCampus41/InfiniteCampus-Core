@@ -7,7 +7,6 @@ import { createServer } from "http";
 import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
-import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import FormData from "form-data";
 import fs from "fs";
@@ -21,10 +20,31 @@ import { Server as IOServer } from "socket.io";
 import { spawn } from "child_process";
 import util from "util";
 import { WebSocketServer } from "ws";
+import fetch from "node-fetch";
+import { Client as DiscordClient, GatewayIntentBits, Partials } from "discord.js";
 dotenv.config();
+const discordBridgeState = {};
+const discordMsgIdToTimestamp = {};
+const botSentDiscordIds = new Set();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DISCORD_CHANNEL_MAP_PATH = path.join(__dirname, "discord_channel_map.json");
+let DISCORD_CHANNEL_MAP = (() => {
+    try {
+        if (fs.existsSync(DISCORD_CHANNEL_MAP_PATH)) {
+            return JSON.parse(fs.readFileSync(DISCORD_CHANNEL_MAP_PATH, "utf-8"));
+        }
+    } catch (e) { console.warn("Failed To Load Channel Map:", e.message); }
+    try {
+        return JSON.parse(process.env.DISCORD_CHANNEL_MAP || "{}");
+    } catch { return {}; }
+})();
+function saveDiscordChannelMap() {
+    try {
+        fs.writeFileSync(DISCORD_CHANNEL_MAP_PATH, JSON.stringify(DISCORD_CHANNEL_MAP, null, 2));
+    } catch (e) { console.error("Failed To Save Channel Map:", e.message); }
+}
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH");
@@ -106,6 +126,20 @@ const client = new Client({
     environment: Environment.Production,
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
 });
+const dClient = new DiscordClient({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ],
+    partials: [
+        Partials.Channel
+    ]
+});
+dClient.once("clientReady", () => {
+    console.log(`Logged In As ${dClient.user.tag}`);
+});
+dClient.login(process.env.DISCORD_BOT_TOKEN);
 const CREATE_COOLDOWN = 1500;
 const creating = new Map();
 const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
@@ -146,7 +180,7 @@ const MAX_DISCORD_QUEUE = 5000;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024 * 30;
 const MAX_SIZE_NON_PREMIUM = 100 * 1024 * 1024;
 const MAX_SIZE_PREMIUM = 500 * 1024 * 1024;
-const memoryUpload = multer({
+let memoryUpload = multer({
     storage: multer.diskStorage({
         destination: UPLOADS_TEMP_DIR,
         filename: (req,file,cb)=>cb(null,Date.now()+"-"+file.originalname)
@@ -173,6 +207,8 @@ const RATE_LIMITS = {
     default: { max: 40,  window: 10_000 },  // misc fallback
 };
 const _rateLimitStore = new Map();
+const _msgSlowmodeStore = new Map();
+const MSG_SLOWMODE_MS = 3000;
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of _rateLimitStore.entries()) {
@@ -641,12 +677,50 @@ app.get("/hypervm", async (req, res) => {
         res.status(500).send("Failed to create VM");
     }
 });
-app.get('/ping', (req, res) => {
+app.get("/ping", (req, res) => {
     const now = Date.now();
     res.json({
         ok: true,
         serverTime: now
     });
+});
+app.get("/admin/discord-channel-map", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isTester)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        res.json({ map: DISCORD_CHANNEL_MAP });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+app.post("/admin/discord-channel-map", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isTester)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        const { channelName, discordChannelId } = req.body;
+        if (!channelName || typeof channelName !== "string") {
+            return res.status(400).json({ error: "Missing channelName" });
+        }
+        if (discordChannelId && !/^\d+$/.test(discordChannelId)) {
+            return res.status(400).json({ error: "Invalid Discord Channel ID" });
+        }
+        if (discordChannelId) {
+            DISCORD_CHANNEL_MAP[channelName] = discordChannelId;
+        } else {
+            delete DISCORD_CHANNEL_MAP[channelName];
+        }
+        saveDiscordChannelMap();
+        console.log(`Channel Map Updated: ${channelName} -> ${discordChannelId || "(Removed)"}`);
+        res.json({ ok: true, map: DISCORD_CHANNEL_MAP });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 });
 app.get("/music/search", async (req, res) => {
     const q = req.query.q;
@@ -959,7 +1033,6 @@ app.get("/weather", async (req, res) => {
             time: obsData.properties.timestamp
         });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: "Weather Lookup Failed" });
     }
 });
@@ -1257,6 +1330,9 @@ app.post("/delete", rateLimit("delete"), async (req, res) => {
         delete parent[key];
         saveData(dataJson);
         broadcastUpdate(path, null);
+        if (path.length === 3 && path[0] === "messages" && DISCORD_CHANNEL_MAP[path[1]]) {
+            bridgeDeleteToDiscordWithEntry(path[1], path[2], oldValue).catch(() => {});
+        }
         res.json({ success: true });
     } catch (err) {
         console.error(err);
@@ -1542,14 +1618,23 @@ app.post("/load-more-messages", async (req, res) => {
         if (!node || typeof node !== "object") {
             return res.json({ data: null });
         }
-        const filtered = Object.entries(node).filter(([, v]) => v && typeof v.timestamp === "number" && v.timestamp < before);
-        filtered.sort((b, a) => a[1].timestamp - b[1].timestamp);
+        const filtered = Object.entries(node).filter(([k, v]) => {
+            if (!v || typeof v !== "object") return false;
+            const ts = typeof v.timestamp === "number" ? v.timestamp : Number(k);
+            return !isNaN(ts) && ts < before;
+        });
+        filtered.sort(([ka, va], [kb, vb]) => {
+            const tsA = typeof va.timestamp === "number" ? va.timestamp : Number(ka);
+            const tsB = typeof vb.timestamp === "number" ? vb.timestamp : Number(kb);
+            return tsB - tsA;
+        });
         const entries = filtered.slice(0, limit);
         if (entries.length === 0) {
             return res.json({ data: null });
         }
         const result = entries.map(([k, v]) => ({
             id: k,
+            timestamp: typeof v.timestamp === "number" ? v.timestamp : Number(k),
             ...v
         }));
         res.json({ data: result });
@@ -2027,11 +2112,64 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
         res.status(500).json({ error: "Upload Failed" });
     }
 });
-app.post("/write", rateLimit("write"), async (req, res) => {
-    try {
+app.post("/write", rateLimit("write"), (req, res, next) => {
+    let memoryUpload = multer({
+        storage: multer.memoryStorage(),
+        limits: {
+            fileSize: 10 * 1024 * 1024
+        }
+    });
+    memoryUpload.single("file")(req, res, (err) => {
+        if (err) {
+            if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+                return res.status(400).json({ error: "File size must be 10MB or less." });
+            }
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+        try {
         const uid = await verifyToken(req);
-        const { path, value } = req.body;
-        if (!Array.isArray(path)) return res.status(400).json({ error: "Path must be array" });
+        let path = req.body?.path;
+        let value = req.body?.value;
+        if (typeof path === "string") {
+            try { path = JSON.parse(path); } catch {}
+        }
+        if (typeof value === "string") {
+            try { value = JSON.parse(value); } catch {}
+        }
+        const uploadedFile = req.file || null;
+        if (!Array.isArray(path)) return res.status(400).json({ error: "Path Must Be Array" });
+        if (
+            path.length === 3 && path[0] === "messages" &&
+            value && typeof value === "object" &&
+            (value.t || value.text)
+        ) {
+            const msgText = value.t || value.text || "";
+            if (/@everyone\b/i.test(msgText) || /@here\b/i.test(msgText)) {
+                return res.status(403).json({ error: "@everyone And @here Are Not Allowed." });
+            }
+            const dataJson = getDataCache();
+            const userProfile = dataJson?.users?.[uid]?.profile || {};
+            const isAdminUser = !!(
+                userProfile.isOwner || userProfile.isCoOwner ||
+                userProfile.isAdmin || userProfile.isHAdmin ||
+                userProfile.isTester
+            );
+            if (!isAdminUser) {
+                const now = Date.now();
+                const lastSend = _msgSlowmodeStore.get(uid) || 0;
+                if (now - lastSend < MSG_SLOWMODE_MS) {
+                    const retryAfter = Math.ceil((MSG_SLOWMODE_MS - (now - lastSend)) / 1000);
+                    return res.status(429).json({
+                        error: `You Can Only Send A Message Every 3 Seconds. Try Again In ${retryAfter}s.`,
+                        retryAfter
+                    });
+                }
+                _msgSlowmodeStore.set(uid, now);
+            }
+        }
         const dataJson = getDataCache();
         const rules = await loadRules();
         const root = new DataSnapshot(dataJson);
@@ -2065,6 +2203,74 @@ app.post("/write", rateLimit("write"), async (req, res) => {
             saveData(dataJson);
         }
         broadcastUpdate(path, newValue);
+        if (
+            uploadedFile &&
+            path.length === 3 &&
+            path[0] === "messages" &&
+            newValue && typeof newValue === "object"
+        ) {
+            const channel = path[1];
+            const msgTimestamp = String(path[2]);
+            try {
+                const fname = uploadedFile.originalname || "file";
+                const fileBuffer = uploadedFile.buffer;
+                const targetDiscordChannel = DISCORD_CHANNEL_MAP[channel] || logid;
+                const uploadForm = new FormData();
+                uploadForm.append("payload_json", JSON.stringify({ content: "" }));
+                uploadForm.append("files[0]", fileBuffer, {
+                    filename: fname,
+                    contentType: uploadedFile.mimetype || "application/octet-stream",
+                });
+                const uploadResp = await discordRequestForce({
+                    method: "post",
+                    url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages`,
+                    data: uploadForm,
+                    headers: uploadForm.getHeaders(),
+                });
+                const discordAttachment = uploadResp?.data?.attachments?.[0];
+                const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
+                const uploadedDiscordMsgId = uploadResp?.data?.id || null;
+                if (cdnUrl) {
+                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                    let attachHtml = "";
+                    if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
+                        attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                    } else if (/\.(mp4|webm|mov)(\?|$)/i.test(fname)) {
+                        attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                    } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(fname)) {
+                        attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                    } else {
+                        attachHtml = `<a href="${proxied}" target="_blank" style="color:#4fa3ff;">${fname}</a>`;
+                    }
+                    const data = getDataCache();
+                    if (data?.messages?.[channel]?.[msgTimestamp]) {
+                        const existingT = data.messages[channel][msgTimestamp].t || "";
+                        data.messages[channel][msgTimestamp].t = existingT
+                            ? existingT + "\n" + attachHtml
+                            : attachHtml;
+                        data.messages[channel][msgTimestamp]._attachmentUrl = cdnUrl;
+                        if (uploadedDiscordMsgId) {
+                            botSentDiscordIds.add(uploadedDiscordMsgId);
+                            data.messages[channel][msgTimestamp]._discordMirrorId = uploadedDiscordMsgId;
+                        }
+                        saveData(data);
+                        broadcastUpdate(path, data.messages[channel][msgTimestamp]);
+                    }
+                }
+                if (uploadedDiscordMsgId && !DISCORD_CHANNEL_MAP[channel]) {
+                    try {
+                        await discordRequestForce({
+                            method: "delete",
+                            url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages/${uploadedDiscordMsgId}`,
+                        });
+                    } catch {}
+                }
+            } catch (e) {
+                console.error("[FileUpload] Failed to upload file to Discord:", e.message);
+            } finally {
+                try { fs.unlinkSync(uploadedFile.path); } catch {}
+            }
+        }
         res.json({ success: true });
         (async () => {
             try {
@@ -2073,18 +2279,86 @@ app.post("/write", rateLimit("write"), async (req, res) => {
                     path[0] === "messages" &&
                     newValue &&
                     typeof newValue === "object" &&
+                    newValue.t &&
+                    newValue.s
+                ) {
+                    const channel = path[1];
+                    const msgTimestamp = String(path[2]);
+                    if (DISCORD_CHANNEL_MAP[channel]) {
+                        const latestData = getDataCache();
+                        const latestEntry = latestData?.messages?.[channel]?.[msgTimestamp];
+                        if (!uploadedFile || !latestEntry?._discordMirrorId) {
+                            const discordMsgId = await bridgeWebsiteMsgToDiscord(
+                                channel,
+                                newValue.s,
+                                latestEntry?.t || newValue.t,
+                                newValue.r || null
+                            );
+                            if (discordMsgId) {
+                                const data = getDataCache();
+                                if (data?.messages?.[channel]?.[msgTimestamp]) {
+                                    data.messages[channel][msgTimestamp]._discordMirrorId = discordMsgId;
+                                    saveData(data);
+                                }
+                            }
+                        }
+                    }
+                    const matches = [...(newValue.t.matchAll(/@([^\s<]+)/g))];
+                    for (const [, name] of matches) {
+                        if (name.toLowerCase() === "support") continue;
+                        const targetUid = await getUidByDisplayNameServer(name);
+                        if (targetUid && targetUid !== uid) {
+                            await sendMentionNotification(targetUid, uid, channel, msgTimestamp, newValue.t);
+                        }
+                    }
+                } else if (
+                    path.length === 3 &&
+                    path[0] === "messages" &&
+                    newValue &&
+                    typeof newValue === "object" &&
                     newValue.text &&
                     newValue.sender
                 ) {
                     const channel = path[1];
-                    const msgId   = path[2];
+                    const msgTimestamp = String(path[2]);
+                    if (DISCORD_CHANNEL_MAP[channel]) {
+                        const latestData = getDataCache();
+                        const latestEntry = latestData?.messages?.[channel]?.[msgTimestamp];
+                        if (!uploadedFile || !latestEntry?._discordMirrorId) {
+                            const discordMsgId = await bridgeWebsiteMsgToDiscord(
+                                channel,
+                                newValue.sender,
+                                latestEntry?.t || newValue.text,
+                                newValue.reply || null
+                            );
+                            if (discordMsgId) {
+                                const data = getDataCache();
+                                if (data?.messages?.[channel]?.[msgTimestamp]) {
+                                    data.messages[channel][msgTimestamp]._discordMirrorId = discordMsgId;
+                                    saveData(data);
+                                }
+                            }
+                        }
+                    }
                     const matches = [...(newValue.text.matchAll(/@([^\s<]+)/g))];
                     for (const [, name] of matches) {
                         if (name.toLowerCase() === "support") continue;
                         const targetUid = await getUidByDisplayNameServer(name);
                         if (targetUid && targetUid !== uid) {
-                            await sendMentionNotification(targetUid, uid, channel, msgId, newValue.text);
+                            await sendMentionNotification(targetUid, uid, channel, msgTimestamp, newValue.text);
                         }
+                    }
+                } else if (
+                    path.length === 4 &&
+                    path[0] === "messages" &&
+                    (path[3] === "t" || path[3] === "text") &&
+                    newValue &&
+                    typeof newValue === "string"
+                ) {
+                    const channel = path[1];
+                    const msgTs = path[2];
+                    if (DISCORD_CHANNEL_MAP[channel]) {
+                        await bridgeEditToDiscord(channel, msgTs, newValue, uid);
                     }
                 }
                 if (
@@ -2102,7 +2376,7 @@ app.post("/write", rateLimit("write"), async (req, res) => {
                     }
                 }
             } catch (notifErr) {
-                console.error("Post-write notification error:", notifErr.message || notifErr);
+                console.error("Post-write Notification Error:", notifErr.message || notifErr);
             }
         })();
     } catch (err) {
@@ -2967,6 +3241,8 @@ async function verifyToken(reqOrToken) {
         const header = reqOrToken.headers.authorization;
         if (!header.startsWith("Bearer ")) throw new Error("Missing token");
         token = header.split("Bearer ")[1];
+    } else if (reqOrToken?.body?.token) {
+        token = reqOrToken.body.token;
     } else {
         throw new Error("Missing token");
     }
@@ -3975,3 +4251,699 @@ setupSocketHandlers(ioRealtime, "REALTIME");
 scheduleDailyClear();
 restoreApplicantMessages();
 watchForNewUsers();
+app.get("/discord-avatar-proxy", async (req, res) => {
+    const { url } = req.query;
+    if (!url || !url.startsWith("https://cdn.discordapp.com/")) {
+        return res.status(400).send("Bad URL");
+    }
+    try {
+        const r = await fetch(url);
+        if (!r.ok) return res.status(r.status).send("Upstream error");
+        const ct = r.headers.get("content-type") || "image/png";
+        res.setHeader("Content-Type", ct);
+        r.body.pipe(res);
+    } catch (e) {
+        res.status(500).send("Proxy Error");
+    }
+});
+app.get("/discord-media-proxy", async (req, res) => {
+    const { url } = req.query;
+    if (!url) return res.status(400).send("Bad URL");
+    let parsed;
+    try { parsed = new URL(url); } catch { return res.status(400).send("Invalid URL"); }
+    try {
+        const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        if (!r.ok) return res.status(r.status).send("Upstream error");
+        const ct = r.headers.get("content-type") || "application/octet-stream";
+        const cl = r.headers.get("content-length");
+        res.setHeader("Content-Type", ct);
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        if (cl) res.setHeader("Content-Length", cl);
+        r.body.pipe(res);
+    } catch (e) {
+        res.status(500).send("Proxy error: " + e.message);
+    }
+});
+function discordMsgToWebsite(discordMsg) {
+    const ts = discordMsgToTimestamp(discordMsg.id);
+    const avatarHash = discordMsg.author?.avatar;
+    const userId = discordMsg.author?.id;
+    const avatarUrl = avatarHash
+        ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
+        : `https://cdn.discordapp.com/embed/avatars/0.png`;
+    const proxiedAvatar = `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`;
+    const entry = {
+        u: discordMsg.author?.username || "Unknown",
+        a: proxiedAvatar,
+        t: discordMsg.content || "",
+    };
+    if (discordMsg.referenced_message) {
+        const refTs = discordMsgToTimestamp(discordMsg.referenced_message.id);
+        if (refTs) entry.r = refTs;
+    }
+    return { ts, entry };
+}
+function discordMsgToTimestamp(snowflakeId) {
+    return Number((BigInt(snowflakeId) >> 22n) + 1420070400000n);
+}
+function writeDiscordMsgToData(channelName, discordMsgId, entry, ts) {
+    const data = getDataCache();
+    if (!data.messages) data.messages = {};
+    if (!data.messages[channelName]) data.messages[channelName] = {};
+    const entryWithTs = { ...entry, timestamp: Number(ts) };
+    data.messages[channelName][ts] = entryWithTs;
+    saveData(data);
+    discordMsgIdToTimestamp[discordMsgId] = { channel: channelName, timestamp: ts };
+    broadcastUpdate(["messages", channelName, String(ts)], entryWithTs);
+}
+async function syncDiscordHistory(channelName, discordChannelId) {
+    if (!discordChannelId) return;
+    const data = getDataCache();
+    if (!data.messages) data.messages = {};
+    if (!data.messages[channelName]) data.messages[channelName] = {};
+    const existing = data.messages[channelName];
+    const existingTs = new Set(Object.keys(existing).map(Number));
+    for (const [ts, entry] of Object.entries(existing)) {
+        if (entry?._discordId) {
+            discordMsgIdToTimestamp[entry._discordId] = {
+                channel: channelName,
+                timestamp: Number(ts)
+            };
+        }
+    }
+    const state = discordBridgeState[channelName] || {};
+    if (state.synced) return;
+    console.log(`[DiscordBridge] Syncing history for #${channelName}`);
+    let lastId = null;
+    let totalNew = 0;
+    let fetchMore = true;
+    while (fetchMore) {
+        await new Promise(r => setTimeout(r, 300));
+        let response;
+        try {
+            response = await discordRequestForce({
+                method: "get",
+                url: `https://discord.com/api/v10/channels/${discordChannelId}/messages`,
+                params: lastId ? { limit: 100, before: lastId } : { limit: 100 }
+            });
+        } catch (e) {
+            console.error(`[DiscordBridge] History fetch error for ${channelName}:`, e.message);
+            break;
+        }
+        const messages = response.data;
+        if (!messages?.length) break;
+        for (const discordMsg of messages) {
+            const ts = discordMsgToTimestamp(discordMsg.id);
+            if (existingTs.has(ts)) {
+                discordMsgIdToTimestamp[discordMsg.id] = {
+                    channel: channelName,
+                    timestamp: ts
+                };
+                continue;
+            }
+            if (!discordMsg.content && !discordMsg.embeds?.length && !discordMsg.attachments?.length) {
+                continue;
+            }
+            const content = discordMsg.content || "";
+            const attachments = discordMsg.attachments || [];
+            let attachmentHtml = "";
+            for (const att of attachments) {
+                const attUrl = att.proxy_url || att.url || "";
+                if (!attUrl) continue;
+                const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
+                const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
+                const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
+                if (isImage) {
+                    attachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                } else if (isVideo) {
+                    attachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                } else if (isAudio) {
+                    attachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                } else {
+                    attachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
+                }
+            }
+            let embedHtml = "";
+            for (const embed of (discordMsg.embeds || [])) {
+                embedHtml += serializeDiscordEmbed(embed);
+            }
+            const fullContent = content
+                + (attachmentHtml ? (content ? "\n" + attachmentHtml : attachmentHtml) : "")
+                + (embedHtml ? "\n" + embedHtml : "");
+            if (!fullContent) continue;
+            const user = discordMsg.author;
+            const userId = user?.id;
+            let avatarUrl;
+            if (user?.avatar) {
+                const ext = user.avatar.startsWith("a_") ? "gif" : "png";
+                avatarUrl = `https://cdn.discordapp.com/avatars/${userId}/${user.avatar}.${ext}?size=128`;
+            } else {
+                const defaultIndex = Number(BigInt(userId) >> 22n) % 6;
+                avatarUrl = `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+            }
+            const entry = {
+                u: user?.username || "Unknown",
+                a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                t: fullContent,
+                _discordId: discordMsg.id
+            };
+            if (discordMsg.referenced_message) {
+                entry.r = discordMsgToTimestamp(discordMsg.referenced_message.id);
+            }
+            if (discordMsg.edited_timestamp) {
+                entry.e = "edited";
+            }
+            data.messages[channelName][String(ts)] = entry;
+            discordMsgIdToTimestamp[discordMsg.id] = {
+                channel: channelName,
+                timestamp: ts
+            };
+            existingTs.add(ts);
+            totalNew++;
+        }
+        if (messages.length < 100) {
+            fetchMore = false;
+        } else {
+            lastId = messages[messages.length - 1].id;
+        }
+    }
+    const sorted = Object.fromEntries(
+        Object.entries(data.messages[channelName])
+            .sort((a, b) => Number(a[0]) - Number(b[0]))
+    );
+    data.messages[channelName] = sorted;
+    _dataCache = data;
+    if (totalNew > 0) {
+        fs.writeFileSync("./data.json", JSON.stringify(data, null, 2));
+        console.log(`Synced ${totalNew} New Messages For #${channelName}`);
+    } else {
+        console.log(`No New Messages For #${channelName}`);
+    }
+    discordBridgeState[channelName] = { synced: true };
+}
+async function runInitialDiscordSync() {
+    for (const [channelName, discordChannelId] of Object.entries(DISCORD_CHANNEL_MAP)) {
+        try {
+            await syncDiscordHistory(channelName, discordChannelId);
+        } catch (e) {
+            console.error(`Sync Failed For ${channelName}:`, e.message);
+        }
+    }
+}
+let discordGatewayWs = null;
+let gatewayHeartbeatInterval = null;
+let gatewaySessionId = null;
+let gatewaySeq = null;
+let gatewayReconnectTimer = null;
+function startDiscordGateway() {
+    if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
+    const discordIdToChannelName = {};
+    for (const [name, id] of Object.entries(DISCORD_CHANNEL_MAP)) {
+        discordIdToChannelName[id] = name;
+    }
+    const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
+    function connect() {
+        if (discordGatewayWs) {
+            try { discordGatewayWs.close(); } catch {}
+        }
+        if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
+        const { WebSocket: WS } = import("ws").catch(() => ({ WebSocket: null }));
+        const GWS = require ? (() => { try { return require("ws"); } catch { return null; } })() : null;
+        const gwWs = new WebSocketServer.__proto__.constructor
+            ? new (Object.getPrototypeOf(WebSocketServer))("wss://gateway.discord.gg/?v=10&encoding=json")
+            : null;
+        const _ws = (() => {
+            try {
+                const wsModule = { WebSocket: class extends require("events") {
+                    constructor(url) {
+                        super();
+                        const net = require("https");
+                    }
+                }};
+                return null;
+            } catch { return null; }
+        })();
+        let ws;
+        try {
+            const wsLib = (import("ws")).default || (import("ws"));
+            ws = new wsLib.WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
+        } catch {
+            const wsLib = (() => { const m = {}; require.__proto__ && (m.ws = eval("require")("ws")); return m.ws; })();
+            if (!wsLib) return;
+            ws = new wsLib("wss://gateway.discord.gg/?v=10&encoding=json");
+        }
+        discordGatewayWs = ws;
+        ws.on("message", (raw) => {
+            let payload;
+            try { payload = JSON.parse(raw.toString()); } catch { return; }
+            const { op, d, s, t } = payload;
+            if (s != null) gatewaySeq = s;
+            if (op === 10) {
+                const interval = d.heartbeat_interval;
+                if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
+                gatewayHeartbeatInterval = setInterval(() => {
+                    if (ws.readyState === ws.OPEN) {
+                        ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
+                    }
+                }, interval);
+                ws.send(JSON.stringify({
+                    op: 2,
+                    d: {
+                        token: DISCORD_BOT_TOKEN,
+                        intents: 512,
+                        properties: { os: "linux", browser: "ic-bridge", device: "ic-bridge" }
+                    }
+                }));
+            } else if (op === 0 && t === "READY") {
+                gatewaySessionId = d.session_id;
+                console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId);
+            } else if (op === 0 && t === "MESSAGE_CREATE") {
+                if (!watchedChannelIds.has(d.channel_id)) return;
+                if (d.author?.bot && botSentDiscordIds.has(d.id)) return;
+                if (d.author?.bot) return;
+                const channelName = discordIdToChannelName[d.channel_id];
+                if (!channelName) return;
+                const ts = discordMsgToTimestamp(d.id);
+                const baseContent = (d.content || d.embeds?.[0]?.description || "")
+                    .replace(/@everyone\b/gi, "@\u200beveryone")
+                    .replace(/@here\b/gi, "@\u200bhere");
+                const gatewayAttachments = d.attachments || [];
+                let gatewayAttachmentHtml = "";
+                for (const att of gatewayAttachments) {
+                    const attUrl = att.proxy_url || att.url || "";
+                    if (!attUrl) continue;
+                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                    const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
+                    const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
+                    const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
+                    if (isImage) {
+                        gatewayAttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                    } else if (isVideo) {
+                        gatewayAttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                    } else if (isAudio) {
+                        gatewayAttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                    } else {
+                        gatewayAttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
+                    }
+                }
+                const content = baseContent + (gatewayAttachmentHtml ? (baseContent ? "\n" + gatewayAttachmentHtml : gatewayAttachmentHtml) : "");
+                if (!content) return;
+                const avatarHash = d.author?.avatar;
+                const userId = d.author?.id;
+                const avatarUrl = avatarHash
+                    ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
+                    : `https://cdn.discordapp.com/embed/avatars/0.png`;
+                const entry = {
+                    u: d.author?.username || "Unknown",
+                    a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                    t: content,
+                    _discordId: d.id,
+                };
+                if (d.referenced_message) {
+                    entry.r = discordMsgToTimestamp(d.referenced_message.id);
+                }
+                console.log(channelName);
+                writeDiscordMsgToData(channelName, d.id, entry, ts);
+            } else if (op === 0 && t === "MESSAGE_UPDATE") {
+                if (!watchedChannelIds.has(d.channel_id)) return;
+                const channelName = discordIdToChannelName[d.channel_id];
+                if (!channelName) return;
+                const ref = discordMsgIdToTimestamp[d.id];
+                if (!ref) return;
+                const data = getDataCache();
+                const existing = data?.messages?.[channelName]?.[ref.timestamp];
+                if (!existing || !existing.u) return;
+                existing.t = d.content || existing.t;
+                existing.e = "edited";
+                data.messages[channelName][ref.timestamp] = existing;
+                saveData(data);
+                broadcastUpdate(["messages", channelName, String(ref.timestamp)], existing);
+            } else if (op === 0 && t === "MESSAGE_DELETE") {
+                if (!watchedChannelIds.has(d.channel_id)) return;
+                const channelName = discordIdToChannelName[d.channel_id];
+                if (!channelName) return;
+                const ref = discordMsgIdToTimestamp[d.id];
+                if (!ref) return;
+                const data = getDataCache();
+                if (data?.messages?.[channelName]?.[ref.timestamp]) {
+                    delete data.messages[channelName][ref.timestamp];
+                    saveData(data);
+                    broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
+                }
+                delete discordMsgIdToTimestamp[d.id];
+            } else if (op === 7 || op === 9) {
+                scheduleGatewayReconnect(3000);
+            }
+        });
+        ws.on("close", (code) => {
+            console.warn("Gateway Closed, Code:", code);
+            if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
+            scheduleGatewayReconnect(5000);
+        });
+        ws.on("error", (e) => {
+            console.error("Gateway Error:", e.message);
+        });
+    }
+    function scheduleGatewayReconnect(delay) {
+        if (gatewayReconnectTimer) return;
+        gatewayReconnectTimer = setTimeout(() => {
+            gatewayReconnectTimer = null;
+            connect();
+        }, delay);
+    }
+    connect();
+}
+function serializeDiscordEmbed(embed) {
+    if (!embed) return "";
+    const color = embed.color ? `#${embed.color.toString(16).padStart(6, "0")}` : "#5865F2";
+    let html = `<div class="discord-embed" style="border-left:4px solid ${color};background:rgba(30,31,34,0.9);border-radius:4px;padding:10px 14px;margin-top:6px;max-width:400px;display:inline-block;">`;
+    if (embed.author) {
+        const authorIcon = embed.author.proxy_icon_url || embed.author.icon_url || embed.author.iconURL || "";
+        const authorName = embed.author.name || embed.author.text || "";
+        const authorUrl = embed.author.url || "";
+        html += `<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">`;
+        if (authorIcon) html += `<img src="${authorIcon}" style="width:20px;height:20px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none'">`;
+        if (authorUrl) html += `<a href="${authorUrl}" target="_blank" style="color:#ddd;font-size:0.82em;font-weight:600;text-decoration:none;">${authorName}</a>`;
+        else html += `<span style="color:#ddd;font-size:0.82em;font-weight:600;">${authorName}</span>`;
+        html += `</div>`;
+    }
+    if (embed.title || embed.url) {
+        const title = embed.title || "";
+        const url = embed.url || "";
+        if (url) html += `<div style="margin-bottom:4px;"><a href="${url}" target="_blank" style="color:#4fa3ff;font-weight:700;text-decoration:none;">${title}</a></div>`;
+        else if (title) html += `<div style="color:#fff;font-weight:700;margin-bottom:4px;">${title}</div>`;
+    }
+    if (embed.description) {
+        const desc = embed.description.replace(/\n/g, "<br>").replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>").replace(/\*(.*?)\*/g, "<em>$1</em>");
+        html += `<div style="color:#ddd;font-size:0.9em;margin-bottom:6px;">${desc}</div>`;
+    }
+    const fields = embed.fields || [];
+    if (fields.length > 0) {
+        html += `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:4px;">`;
+        for (const field of fields) {
+            const fieldVal = (field.value || "").replace(/\n/g, "<br>").replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+            html += `<div style="${field.inline ? "min-width:100px;flex:1;" : "width:100%;"}">`;
+            html += `<div style="color:#bbb;font-size:0.78em;font-weight:700;margin-bottom:2px;">${field.name || ""}</div>`;
+            html += `<div style="color:#ddd;font-size:0.85em;">${fieldVal}</div>`;
+            html += `</div>`;
+        }
+        html += `</div>`;
+    }
+    const imageUrl = embed.image?.proxy_url || embed.image?.url || embed.image?.proxyURL || "";
+    if (imageUrl) {
+        html += `<img src="${imageUrl}" style="max-width:360px;margin-top:8px;border-radius:4px;display:block;" onerror="this.style.display='none'">`;
+    }
+    const thumbUrl = embed.thumbnail?.proxy_url || embed.thumbnail?.url || embed.thumbnail?.proxyURL || "";
+    if (thumbUrl && !imageUrl) {
+        html += `<img src="${thumbUrl}" style="max-width:80px;float:right;border-radius:4px;margin-left:8px;" onerror="this.style.display='none'">`;
+    }
+    if (embed.footer) {
+        const footerText = embed.footer.text || "";
+        const footerIcon = embed.footer.proxy_icon_url || embed.footer.icon_url || embed.footer.iconURL || "";
+        html += `<div style="display:flex;align-items:center;gap:5px;margin-top:8px;">`;
+        if (footerIcon) html += `<img src="${footerIcon}" style="width:16px;height:16px;border-radius:50%;object-fit:cover;" onerror="this.style.display='none'">`;
+        html += `<span style="color:#999;font-size:0.75em;">${footerText}</span>`;
+        if (embed.timestamp) {
+            const ts = new Date(embed.timestamp).toLocaleDateString();
+            html += `<span style="color:#999;font-size:0.75em;"> • ${ts}</span>`;
+        }
+        html += `</div>`;
+    }
+    html += `</div>`;
+    const b64 = Buffer.from(html).toString("base64");
+    return `<discord-embed-b64 data="${b64}"></discord-embed-b64>`;
+}
+async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTimestamp) {
+    const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
+    if (!discordChannelId) return null;
+    const data = getDataCache();
+    const profile = data?.users?.[senderUid]?.profile || {};
+    const displayName = profile.displayName || "User";
+    const content = `**${displayName}**: ${text || ""}`;
+    const payload = { content };
+    if (replyTimestamp) {
+        const entry = data?.messages?.[channelName]?.[replyTimestamp];
+        if (entry?._discordId) {
+            payload.message_reference = { message_id: entry._discordId };
+            payload.allowed_mentions = { replied_user: false };
+        }
+    }
+    try {
+        const resp = await discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages`,
+            data: payload,
+            headers: { "Content-Type": "application/json" },
+        });
+        const discordMsgId = resp?.data?.id;
+        if (discordMsgId) botSentDiscordIds.add(discordMsgId);
+        return discordMsgId;
+    } catch (e) {
+        console.error("Failed To Bridge Message To Discord:", e.message);
+        return null;
+    }
+}
+async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
+    const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
+    if (!discordChannelId) return;
+    const data = getDataCache();
+    const entry = data?.messages?.[channelName]?.[timestamp];
+    if (!entry) return;
+    if (entry.u) return;
+    if (!entry._discordMirrorId) return;
+    try {
+        const profile = data?.users?.[senderUid]?.profile || {};
+        const displayName = profile.displayName || "User";
+        await discordRequestForce({
+            method: "patch",
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+            data: { content: `**${displayName}**: ${newText}` },
+            headers: { "Content-Type": "application/json" },
+        });
+    } catch (e) {
+        console.error("Failed To Edit Discord Mirror Message:", e.message);
+    }
+}
+async function bridgeDeleteToDiscordWithEntry(channelName, timestamp, entry) {
+    const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
+    if (!discordChannelId) return;
+    if (!entry) return;
+    if (!entry._discordMirrorId) return;
+    if (entry.u) return;
+    try {
+        await discordRequestForce({
+            method: "delete",
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+        });
+    } catch (e) {
+        console.error("Failed To Delete Discord Mirror Message:", e.message);
+    }
+}
+async function bridgeDeleteToDiscord(channelName, timestamp) {
+    const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
+    if (!discordChannelId) return;
+    const data = getDataCache();
+    const entry = data?.messages?.[channelName]?.[timestamp];
+    if (!entry) return;
+    if (!entry._discordMirrorId) return;
+    if (entry.u) return;
+    try {
+        await discordRequestForce({
+            method: "delete",
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+        });
+    } catch (e) {
+        console.error("Failed To Delete Discord Mirror Message:", e.message);
+    }
+}
+(async () => {
+    await runInitialDiscordSync();
+    _startDiscordGatewaySync();
+})();
+function _startDiscordGatewaySync() {
+    if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
+    let discordIdToChannelName = {};
+    for (const [name, id] of Object.entries(DISCORD_CHANNEL_MAP)) {
+        discordIdToChannelName[id] = name;
+    }
+    const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
+    import("ws").then(({ default: wsModule, WebSocket: WsClient }) => {
+        const WSClient = WsClient || wsModule;
+        function connect() {
+            if (discordGatewayWs) { try { discordGatewayWs.close(); } catch {} }
+            if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
+            const ws = new WSClient("wss://gateway.discord.gg/?v=10&encoding=json");
+            discordGatewayWs = ws;
+            ws.on("message", (raw) => {
+                let payload;
+                try { payload = JSON.parse(raw.toString()); } catch { return; }
+                const { op, d, s, t } = payload;
+                if (s != null) gatewaySeq = s;
+                if (op === 10) {
+                    const interval = d.heartbeat_interval;
+                    if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
+                    gatewayHeartbeatInterval = setInterval(() => {
+                        if (ws.readyState === ws.OPEN) {
+                            ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
+                        }
+                    }, interval);
+                    ws.send(JSON.stringify({
+                        op: 2,
+                        d: {
+                            token: DISCORD_BOT_TOKEN,
+                            intents: 512,
+                            properties: { os: "linux", browser: "ic-bridge", device: "ic-bridge" }
+                        }
+                    }));
+                } else if (op === 0 && t === "READY") {
+                    gatewaySessionId = d.session_id;
+                    console.log("Gateway Connected, Session:", gatewaySessionId);
+                } else if (op === 0 && t === "MESSAGE_CREATE") {
+                    if (!watchedChannelIds.has(d.channel_id)) return;
+                    if (d.author?.bot) return;
+                    const channelName = discordIdToChannelName[d.channel_id];
+                    if (!channelName) return;
+                    const ts = discordMsgToTimestamp(d.id);
+                    const baseContent2 = (d.content || "")
+                        .replace(/@everyone\b/gi, "@\u200beveryone")
+                        .replace(/@here\b/gi, "@\u200bhere");
+                    const gw2Attachments = d.attachments || [];
+                    let gw2AttachmentHtml = "";
+                    for (const att of gw2Attachments) {
+                        const attUrl = att.proxy_url || att.url || "";
+                        if (!attUrl) continue;
+                        const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                        const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
+                        const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
+                        const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
+                        if (isImage) {
+                            gw2AttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                        } else if (isVideo) {
+                            gw2AttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                        } else if (isAudio) {
+                            gw2AttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                        } else {
+                            gw2AttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
+                        }
+                    }
+                    let gw2EmbedHtml = "";
+                    for (const embed of (d.embeds || [])) {
+                        gw2EmbedHtml += serializeDiscordEmbed(embed);
+                    }
+                    const content = baseContent2
+                        + (gw2AttachmentHtml ? (baseContent2 ? "\n" + gw2AttachmentHtml : gw2AttachmentHtml) : "")
+                        + (gw2EmbedHtml ? "\n" + gw2EmbedHtml : "");
+                    if (!content) return;
+                    const avatarHash = d.author?.avatar;
+                    const userId = d.author?.id;
+                    const avatarUrl = avatarHash
+                        ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
+                        : `https://cdn.discordapp.com/embed/avatars/0.png`;
+                    const entry = {
+                        u: d.author?.username || "Unknown",
+                        a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                        t: content,
+                        _discordId: d.id,
+                    };
+                    if (d.referenced_message) {
+                        entry.r = discordMsgToTimestamp(d.referenced_message.id);
+                    }
+                    writeDiscordMsgToData(channelName, d.id, entry, ts);
+                } else if (op === 0 && t === "MESSAGE_UPDATE") {
+                    if (!watchedChannelIds.has(d.channel_id)) return;
+                    const channelName = discordIdToChannelName[d.channel_id];
+                    if (!channelName) return;
+                    const ref = discordMsgIdToTimestamp[d.id];
+                    if (!ref) return;
+                    const data = getDataCache();
+                    const existing = data?.messages?.[channelName]?.[ref.timestamp];
+                    if (!existing || !existing.u) return;
+                    existing.t = d.content || existing.t;
+                    existing.e = "edited";
+                    data.messages[channelName][ref.timestamp] = existing;
+                    saveData(data);
+                    broadcastUpdate(["messages", channelName, String(ref.timestamp)], existing);
+                } else if (op === 0 && t === "MESSAGE_DELETE") {
+                    if (!watchedChannelIds.has(d.channel_id)) return;
+                    const channelName = discordIdToChannelName[d.channel_id];
+                    if (!channelName) return;
+                    const ref = discordMsgIdToTimestamp[d.id];
+                    if (!ref) return;
+                    const data = getDataCache();
+                    if (data?.messages?.[channelName]?.[ref.timestamp]) {
+                        delete data.messages[channelName][ref.timestamp];
+                        saveData(data);
+                        broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
+                    }
+                    delete discordMsgIdToTimestamp[d.id];
+                } else if (op === 7 || op === 9) {
+                    scheduleReconnect(3000);
+                }
+            });
+            ws.on("close", (code) => {
+                console.warn("Gateway Closed, Code:", code);
+                if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
+                scheduleReconnect(5000);
+            });
+            ws.on("error", (e) => {
+                console.error("Gateway Error:", e.message);
+            });
+        }
+        dClient.on("messageCreate", async (message) => {
+            if (message.author.bot) return;
+            const channelName = discordIdToChannelName[message.channel.id];
+            if (!channelName) return;
+            const ts = discordMsgToTimestamp(message.id);
+            let content = (message.content || "")
+                .replace(/@everyone\b/gi, "@\u200beveryone")
+                .replace(/@here\b/gi, "@\u200bhere");
+            let attachmentHtml = "";
+            for (const att of message.attachments.values()) {
+                const attUrl = att.proxyURL || att.url;
+                const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                const name = att.name || "file";
+                if (/\.(png|jpg|jpeg|gif|webp)$/i.test(name)) {
+                    attachmentHtml += `<img src="${proxied}" alt="${name}" class="chat-img">`;
+                } else if (/\.(mp4|webm|mov)$/i.test(name)) {
+                    attachmentHtml += `<video src="${proxied}" controls></video>`;
+                } else {
+                    attachmentHtml += `<br><a href="${proxied}" target="_blank">${name}</a>`;
+                }
+            }
+            if (attachmentHtml) {
+                content += (content ? "\n" : "") + attachmentHtml;
+            }
+            let embedHtml = "";
+            for (const embed of (message.embeds || [])) {
+                embedHtml += serializeDiscordEmbed(embed);
+            }
+            if (embedHtml) {
+                content += (content ? "\n" : "") + embedHtml;
+            }
+            if (!content) return;
+            const avatarUrl = message.author.displayAvatarURL({
+                extension: "png",
+                size: 64
+            });
+            const entry = {
+                u: message.author.username,
+                a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                t: content,
+                _discordId: message.id
+            };
+            if (message.reference?.messageId) {
+                entry.r = discordMsgToTimestamp(message.reference.messageId);
+            }
+            writeDiscordMsgToData(channelName, message.id, entry, ts);
+        });
+        function scheduleReconnect(delay) {
+            if (gatewayReconnectTimer) return;
+            gatewayReconnectTimer = setTimeout(() => {
+                gatewayReconnectTimer = null;
+                connect();
+            }, delay);
+        }
+        connect();
+    }).catch(e => console.error("Failed To Start Gateway:", e.message));
+}
