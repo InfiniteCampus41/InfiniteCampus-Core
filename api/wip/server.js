@@ -7,7 +7,6 @@ import { createServer } from "http";
 import crypto from "crypto";
 import dotenv from "dotenv";
 import express from "express";
-import fetch from "node-fetch";
 import { fileURLToPath } from "url";
 import FormData from "form-data";
 import fs from "fs";
@@ -21,6 +20,8 @@ import { Server as IOServer } from "socket.io";
 import { spawn } from "child_process";
 import util from "util";
 import { WebSocketServer } from "ws";
+import fetch from "node-fetch";
+import { Client as DiscordClient, GatewayIntentBits, Partials } from "discord.js";
 dotenv.config();
 const discordBridgeState = {};
 const discordMsgIdToTimestamp = {};
@@ -125,6 +126,20 @@ const client = new Client({
     environment: Environment.Production,
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
 });
+const dClient = new DiscordClient({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ],
+    partials: [
+        Partials.Channel
+    ]
+});
+dClient.once("clientReady", () => {
+    console.log(`Logged In As ${dClient.user.tag}`);
+});
+dClient.login(process.env.DISCORD_BOT_TOKEN);
 const CREATE_COOLDOWN = 1500;
 const creating = new Map();
 const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
@@ -192,6 +207,8 @@ const RATE_LIMITS = {
     default: { max: 40,  window: 10_000 },  // misc fallback
 };
 const _rateLimitStore = new Map();
+const _msgSlowmodeStore = new Map();
+const MSG_SLOWMODE_MS = 3000;
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of _rateLimitStore.entries()) {
@@ -1016,7 +1033,6 @@ app.get("/weather", async (req, res) => {
             time: obsData.properties.timestamp
         });
     } catch (err) {
-        console.error(err);
         res.status(500).json({ error: "Weather Lookup Failed" });
     }
 });
@@ -2100,7 +2116,36 @@ app.post("/write", rateLimit("write"), async (req, res) => {
     try {
         const uid = await verifyToken(req);
         const { path, value } = req.body;
-        if (!Array.isArray(path)) return res.status(400).json({ error: "Path must be array" });
+        if (!Array.isArray(path)) return res.status(400).json({ error: "Path Must Be Array" });
+        if (
+            path.length === 3 && path[0] === "messages" &&
+            value && typeof value === "object" &&
+            (value.t || value.text)
+        ) {
+            const msgText = value.t || value.text || "";
+            if (/@everyone\b/i.test(msgText) || /@here\b/i.test(msgText)) {
+                return res.status(403).json({ error: "@everyone And @here Are Not Allowed." });
+            }
+            const dataJson = getDataCache();
+            const userProfile = dataJson?.users?.[uid]?.profile || {};
+            const isAdminUser = !!(
+                userProfile.isOwner || userProfile.isCoOwner ||
+                userProfile.isAdmin || userProfile.isHAdmin ||
+                userProfile.isTester
+            );
+            if (!isAdminUser) {
+                const now = Date.now();
+                const lastSend = _msgSlowmodeStore.get(uid) || 0;
+                if (now - lastSend < MSG_SLOWMODE_MS) {
+                    const retryAfter = Math.ceil((MSG_SLOWMODE_MS - (now - lastSend)) / 1000);
+                    return res.status(429).json({
+                        error: `You Can Only Send A Message Every 3 Seconds. Try Again In ${retryAfter}s.`,
+                        retryAfter
+                    });
+                }
+                _msgSlowmodeStore.set(uid, now);
+            }
+        }
         const dataJson = getDataCache();
         const rules = await loadRules();
         const root = new DataSnapshot(dataJson);
@@ -4375,7 +4420,9 @@ function startDiscordGateway() {
                 const channelName = discordIdToChannelName[d.channel_id];
                 if (!channelName) return;
                 const ts = discordMsgToTimestamp(d.id);
-                const baseContent = d.content || d.embeds?.[0]?.description || "";
+                const baseContent = (d.content || d.embeds?.[0]?.description || "")
+                    .replace(/@everyone\b/gi, "@\u200beveryone")
+                    .replace(/@here\b/gi, "@\u200bhere");
                 const gatewayAttachments = d.attachments || [];
                 let gatewayAttachmentHtml = "";
                 for (const att of gatewayAttachments) {
@@ -4411,6 +4458,7 @@ function startDiscordGateway() {
                 if (d.referenced_message) {
                     entry.r = discordMsgToTimestamp(d.referenced_message.id);
                 }
+                console.log(channelName);
                 writeDiscordMsgToData(channelName, d.id, entry, ts);
             } else if (op === 0 && t === "MESSAGE_UPDATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
@@ -4551,7 +4599,7 @@ async function bridgeDeleteToDiscord(channelName, timestamp) {
 })();
 function _startDiscordGatewaySync() {
     if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
-    const discordIdToChannelName = {};
+    let discordIdToChannelName = {};
     for (const [name, id] of Object.entries(DISCORD_CHANNEL_MAP)) {
         discordIdToChannelName[id] = name;
     }
@@ -4593,7 +4641,9 @@ function _startDiscordGatewaySync() {
                     const channelName = discordIdToChannelName[d.channel_id];
                     if (!channelName) return;
                     const ts = discordMsgToTimestamp(d.id);
-                    const baseContent2 = d.content || d.embeds?.[0]?.description || "";
+                    const baseContent2 = (d.content || d.embeds?.[0]?.description || "")
+                        .replace(/@everyone\b/gi, "@\u200beveryone")
+                        .replace(/@here\b/gi, "@\u200bhere");
                     const gw2Attachments = d.attachments || [];
                     let gw2AttachmentHtml = "";
                     for (const att of gw2Attachments) {
@@ -4670,6 +4720,46 @@ function _startDiscordGatewaySync() {
                 console.error("Gateway Error:", e.message);
             });
         }
+        dClient.on("messageCreate", async (message) => {
+            if (message.author.bot) return;
+            const channelName = discordIdToChannelName[message.channel.id];
+            if (!channelName) return;
+            const ts = discordMsgToTimestamp(message.id);
+            let content = (message.content || "")
+                .replace(/@everyone\b/gi, "@\u200beveryone")
+                .replace(/@here\b/gi, "@\u200bhere");
+            let attachmentHtml = "";
+            for (const att of message.attachments.values()) {
+                const attUrl = att.proxyURL || att.url;
+                const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                const name = att.name || "file";
+                if (/\.(png|jpg|jpeg|gif|webp)$/i.test(name)) {
+                    attachmentHtml += `<img src="${proxied}" alt="${name}" class="chat-img">`;
+                } else if (/\.(mp4|webm|mov)$/i.test(name)) {
+                    attachmentHtml += `<video src="${proxied}" controls></video>`;
+                } else {
+                    attachmentHtml += `<br><a href="${proxied}" target="_blank">${name}</a>`;
+                }
+            }
+            if (attachmentHtml) {
+                content += (content ? "\n" : "") + attachmentHtml;
+            }
+            if (!content) return;
+            const avatarUrl = message.author.displayAvatarURL({
+                extension: "png",
+                size: 64
+            });
+            const entry = {
+                u: message.author.username,
+                a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                t: content,
+                _discordId: message.id
+            };
+            if (message.reference?.messageId) {
+                entry.r = discordMsgToTimestamp(message.reference.messageId);
+            }
+            writeDiscordMsgToData(channelName, message.id, entry, ts);
+        });
         function scheduleReconnect(delay) {
             if (gatewayReconnectTimer) return;
             gatewayReconnectTimer = setTimeout(() => {
