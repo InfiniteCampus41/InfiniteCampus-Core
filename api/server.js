@@ -25,10 +25,25 @@ import { Client as DiscordClient, GatewayIntentBits, Partials } from "discord.js
 dotenv.config();
 const discordBridgeState = {};
 const discordMsgIdToTimestamp = {};
-const botSentDiscordIds = new Set();
+const botSentDiscordIds = loadBotSentDiscordIds();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const DISCORD_IDS_PATH = path.join(__dirname, "discordids.json");
+function loadBotSentDiscordIds() {
+    try {
+        if (fs.existsSync(DISCORD_IDS_PATH)) {
+            const parsed = JSON.parse(fs.readFileSync(DISCORD_IDS_PATH, "utf-8"));
+            if (Array.isArray(parsed)) return new Set(parsed);
+        }
+    } catch (e) { console.warn("Failed To Load discordids.json:", e.message); }
+    return new Set();
+}
+function saveBotSentDiscordIds() {
+    try {
+        fs.writeFileSync(DISCORD_IDS_PATH, JSON.stringify([...botSentDiscordIds], null, 2));
+    } catch (e) { console.error("Failed To Save discordids.json:", e.message); }
+}
 const DISCORD_CHANNEL_MAP_PATH = path.join(__dirname, "discord_channel_map.json");
 let DISCORD_CHANNEL_MAP = (() => {
     try {
@@ -198,7 +213,7 @@ const QUEUE_DIR = path.join(__dirname, "queue");
 const rateLimitLogs = [];
 const RATE_LIMIT_ENABLED = true;
 const RATE_LIMITS = {
-    read:    { max: 200,  window: 10_000 },  // 200 reads  / 10 s
+    read:    { max: 500,  window: 10_000 },  // 500 reads  / 10 s
     write:   { max: 25,  window: 10_000 },  // 25 writes / 10 s
     delete:  { max: 15,  window: 10_000 },  // 15 deletes/ 10 s
     react:   { max: 20,  window: 10_000 },  // 20 reacts / 10 s
@@ -2251,6 +2266,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         data.messages[channel][msgTimestamp]._attachmentUrl = cdnUrl;
                         if (uploadedDiscordMsgId) {
                             botSentDiscordIds.add(uploadedDiscordMsgId);
+                            saveBotSentDiscordIds();
                             data.messages[channel][msgTimestamp]._discordMirrorId = uploadedDiscordMsgId;
                         }
                         saveData(data);
@@ -4520,8 +4536,9 @@ function startDiscordGateway() {
                 console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId);
             } else if (op === 0 && t === "MESSAGE_CREATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
-                if (d.author?.bot && botSentDiscordIds.has(d.id)) return;
-                if (d.author?.bot) return;
+                if (d.author?.bot) {
+                    if (botSentDiscordIds.has(d.id)) return;
+                }
                 const channelName = discordIdToChannelName[d.channel_id];
                 if (!channelName) return;
                 const ts = discordMsgToTimestamp(d.id);
@@ -4697,7 +4714,7 @@ async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTime
             headers: { "Content-Type": "application/json" },
         });
         const discordMsgId = resp?.data?.id;
-        if (discordMsgId) botSentDiscordIds.add(discordMsgId);
+        if (discordMsgId) { botSentDiscordIds.add(discordMsgId); saveBotSentDiscordIds(); }
         return discordMsgId;
     } catch (e) {
         console.error("Failed To Bridge Message To Discord:", e.message);
@@ -4730,7 +4747,6 @@ async function bridgeDeleteToDiscordWithEntry(channelName, timestamp, entry) {
     if (!discordChannelId) return;
     if (!entry) return;
     if (!entry._discordMirrorId) return;
-    if (entry.u) return;
     try {
         await discordRequestForce({
             method: "delete",
@@ -4801,7 +4817,9 @@ function _startDiscordGatewaySync() {
                     console.log("Gateway Connected, Session:", gatewaySessionId);
                 } else if (op === 0 && t === "MESSAGE_CREATE") {
                     if (!watchedChannelIds.has(d.channel_id)) return;
-                    if (d.author?.bot) return;
+                    if (d.author?.bot) {
+                        if (botSentDiscordIds.has(d.id)) return;
+                    }
                     const channelName = discordIdToChannelName[d.channel_id];
                     if (!channelName) return;
                     const ts = discordMsgToTimestamp(d.id);
@@ -4891,7 +4909,9 @@ function _startDiscordGatewaySync() {
             });
         }
         dClient.on("messageCreate", async (message) => {
-            if (message.author.bot) return;
+            if (message.author.bot) {
+                if (botSentDiscordIds.has(message.id)) return;
+            }
             const channelName = discordIdToChannelName[message.channel.id];
             if (!channelName) return;
             const ts = discordMsgToTimestamp(message.id);
