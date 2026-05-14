@@ -25,11 +25,11 @@ import { Client as DiscordClient, GatewayIntentBits, Partials } from "discord.js
 dotenv.config();
 const discordBridgeState = {};
 const discordMsgIdToTimestamp = {};
-const botSentDiscordIds = loadBotSentDiscordIds();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DISCORD_IDS_PATH = path.join(__dirname, "discordids.json");
+const botSentDiscordIds = loadBotSentDiscordIds();
 function loadBotSentDiscordIds() {
     try {
         if (fs.existsSync(DISCORD_IDS_PATH)) {
@@ -141,20 +141,6 @@ const client = new Client({
     environment: Environment.Production,
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
 });
-const dClient = new DiscordClient({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ],
-    partials: [
-        Partials.Channel
-    ]
-});
-dClient.once("clientReady", () => {
-    console.log(`Logged In As ${dClient.user.tag}`);
-});
-dClient.login(process.env.DISCORD_BOT_TOKEN);
 const CREATE_COOLDOWN = 1500;
 const creating = new Map();
 const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
@@ -4467,11 +4453,24 @@ async function runInitialDiscordSync() {
         }
     }
 }
+let discordMessageListenerAttached = false;
+let discordClient = null;
 let discordGatewayWs = null;
 let gatewayHeartbeatInterval = null;
 let gatewaySessionId = null;
 let gatewaySeq = null;
 let gatewayReconnectTimer = null;
+// this weird thing happens where it sends an error but still works. I honestly don't know how it still works but whatever
+if (!discordClient) {
+    discordClient = new DiscordClient({
+        intents: [
+            GatewayIntentBits.Guilds,
+            GatewayIntentBits.GuildMessages,
+            GatewayIntentBits.MessageContent
+        ],
+        partials: [Partials.Channel]
+    });
+}
 function startDiscordGateway() {
     if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
     const discordIdToChannelName = {};
@@ -4479,35 +4478,24 @@ function startDiscordGateway() {
         discordIdToChannelName[id] = name;
     }
     const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
-    function connect() {
+    let reconnectAttempts = 0;
+    const MAX_RECONNECT_ATTEMPTS = 10;
+    const BASE_RECONNECT_DELAY = 3000;
+    const MAX_RECONNECT_DELAY = 5 * 60 * 1000;
+    async function connect() {
         if (discordGatewayWs) {
             try { discordGatewayWs.close(); } catch {}
+            discordGatewayWs = null;
         }
         if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
-        const { WebSocket: WS } = import("ws").catch(() => ({ WebSocket: null }));
-        const GWS = require ? (() => { try { return require("ws"); } catch { return null; } })() : null;
-        const gwWs = new WebSocketServer.__proto__.constructor
-            ? new (Object.getPrototypeOf(WebSocketServer))("wss://gateway.discord.gg/?v=10&encoding=json")
-            : null;
-        const _ws = (() => {
-            try {
-                const wsModule = { WebSocket: class extends require("events") {
-                    constructor(url) {
-                        super();
-                        const net = require("https");
-                    }
-                }};
-                return null;
-            } catch { return null; }
-        })();
         let ws;
         try {
-            const wsLib = (import("ws")).default || (import("ws"));
-            ws = new wsLib.WebSocket("wss://gateway.discord.gg/?v=10&encoding=json");
-        } catch {
-            const wsLib = (() => { const m = {}; require.__proto__ && (m.ws = eval("require")("ws")); return m.ws; })();
-            if (!wsLib) return;
-            ws = new wsLib("wss://gateway.discord.gg/?v=10&encoding=json");
+            const { WebSocket: WsClient } = await import("ws");
+            ws = new WsClient("wss://gateway.discord.gg/?v=10&encoding=json");
+        } catch (e) {
+            console.error("Failed to open gateway WebSocket:", e.message);
+            scheduleGatewayReconnect(BASE_RECONNECT_DELAY);
+            return;
         }
         discordGatewayWs = ws;
         ws.on("message", (raw) => {
@@ -4533,6 +4521,7 @@ function startDiscordGateway() {
                 }));
             } else if (op === 0 && t === "READY") {
                 gatewaySessionId = d.session_id;
+                reconnectAttempts = 0;
                 console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId);
             } else if (op === 0 && t === "MESSAGE_CREATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
@@ -4564,8 +4553,14 @@ function startDiscordGateway() {
                         gatewayAttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
                     }
                 }
-                const content = baseContent + (gatewayAttachmentHtml ? (baseContent ? "\n" + gatewayAttachmentHtml : gatewayAttachmentHtml) : "");
-                if (!content) return;
+                const content = baseContent
+                    + (gatewayAttachmentHtml ? (baseContent ? "\n" + gatewayAttachmentHtml : gatewayAttachmentHtml) : "");
+                let gatewayEmbedHtml = "";
+                for (const embed of (d.embeds || [])) {
+                    gatewayEmbedHtml += serializeDiscordEmbed(embed);
+                }
+                const fullContent = content + (gatewayEmbedHtml ? (content ? "\n" + gatewayEmbedHtml : gatewayEmbedHtml) : "");
+                if (!fullContent) return;
                 const avatarHash = d.author?.avatar;
                 const userId = d.author?.id;
                 const avatarUrl = avatarHash
@@ -4574,7 +4569,7 @@ function startDiscordGateway() {
                 const entry = {
                     u: d.author?.username || "Unknown",
                     a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
-                    t: content,
+                    t: fullContent,
                     _discordId: d.id,
                 };
                 if (d.referenced_message) {
@@ -4613,6 +4608,64 @@ function startDiscordGateway() {
                 scheduleGatewayReconnect(3000);
             }
         });
+        if (!discordMessageListenerAttached) {
+            discordMessageListenerAttached = true;
+            discordClient.on("messageCreate", async (message) => {
+                if (message.author.bot) {
+                    if (botSentDiscordIds.has(message.id)) return;
+                }
+                const channelName = discordIdToChannelName[message.channel.id];
+                if (!channelName) return;
+                const ts = discordMsgToTimestamp(message.id);
+                let content = (message.content || "")
+                    .replace(/@everyone\b/gi, "@\u200beveryone")
+                    .replace(/@here\b/gi, "@\u200bhere");
+                let attachmentHtml = "";
+                for (const att of message.attachments.values()) {
+                    const attUrl = att.proxyURL || att.url;
+                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                    const name = att.name || "file";
+                    if (/\.(png|jpg|jpeg|gif|webp)$/i.test(name)) {
+                        attachmentHtml += `<img src="${proxied}" alt="${name}" class="chat-img">`;
+                    } else if (/\.(mp4|webm|mov)$/i.test(name)) {
+                        attachmentHtml += `<video src="${proxied}" controls></video>`;
+                    } else {
+                        attachmentHtml += `<br><a href="${proxied}" target="_blank">${name}</a>`;
+                    }
+                }
+                if (attachmentHtml) {
+                    content += (content ? "\n" : "") + attachmentHtml;
+                }
+                let embedHtml = "";
+                for (const embed of (message.embeds || [])) {
+                    embedHtml += serializeDiscordEmbed(embed);
+                }
+                if (embedHtml) {
+                    content += (content ? "\n" : "") + embedHtml;
+                }
+                if (!content) return;
+                const avatarUrl = message.author.displayAvatarURL({
+                    extension: "png",
+                    size: 64
+                });
+                const entry = {
+                    u: message.author.username,
+                    a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                    t: content,
+                    _discordId: message.id
+                };
+                if (message.reference?.messageId) {
+                    entry.r = discordMsgToTimestamp(message.reference.messageId);
+                }
+                writeDiscordMsgToData(channelName, message.id, entry, ts);
+            });
+            discordClient.once("clientReady", () => {
+                console.log(`discord.js ready as ${discordClient.user.tag}`);
+            });
+            discordClient.login(DISCORD_BOT_TOKEN).catch(err => {
+                console.error("discord.js login failed:", err);
+            });
+        }
         ws.on("close", (code) => {
             console.warn("Gateway Closed, Code:", code);
             if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
@@ -4622,8 +4675,15 @@ function startDiscordGateway() {
             console.error("Gateway Error:", e.message);
         });
     }
-    function scheduleGatewayReconnect(delay) {
+    function scheduleGatewayReconnect(baseDelay) {
         if (gatewayReconnectTimer) return;
+        reconnectAttempts++;
+        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+            console.error(`[DiscordGateway] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up to avoid token ban. Restart the server to retry.`);
+            return;
+        }
+        const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
+        console.log(`[DiscordGateway] Scheduling reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s`);
         gatewayReconnectTimer = setTimeout(() => {
             gatewayReconnectTimer = null;
             connect();
@@ -4775,9 +4835,9 @@ async function bridgeDeleteToDiscord(channelName, timestamp) {
 }
 (async () => {
     await runInitialDiscordSync();
-    _startDiscordGatewaySync();
+    startDiscordGateway();
 })();
-function _startDiscordGatewaySync() {
+function _startDiscordGatewaySync_REMOVED() {
     if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
     let discordIdToChannelName = {};
     for (const [name, id] of Object.entries(DISCORD_CHANNEL_MAP)) {
@@ -4908,55 +4968,6 @@ function _startDiscordGatewaySync() {
                 console.error("Gateway Error:", e.message);
             });
         }
-        dClient.on("messageCreate", async (message) => {
-            if (message.author.bot) {
-                if (botSentDiscordIds.has(message.id)) return;
-            }
-            const channelName = discordIdToChannelName[message.channel.id];
-            if (!channelName) return;
-            const ts = discordMsgToTimestamp(message.id);
-            let content = (message.content || "")
-                .replace(/@everyone\b/gi, "@\u200beveryone")
-                .replace(/@here\b/gi, "@\u200bhere");
-            let attachmentHtml = "";
-            for (const att of message.attachments.values()) {
-                const attUrl = att.proxyURL || att.url;
-                const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
-                const name = att.name || "file";
-                if (/\.(png|jpg|jpeg|gif|webp)$/i.test(name)) {
-                    attachmentHtml += `<img src="${proxied}" alt="${name}" class="chat-img">`;
-                } else if (/\.(mp4|webm|mov)$/i.test(name)) {
-                    attachmentHtml += `<video src="${proxied}" controls></video>`;
-                } else {
-                    attachmentHtml += `<br><a href="${proxied}" target="_blank">${name}</a>`;
-                }
-            }
-            if (attachmentHtml) {
-                content += (content ? "\n" : "") + attachmentHtml;
-            }
-            let embedHtml = "";
-            for (const embed of (message.embeds || [])) {
-                embedHtml += serializeDiscordEmbed(embed);
-            }
-            if (embedHtml) {
-                content += (content ? "\n" : "") + embedHtml;
-            }
-            if (!content) return;
-            const avatarUrl = message.author.displayAvatarURL({
-                extension: "png",
-                size: 64
-            });
-            const entry = {
-                u: message.author.username,
-                a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
-                t: content,
-                _discordId: message.id
-            };
-            if (message.reference?.messageId) {
-                entry.r = discordMsgToTimestamp(message.reference.messageId);
-            }
-            writeDiscordMsgToData(channelName, message.id, entry, ts);
-        });
         function scheduleReconnect(delay) {
             if (gatewayReconnectTimer) return;
             gatewayReconnectTimer = setTimeout(() => {
