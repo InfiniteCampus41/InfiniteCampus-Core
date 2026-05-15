@@ -1363,7 +1363,7 @@ app.post("/discordVerifyConfirm", async (req, res) => {
         message: "Discord Account Verified"
     });
 });
-app.post("/email", async (req, res) => {
+app.post("/email", verifyFirebaseToken, async (req, res) => {
     try {
         const { to, subject, text, html } = req.body;
         if (!to || !subject || (!text && !html)) {
