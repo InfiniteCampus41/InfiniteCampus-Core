@@ -1090,21 +1090,6 @@ app.post("/admin/createCustomToken", verifyFirebaseToken, async (req, res) => {
         res.status(500).json({ error: "Failed to create token" });
     }
 });
-app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
-    const { filename } = req.body;
-    if (!filename) return res.json({ ok: false, message: "No Filename Provided" });
-    const full = path.join(APPLY_DIR, filename);
-    if (!fs.existsSync(full)) return res.json({ ok: false, message: "Not Found" });
-    try {
-        fs.unlinkSync(full);
-        finishReject(filename);
-        applicantMessages.delete(filename);
-        acceptStatus.delete(filename);
-        return res.json({ ok: true });
-    } catch (err) {
-        return res.json({ ok: false, message: err.message });
-    }
-});
 app.post("/admin/discord_toggle", async (req, res) => {
     const pass = req.headers["x-admin-password"];
     if (pass === process.env.NITRIX67 || pass === process.env.DON_PASS_1) {
@@ -1168,6 +1153,21 @@ app.post("/admin/lockdown", (req, res) => {
     }
     console.log(`LOCKDOWN Is Now ${LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
     res.json({ lockdown: LOCKDOWN });
+});
+app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
+    const { filename } = req.body;
+    if (!filename) return res.json({ ok: false, message: "No Filename Provided" });
+    const full = path.join(APPLY_DIR, filename);
+    if (!fs.existsSync(full)) return res.json({ ok: false, message: "Not Found" });
+    try {
+        fs.unlinkSync(full);
+        finishReject(filename);
+        applicantMessages.delete(filename);
+        acceptStatus.delete(filename);
+        return res.json({ ok: true });
+    } catch (err) {
+        return res.json({ ok: false, message: err.message });
+    }
 });
 app.post("/check_pass", (req, res) => {
     const pass = req.body.password;
@@ -1372,6 +1372,31 @@ app.post("/email", verifyFirebaseToken, async (req, res) => {
             text,
             html
         });
+        try {
+            const senderProfile = readDataPath(`users/${uid}/profile`);
+            const senderName = senderProfile?.displayName || uid;
+            const preview = (text || "").substring(0, 200) || "(HTML only)";
+            await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${logid}/messages`,
+                data: {
+                    embeds: [{
+                        title: "Email Sent",
+                        color: 0x4fa3ff,
+                        fields: [
+                            { name: "From", value: senderName, inline: true },
+                            { name: "To", value: Array.isArray(to) ? to.join(", ") : to, inline: true },
+                            { name: "Subject", value: subject, inline: false },
+                            { name: "Preview", value: preview, inline: false },
+                        ],
+                        timestamp: new Date().toISOString(),
+                        footer: { text: `Resend ID: ${result.data?.id || "N/A"}` }
+                    }]
+                }
+            });
+        } catch (logErr) {
+            console.error("Email Log To Discord Failed:", logErr.message || logErr);
+        }
         res.json({
             success: true,
             id: result.data?.id || null
@@ -2359,6 +2384,18 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                             await sendMentionNotification(targetUid, uid, channel, msgTimestamp, newValue.t);
                         }
                     }
+                    if (newValue.r) {
+                        const replyTargetTs = String(newValue.r);
+                        const msgData = getDataCache();
+                        const repliedEntry = msgData?.messages?.[channel]?.[replyTargetTs];
+                        if (repliedEntry) {
+                            const repliedSenderUid = repliedEntry.s || null;
+                            if (repliedSenderUid && repliedSenderUid !== uid) {
+                                const senderProfile = msgData?.users?.[uid]?.profile;
+                                await sendReplyNotification(repliedSenderUid, uid, senderProfile?.displayName || "Someone", channel, msgTimestamp, newValue.t);
+                            }
+                        }
+                    }
                 } else if (
                     path.length === 3 &&
                     path[0] === "messages" &&
@@ -2394,6 +2431,18 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         const targetUid = await getUidByDisplayNameServer(name);
                         if (targetUid && targetUid !== uid) {
                             await sendMentionNotification(targetUid, uid, channel, msgTimestamp, newValue.text);
+                        }
+                    }
+                    if (newValue.reply) {
+                        const replyTargetTs = String(newValue.reply);
+                        const msgData = getDataCache();
+                        const repliedEntry = msgData?.messages?.[channel]?.[replyTargetTs];
+                        if (repliedEntry) {
+                            const repliedSenderUid = repliedEntry.s || repliedEntry.sender || null;
+                            if (repliedSenderUid && repliedSenderUid !== uid) {
+                                const senderProfile = msgData?.users?.[uid]?.profile;
+                                await sendReplyNotification(repliedSenderUid, uid, senderProfile?.displayName || "Someone", channel, msgTimestamp, newValue.text);
+                            }
                         }
                     }
                 } else if (
@@ -3195,6 +3244,33 @@ async function sendDMNotification(targetUid, senderUid, text) {
         });
     } catch (e) {
         console.error("DM Notification Error:", e.message || e);
+    }
+}
+async function sendReplyNotification(targetUid, senderUid, senderDisplayName, channel, msgId, text) {
+    try {
+        if (targetUid && targetUid === senderUid) return;
+        const tokens = await _getPushTokensForUser(targetUid);
+        if (!tokens.length) return;
+        const data = getDataCache();
+        const settings = data?.notifications?.[targetUid]?.settings || {};
+        if (settings.replies === false) return;
+        const preview = (text || "").substring(0, 80);
+        const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        const title = senderDisplayName
+            ? `${senderDisplayName} Replied To You`
+            : "Someone Replied To You";
+        await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: { title, body: preview },
+            data: { type: "reply", url, channel: channel || "", msgId: String(msgId) },
+            webpush: { fcmOptions: { link: url } }
+        });
+        logEvent("notifications", {
+            id: `reply_${Date.now()}`,
+            data: { type: "reply", to: targetUid, from: senderUid || senderDisplayName, channel: channel || "", msgId: String(msgId) }
+        });
+    } catch (e) {
+        console.error("Reply Notification Error:", e.message || e);
     }
 }
 async function sendMentionNotification(targetUid, senderUid, channel, msgId, text) {
@@ -4548,6 +4624,34 @@ function startDiscordGateway() {
                 }
                 console.log(channelName);
                 writeDiscordMsgToData(channelName, d.id, entry, ts);
+                if (d.referenced_message) {
+                    try {
+                        const refTs = discordMsgToTimestamp(d.referenced_message.id);
+                        const replyData = getDataCache();
+                        const repliedEntry = replyData?.messages?.[channelName]?.[String(refTs)];
+                        if (repliedEntry) {
+                            const replierDiscordUsername = (d.author?.username || "").toLowerCase();
+                            const originalSenderUid = repliedEntry.s || null;
+                            if (originalSenderUid) {
+                                const originalSenderProfile = replyData?.users?.[originalSenderUid]?.profile || {};
+                                const linkedDiscordUsername = (originalSenderProfile.dUsername || "").toLowerCase();
+                                if (linkedDiscordUsername && linkedDiscordUsername === replierDiscordUsername) {
+                                } else {
+                                    await sendReplyNotification(
+                                        originalSenderUid,
+                                        null,
+                                        d.author?.username || "Someone",
+                                        channelName,
+                                        ts,
+                                        d.content || ""
+                                    );
+                                }
+                            }
+                        }
+                    } catch (replyNotifErr) {
+                        console.error("Discord Reply Notification Error:", replyNotifErr.message || replyNotifErr);
+                    }
+                }
             } else if (op === 0 && t === "MESSAGE_UPDATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
                 const channelName = discordIdToChannelName[d.channel_id];
