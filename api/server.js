@@ -22,7 +22,6 @@ import util from "util";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { Resend } from "resend";
-import { Client as DiscordClient, GatewayIntentBits, Partials } from "discord.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -70,7 +69,6 @@ let DISCORD_CHANNEL_MAP = (() => {
         return JSON.parse(process.env.DISCORD_CHANNEL_MAP || "{}");
     } catch { return {}; }
 })();
-let discordClient = null;
 let DISCORD_DISABLED = false;
 let discordGatewayWs = null;
 let discordMessageListenerAttached = false;
@@ -259,16 +257,6 @@ if (!admin.apps.length) {
     admin.initializeApp({
         credential: admin.credential.cert(JSON.parse(fs.readFileSync("./admin.json"))),
         databaseURL: "https://notes-27f22-default-rtdb.firebaseio.com"
-    });
-}
-if (!discordClient) {
-    discordClient = new DiscordClient({
-        intents: [
-            GatewayIntentBits.Guilds,
-            GatewayIntentBits.GuildMessages,
-            GatewayIntentBits.MessageContent
-        ],
-        partials: [Partials.Channel]
     });
 }
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -4489,8 +4477,12 @@ function startDiscordGateway() {
                     op: 2,
                     d: {
                         token: DISCORD_BOT_TOKEN,
-                        intents: 512,
-                        properties: { os: "linux", browser: "ic-bridge", device: "ic-bridge" }
+                        intents: 33281,
+                        properties: { 
+                            os: "linux", 
+                            browser: "ic-bridge", 
+                            device: "ic-bridge" 
+                        }
                     }
                 }));
             } else if (op === 0 && t === "READY") {
@@ -4582,64 +4574,6 @@ function startDiscordGateway() {
                 scheduleGatewayReconnect(3000);
             }
         });
-        if (!discordMessageListenerAttached) {
-            discordMessageListenerAttached = true;
-            discordClient.on("messageCreate", async (message) => {
-                if (message.author.bot) {
-                    if (botSentDiscordIds.has(message.id)) return;
-                }
-                const channelName = discordIdToChannelName[message.channel.id];
-                if (!channelName) return;
-                const ts = discordMsgToTimestamp(message.id);
-                let content = (message.content || "")
-                    .replace(/@everyone\b/gi, "@\u200beveryone")
-                    .replace(/@here\b/gi, "@\u200bhere");
-                let attachmentHtml = "";
-                for (const att of message.attachments.values()) {
-                    const attUrl = att.proxyURL || att.url;
-                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
-                    const name = att.name || "file";
-                    if (/\.(png|jpg|jpeg|gif|webp)$/i.test(name)) {
-                        attachmentHtml += `<img src="${proxied}" alt="${name}" class="chat-img">`;
-                    } else if (/\.(mp4|webm|mov)$/i.test(name)) {
-                        attachmentHtml += `<video src="${proxied}" controls></video>`;
-                    } else {
-                        attachmentHtml += `<br><a href="${proxied}" target="_blank">${name}</a>`;
-                    }
-                }
-                if (attachmentHtml) {
-                    content += (content ? "\n" : "") + attachmentHtml;
-                }
-                let embedHtml = "";
-                for (const embed of (message.embeds || [])) {
-                    embedHtml += serializeDiscordEmbed(embed);
-                }
-                if (embedHtml) {
-                    content += (content ? "\n" : "") + embedHtml;
-                }
-                if (!content) return;
-                const avatarUrl = message.author.displayAvatarURL({
-                    extension: "png",
-                    size: 64
-                });
-                const entry = {
-                    u: message.author.username,
-                    a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
-                    t: content,
-                    _discordId: message.id
-                };
-                if (message.reference?.messageId) {
-                    entry.r = discordMsgToTimestamp(message.reference.messageId);
-                }
-                writeDiscordMsgToData(channelName, message.id, entry, ts);
-            });
-            discordClient.once("clientReady", () => {
-                console.log(`discord.js ready as ${discordClient.user.tag}`);
-            });
-            discordClient.login(DISCORD_BOT_TOKEN).catch(err => {
-                console.error("discord.js login failed:", err);
-            });
-        }
         ws.on("close", (code) => {
             console.warn("Gateway Closed, Code:", code);
             if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
