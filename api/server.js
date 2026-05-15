@@ -1353,6 +1353,11 @@ app.post("/discordVerifyConfirm", async (req, res) => {
 });
 app.post("/email", verifyFirebaseToken, async (req, res) => {
     try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isTester)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
         const { to, subject, text, html } = req.body;
         if (!to || !subject || (!text && !html)) {
             return res.status(400).json({
@@ -4598,148 +4603,6 @@ function startDiscordGateway() {
         }, delay);
     }
     connect();
-}
-//there is no need for this function anymore, i am just using it for reference so if the new code doesnt work, then i can restore it from here
-function _startDiscordGatewaySync_REMOVED() {
-    if (!DISCORD_BOT_TOKEN || Object.keys(DISCORD_CHANNEL_MAP).length === 0) return;
-    let discordIdToChannelName = {};
-    for (const [name, id] of Object.entries(DISCORD_CHANNEL_MAP)) {
-        discordIdToChannelName[id] = name;
-    }
-    const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
-    import("ws").then(({ default: wsModule, WebSocket: WsClient }) => {
-        const WSClient = WsClient || wsModule;
-        function connect() {
-            if (discordGatewayWs) { try { discordGatewayWs.close(); } catch {} }
-            if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
-            const ws = new WSClient("wss://gateway.discord.gg/?v=10&encoding=json");
-            discordGatewayWs = ws;
-            ws.on("message", (raw) => {
-                let payload;
-                try { payload = JSON.parse(raw.toString()); } catch { return; }
-                const { op, d, s, t } = payload;
-                if (s != null) gatewaySeq = s;
-                if (op === 10) {
-                    const interval = d.heartbeat_interval;
-                    if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
-                    gatewayHeartbeatInterval = setInterval(() => {
-                        if (ws.readyState === ws.OPEN) {
-                            ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
-                        }
-                    }, interval);
-                    ws.send(JSON.stringify({
-                        op: 2,
-                        d: {
-                            token: DISCORD_BOT_TOKEN,
-                            intents: 512,
-                            properties: { os: "linux", browser: "ic-bridge", device: "ic-bridge" }
-                        }
-                    }));
-                } else if (op === 0 && t === "READY") {
-                    gatewaySessionId = d.session_id;
-                    console.log("Gateway Connected, Session:", gatewaySessionId);
-                } else if (op === 0 && t === "MESSAGE_CREATE") {
-                    if (!watchedChannelIds.has(d.channel_id)) return;
-                    if (d.author?.bot) {
-                        if (botSentDiscordIds.has(d.id)) return;
-                    }
-                    const channelName = discordIdToChannelName[d.channel_id];
-                    if (!channelName) return;
-                    const ts = discordMsgToTimestamp(d.id);
-                    const baseContent2 = (d.content || "")
-                        .replace(/@everyone\b/gi, "@\u200beveryone")
-                        .replace(/@here\b/gi, "@\u200bhere");
-                    const gw2Attachments = d.attachments || [];
-                    let gw2AttachmentHtml = "";
-                    for (const att of gw2Attachments) {
-                        const attUrl = att.proxy_url || att.url || "";
-                        if (!attUrl) continue;
-                        const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
-                        const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
-                        const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
-                        const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
-                        if (isImage) {
-                            gw2AttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
-                        } else if (isVideo) {
-                            gw2AttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
-                        } else if (isAudio) {
-                            gw2AttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
-                        } else {
-                            gw2AttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
-                        }
-                    }
-                    let gw2EmbedHtml = "";
-                    for (const embed of (d.embeds || [])) {
-                        gw2EmbedHtml += serializeDiscordEmbed(embed);
-                    }
-                    const content = baseContent2
-                        + (gw2AttachmentHtml ? (baseContent2 ? "\n" + gw2AttachmentHtml : gw2AttachmentHtml) : "")
-                        + (gw2EmbedHtml ? "\n" + gw2EmbedHtml : "");
-                    if (!content) return;
-                    const avatarHash = d.author?.avatar;
-                    const userId = d.author?.id;
-                    const avatarUrl = avatarHash
-                        ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
-                        : `https://cdn.discordapp.com/embed/avatars/0.png`;
-                    const entry = {
-                        u: d.author?.username || "Unknown",
-                        a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
-                        t: content,
-                        _discordId: d.id,
-                    };
-                    if (d.referenced_message) {
-                        entry.r = discordMsgToTimestamp(d.referenced_message.id);
-                    }
-                    writeDiscordMsgToData(channelName, d.id, entry, ts);
-                } else if (op === 0 && t === "MESSAGE_UPDATE") {
-                    if (!watchedChannelIds.has(d.channel_id)) return;
-                    const channelName = discordIdToChannelName[d.channel_id];
-                    if (!channelName) return;
-                    const ref = discordMsgIdToTimestamp[d.id];
-                    if (!ref) return;
-                    const data = getDataCache();
-                    const existing = data?.messages?.[channelName]?.[ref.timestamp];
-                    if (!existing || !existing.u) return;
-                    existing.t = d.content || existing.t;
-                    existing.e = "edited";
-                    data.messages[channelName][ref.timestamp] = existing;
-                    saveData(data);
-                    broadcastUpdate(["messages", channelName, String(ref.timestamp)], existing);
-                } else if (op === 0 && t === "MESSAGE_DELETE") {
-                    if (!watchedChannelIds.has(d.channel_id)) return;
-                    const channelName = discordIdToChannelName[d.channel_id];
-                    if (!channelName) return;
-                    const ref = discordMsgIdToTimestamp[d.id];
-                    if (!ref) return;
-                    const data = getDataCache();
-                    if (data?.messages?.[channelName]?.[ref.timestamp]) {
-                        delete data.messages[channelName][ref.timestamp];
-                        saveData(data);
-                        broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
-                    }
-                    delete discordMsgIdToTimestamp[d.id];
-                } else if (op === 7 || op === 9) {
-                    scheduleReconnect(3000);
-                }
-            });
-            ws.on("close", (code) => {
-                console.warn("Gateway Closed, Code:", code);
-                if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
-                scheduleReconnect(5000);
-            });
-            ws.on("error", (e) => {
-                console.error("Gateway Error:", e.message);
-            });
-        }
-        function scheduleReconnect(delay) {
-            if (gatewayReconnectTimer) return;
-            gatewayReconnectTimer = setTimeout(() => {
-                gatewayReconnectTimer = null;
-                connect();
-            }, delay);
-        }
-        connect();
-    }).catch(e => console.error("Failed To Start Gateway:", e.message));
 }
 function toggleLockdown() {
     LOCKDOWN = !LOCKDOWN;
