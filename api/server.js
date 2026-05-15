@@ -2392,7 +2392,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                             const repliedSenderUid = repliedEntry.s || null;
                             if (repliedSenderUid && repliedSenderUid !== uid) {
                                 const senderProfile = msgData?.users?.[uid]?.profile;
-                                await sendReplyNotification(repliedSenderUid, uid, senderProfile?.displayName || "Someone", channel, msgTimestamp, newValue.t);
+                                sendReplyNotification(repliedSenderUid, uid, senderProfile?.displayName || "Someone", channel, msgTimestamp, newValue.t);
                             }
                         }
                     }
@@ -4637,7 +4637,7 @@ function startDiscordGateway() {
                                 const linkedDiscordUsername = (originalSenderProfile.dUsername || "").toLowerCase();
                                 if (linkedDiscordUsername && linkedDiscordUsername === replierDiscordUsername) {
                                 } else {
-                                    await sendReplyNotification(
+                                    sendReplyNotification(
                                         originalSenderUid,
                                         null,
                                         d.author?.username || "Someone",
