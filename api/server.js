@@ -70,6 +70,7 @@ let DISCORD_CHANNEL_MAP = (() => {
     } catch { return {}; }
 })();
 let DISCORD_DISABLED = false;
+let discordGatewayActive = null;
 let discordGatewayWs = null;
 let discordMessageListenerAttached = false;
 const discordMsgIdToTimestamp = {};
@@ -4687,6 +4688,7 @@ function startDiscordGateway() {
             console.warn("Gateway Closed, Code:", code);
             if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
             scheduleGatewayReconnect(5000);
+            discordGatewayActive = null;
         });
         ws.on("error", (e) => {
             console.error("Gateway Error:", e.message);
@@ -4941,5 +4943,8 @@ restoreApplicantMessages();
 watchForNewUsers();
 (async () => {
     await runInitialDiscordSync();
-    startDiscordGateway();
+    if (!discordGatewayActive) {
+        startDiscordGateway()
+        discordGatewayActive = true;
+    }
 })();
