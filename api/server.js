@@ -92,8 +92,10 @@ const donationSessions = new Map();
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
 const FOLDER_LIMIT_MB = 1024;
+let gatewayCanResume = false;
 let gatewayHeartbeatInterval = null;
 let gatewayReconnectTimer = null;
+let gatewayResumeUrl = null;
 let gatewaySessionId = null;
 let gatewaySeq = null;
 const httpServer = createServer(app);
@@ -4532,10 +4534,13 @@ function startDiscordGateway() {
             discordGatewayWs = null;
         }
         if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
+        const wsUrl = (gatewayCanResume && gatewayResumeUrl)
+            ? `${gatewayResumeUrl}/?v=10&encoding=json`
+            : "wss://gateway.discord.gg/?v=10&encoding=json";
         let ws;
         try {
             const { WebSocket: WsClient } = await import("ws");
-            ws = new WsClient("wss://gateway.discord.gg/?v=10&encoding=json");
+            ws = new WsClient(wsUrl);
         } catch (e) {
             console.error("Failed to open gateway WebSocket:", e.message);
             scheduleGatewayReconnect(BASE_RECONNECT_DELAY);
@@ -4550,27 +4555,69 @@ function startDiscordGateway() {
             if (op === 10) {
                 const interval = d.heartbeat_interval;
                 if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
+                const jitter = Math.floor(Math.random() * interval);
+                setTimeout(() => {
+                    if (ws.readyState === ws.OPEN) {
+                        ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
+                    }
+                }, jitter);
                 gatewayHeartbeatInterval = setInterval(() => {
                     if (ws.readyState === ws.OPEN) {
                         ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
                     }
                 }, interval);
-                ws.send(JSON.stringify({
-                    op: 2,
-                    d: {
-                        token: DISCORD_BOT_TOKEN,
-                        intents: 33281,
-                        properties: { 
-                            os: "linux", 
-                            browser: "ic-bridge", 
-                            device: "ic-bridge" 
+                if (gatewayCanResume && gatewaySessionId && gatewaySeq != null) {
+                    console.log("[DiscordGateway] Sending RESUME for session:", gatewaySessionId, "seq:", gatewaySeq);
+                    ws.send(JSON.stringify({
+                        op: 6,
+                        d: {
+                            token: DISCORD_BOT_TOKEN,
+                            session_id: gatewaySessionId,
+                            seq: gatewaySeq
                         }
-                    }
-                }));
+                    }));
+                } else {
+                    console.log("[DiscordGateway] Sending IDENTIFY");
+                    ws.send(JSON.stringify({
+                        op: 2,
+                        d: {
+                            token: DISCORD_BOT_TOKEN,
+                            intents: 33281,
+                            properties: {
+                                os: "linux",
+                                browser: "ic-bridge",
+                                device: "ic-bridge"
+                            }
+                        }
+                    }));
+                }
+            } else if (op === 11) {
+            } else if (op === 1) {
+                if (ws.readyState === ws.OPEN) {
+                    ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
+                }
+            } else if (op === 7) {
+                console.log("[DiscordGateway] Op 7 Reconnect received — will resume");
+                gatewayCanResume = true;
+                scheduleGatewayReconnect(1000);
+            } else if (op === 9) {
+                const resumable = d === true;
+                console.warn("[DiscordGateway] Op 9 Invalid Session — resumable:", resumable);
+                gatewayCanResume = resumable;
+                if (!resumable) {
+                    gatewaySessionId = null;
+                    gatewaySeq = null;
+                }
+                scheduleGatewayReconnect(1000 + Math.floor(Math.random() * 4000));
             } else if (op === 0 && t === "READY") {
                 gatewaySessionId = d.session_id;
+                gatewayResumeUrl = d.resume_gateway_url || null;
+                gatewayCanResume = true;
                 reconnectAttempts = 0;
-                console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId);
+                console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId, "resume_url:", gatewayResumeUrl);
+            } else if (op === 0 && t === "RESUMED") {
+                reconnectAttempts = 0;
+                console.log("[DiscordGateway] Session successfully resumed");
             } else if (op === 0 && t === "MESSAGE_CREATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
                 if (d.author?.bot) {
@@ -4680,15 +4727,22 @@ function startDiscordGateway() {
                     broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
                 }
                 delete discordMsgIdToTimestamp[d.id];
-            } else if (op === 7 || op === 9) {
-                scheduleGatewayReconnect(3000);
             }
         });
         ws.on("close", (code) => {
-            console.warn("Gateway Closed, Code:", code);
-            if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
-            scheduleGatewayReconnect(5000);
+            console.warn("[DiscordGateway] Connection closed, code:", code);
+            if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
+            const nonResumableCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
+            if (nonResumableCodes.has(code)) {
+                console.error(`[DiscordGateway] Non-resumable close code ${code} — clearing session`);
+                gatewayCanResume = false;
+                gatewaySessionId = null;
+                gatewaySeq = null;
+            } else {
+                gatewayCanResume = !!(gatewaySessionId && gatewaySeq != null);
+            }
             discordGatewayActive = null;
+            scheduleGatewayReconnect(5000);
         });
         ws.on("error", (e) => {
             console.error("Gateway Error:", e.message);
