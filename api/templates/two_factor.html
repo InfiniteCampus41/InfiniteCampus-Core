@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Two-Factor Authentication – Infinite Campus</title>
+    <style>
+        body { margin: 0; padding: 0; background-color: #0a0a0a; font-family: 'Segoe UI', Arial, sans-serif; color: #ffffff; }
+        .wrapper { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+        img { display: block; margin: 0 auto; height:30px; border-radius:10px;}
+        .card { background: linear-gradient(135deg, #111111 0%, #1a1a1a 100%); border: 1px solid #2a2a2a; border-radius: 16px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #0f4013 0%, #2e8023 50%, #0f4013 100%); padding: 40px 36px; text-align: center; position: relative; }
+        .header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #44cc88, transparent); }
+        .logo { font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #44cc88; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+        .header h1 { margin: 0; font-size: 26px; font-weight: 800; letter-spacing: -0.5px; }
+        .header h1 span { color: #44cc88; }
+        .header .subtitle { margin: 10px 0 0; color: #888; font-size: 14px; }
+        .body { padding: 36px; }
+        .greeting { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f0f0f0; }
+        .message { color: #aaa; font-size: 15px; line-height: 1.7; margin-bottom: 28px; }
+        .code-display { background: linear-gradient(135deg, #0f4013, #2e8023); border: 1px solid #2e8023; border-radius: 12px; padding: 28px; text-align: center; margin-bottom: 28px; }
+        .code-display .code-label { font-size: 11px; font-weight: 700; letter-spacing: 2px; color: #44cc88; text-transform: uppercase; margin-bottom: 14px; }
+        .code-display .code-number { font-family: 'Courier New', monospace; font-size: 42px; font-weight: 900; letter-spacing: 10px; color: #44cc88; text-shadow: 0 0 20px #00cccc44; }
+        .code-display .code-expire { font-size: 13px; color: #666; margin-top: 12px; }
+        .details-grid { display: table; width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+        .detail-row { display: table-row; }
+        .detail-cell { display: table-cell; padding: 10px 14px; border-bottom: 1px solid #222; font-size: 14px; }
+        .detail-cell:first-child { color: #666; width: 40%; }
+        .detail-cell:last-child { color: #ddd; font-weight: 500; }
+        .security-note { background: #0f4013; border: 1px solid #2e8023; border-radius: 8px; padding: 14px 18px; margin-bottom: 28px; }
+        .security-note p { margin: 0; color: #888; font-size: 13px; line-height: 1.6; }
+        .security-note strong { color: #44cc88; }
+        .warning-note { background: #1a1400; border: 1px solid #333300; border-radius: 8px; padding: 14px 18px; margin-bottom: 20px; }
+        .warning-note p { margin: 0; color: #888; font-size: 13px; line-height: 1.6; }
+        .warning-note strong { color: #ffcc00; }
+        .footer { padding: 24px 36px; text-align: center; border-top: 1px solid #1a1a1a; }
+        .footer p { color: #444; font-size: 12px; line-height: 1.6; margin: 4px 0; }
+        .footer a { color: #44cc88; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <div class="logo"><img src="https://infinitecampus.xyz/res/icon.png">Infinite Campus</div>
+                <h1><span>Two-Factor Authentication</span></h1>
+                <p class="subtitle">Your 2FA Verification Code</p>
+            </div>
+            <div class="body">
+                <div class="greeting">Hey {{DISPLAYNAME}},</div>
+                <p class="message">
+                    You Requested To Enable Two-Factor Authentication On Your Infinite Campus Account. 
+                    Enter The Code Below To Complete The Setup And Secure Your Account.
+                </p>
+                <div class="code-display">
+                    <div class="code-label">Your Verification Code</div>
+                    <div class="code-number">{{SECONDFACTOR}}</div>
+                    <div class="code-expire">This Code Expires In 10 Minutes</div>
+                </div>
+                <div class="details-grid">
+                    <div class="detail-row">
+                        <div class="detail-cell">Account Email</div>
+                        <div class="detail-cell">{{EMAIL}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">User ID</div>
+                        <div class="detail-cell" style="font-family:monospace;font-size:12px;">{{UID}}</div>
+                    </div>
+                </div>
+                <div class="security-note">
+                    <p><strong>🛡 Security Tip:</strong> Once 2FA Is Enabled, You'll Need To Enter A Code Each Time You Sign In. 
+                    Make Sure You Have Access To This Email Address Going Forward.</p>
+                </div>
+                <div class="warning-note">
+                    <p><strong>⚠ Didn't Request This?</strong> If You Didn't Try To Enable 2FA, Someone May Be Trying To Access Your Account. 
+                    We Recommend Resetting Your Password Immediately.</p>
+                </div>
+            </div>
+            <div class="footer">
+                <p>This Email Was Sent To <a href="mailto:{{EMAIL}}">{{EMAIL}}</a></p>
+                <p>You Cannot Unsubscribe From These Types Of Emails, As They Are Security Emails</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

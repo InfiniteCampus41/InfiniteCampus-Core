@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Premium Activated – Infinite Campus</title>
+    <style>
+        body { margin: 0; padding: 0; background-color: #0a0a0a; font-family: 'Segoe UI', Arial, sans-serif; color: #ffffff; }
+        .wrapper { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+        .card { background: linear-gradient(135deg, #111111 0%, #1a1a1a 100%); border: 1px solid #2a2a2a; border-radius: 16px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%); padding: 40px 36px; text-align: center; position: relative; }
+        .header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #4fa3ff, transparent); }
+        img { display: block; margin: 0 auto 20px; height:30px; border-radius:10px;}
+        .logo { font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #4fa3ff; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+        .header h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
+        .header h1 span { color: #4fa3ff; }
+        .header .subtitle { margin: 10px 0 0; color: #888; font-size: 14px; }
+        .body { padding: 36px; }
+        .greeting { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f0f0f0; }
+        .message { color: #aaa; font-size: 15px; line-height: 1.7; margin-bottom: 28px; }
+        .tier-badge { display: inline-block; background: linear-gradient(135deg, #4fa3ff22, #4fa3ff11); border: 1px solid #4fa3ff55; border-radius: 8px; padding: 16px 24px; margin-bottom: 28px; width: 100%; box-sizing: border-box; }
+        .tier-badge .tier-label { font-size: 11px; font-weight: 700; letter-spacing: 2px; color: #4fa3ff; text-transform: uppercase; margin-bottom: 4px; }
+        .tier-badge .tier-name { font-size: 22px; font-weight: 800; color: #fff; }
+        .details-grid { display: table; width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+        .detail-row { display: table-row; }
+        .detail-cell { display: table-cell; padding: 10px 14px; border-bottom: 1px solid #222; font-size: 14px; }
+        .detail-cell:first-child { color: #666; width: 40%; }
+        .detail-cell:last-child { color: #ddd; font-weight: 500; }
+        .cta-btn { display: block; background: linear-gradient(135deg, #4fa3ff, #2d7dd2); color: #fff; text-decoration: none; text-align: center; padding: 16px 32px; border-radius: 10px; font-size: 15px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 28px; }
+        .divider { border: none; border-top: 1px solid #222; margin: 28px 0; }
+        .footer { padding: 24px 36px; text-align: center; border-top: 1px solid #1a1a1a; }
+        .footer p { color: #444; font-size: 12px; line-height: 1.6; margin: 4px 0; }
+        .footer a { color: #4fa3ff; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <div class="logo"><img src="https://infinitecampus.xyz/res/icon.png">Infinite Campus</div>
+                <h1><span>Welcome To Premium</span></h1>
+                <p class="subtitle">Your Infinite Campus Premium {{TIER}} Perks Are Now Active</p>
+            </div>
+            <div class="body">
+                <div class="greeting">Hey {{DISPLAYNAME}},</div>
+                <p class="message">
+                    Thank You For Your Support! Your <strong style="color:#fff;">Infinite Campus Premium {{TIER}}</strong> Subscription Is Now Active. 
+                    You Now Have Access To All The Perks That Come With Your Tier. We Really Appreciate You Being A Part Of The Infinite Campus Community.
+                </p>
+                <div class="tier-badge">
+                    <div class="tier-label">Your Plan</div>
+                    <div class="tier-name">{{TIER}}</div>
+                </div>
+                <div class="details-grid">
+                    <div class="detail-row">
+                        <div class="detail-cell">Account Email</div>
+                        <div class="detail-cell">{{EMAIL}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">User ID</div>
+                        <div class="detail-cell" style="font-family:monospace;font-size:12px;">{{UID}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">Amount Paid</div>
+                        <div class="detail-cell">{{AMOUNT}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">Expires In</div>
+                        <div class="detail-cell">{{EXPIRE}}</div>
+                    </div>
+                </div>
+                <a href="https://www.infinitecampus.xyz/InfiniteAccounts.html" class="cta-btn">Visit My Account →</a>
+                <p class="message" style="font-size:13px;color:#666;">
+                    If You Have Any Questions Or Concerns About Your Subscription, Feel Free To Reach Out To Us On Our Discord server.
+                </p>
+            </div>
+            <div class="footer">
+                <p>This Email Was Sent To <a href="mailto:{{EMAIL}}">{{EMAIL}}</a></p>
+                <p>You Cannot Unsubscribe From These Types Of Emails, As They Are Security Emails</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

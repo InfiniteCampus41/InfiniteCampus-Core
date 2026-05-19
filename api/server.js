@@ -21,6 +21,7 @@ import { spawn } from "child_process";
 import util from "util";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
+import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
 dotenv.config();
 const app = express();
@@ -141,6 +142,7 @@ const pfpStorage = multer.memoryStorage();
 const pfpUploadCooldown = new Map();
 const pinnedAcceptLines = new Map();
 const PORT = process.env.PORT || 4000;
+const PREMIUM_NOTICE_SENT_KEY = "premiumNoticeSent";
 const QUEUE_DIR = path.join(__dirname, "queue");
 const RATE_LIMIT_ENABLED = true;
 const rateLimitLogs = [];
@@ -151,7 +153,7 @@ const RATE_LIMITS = {
     react:   { max: 20,  window: 10_000 },  // 20 reacts / 10 s
     online:  { max: 20,   window: 30_000 },  // 20  pings  / 30 s  (client calls every 20 s)
     upload:  { max: 10,  window: 60_000 },  // 10 uploads/ 60 s
-    default: { max: 40,  window: 10_000 },  // misc fallback
+    default: { max: 40,  window: 10_000 },
 };
 const _rateLimitStore = new Map();
 const READY_DIR = path.join(__dirname, "ready");
@@ -1170,6 +1172,125 @@ app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
         return res.json({ ok: true });
     } catch (err) {
         return res.json({ ok: false, message: err.message });
+    }
+});
+app.post("/auth/send-email-change", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { newEmail } = req.body;
+        if (!newEmail) return res.status(400).json({ error: "newEmail Required" });
+        const firebaseUser = await admin.auth().getUser(uid);
+        const oldEmail = firebaseUser.email;
+        const profile = readDataPath(`users/${uid}/profile`);
+        const displayName = profile?.displayName || "User";
+        const actionCodeSettings = {
+            url: "https://www.infinitecampus.xyz/InfiniteAccounts.html",
+            handleCodeInApp: false
+        };
+        const link = await admin.auth().generateVerifyAndChangeEmailLink(oldEmail, newEmail, actionCodeSettings);
+        const url = new URL(link);
+        const oobCode = url.searchParams.get("oobCode") || "";
+        const action = url.searchParams.get("mode") || "verifyAndChangeEmail";
+        await sendTemplatedEmail("email_change", oldEmail, "Confirm Your Infinite Campus Email Change", {
+            DISPLAYNAME: displayName,
+            EMAIL: oldEmail,
+            EMAIL1: oldEmail,
+            EMAIL2: newEmail,
+            OOBCODE: oobCode,
+            ACTION: action
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("[Auth Email] send-email-change error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Send Email Change Link" });
+    }
+});
+app.post("/auth/send-email-verify", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const firebaseUser = await admin.auth().getUser(uid);
+        if (firebaseUser.emailVerified) {
+            return res.status(400).json({ error: "Email Already Verified" });
+        }
+        const email = firebaseUser.email;
+        const profile = readDataPath(`users/${uid}/profile`);
+        const displayName = profile?.displayName || "User";
+        const actionCodeSettings = {
+            url: "https://www.infinitecampus.xyz/InfiniteAccounts.html",
+            handleCodeInApp: false
+        };
+        const link = await admin.auth().generateEmailVerificationLink(email, actionCodeSettings);
+        const url = new URL(link);
+        const oobCode = url.searchParams.get("oobCode") || "";
+        const action = url.searchParams.get("mode") || "verifyEmail";
+        await sendTemplatedEmail("email_verify", email, "Verify Your Infinite Campus Email", {
+            DISPLAYNAME: displayName,
+            EMAIL: email,
+            OOBCODE: oobCode,
+            ACTION: action
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("[Auth Email] send-email-verify Error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Send Verification Email" });
+    }
+});
+app.post("/auth/send-password-reset", async (req, res) => {
+    try {
+        const { email } = req.body;
+        if (!email) return res.status(400).json({ error: "Email required" });
+         let displayName = "User";
+        try {
+            const firebaseUser = await admin.auth().getUserByEmail(email);
+            const data = getDataCache();
+            for (const [uid, userData] of Object.entries(data.users || {})) {
+                if (userData?.settings?.userEmail === email || firebaseUser.uid === uid) {
+                    displayName = userData?.profile?.displayName || "User";
+                    break;
+                }
+            }
+        } catch (_) {
+            return;
+        }
+        const actionCodeSettings = {
+            url: "https://www.infinitecampus.xyz/InfiniteAccounts.html",
+            handleCodeInApp: false
+        };
+        const link = await admin.auth().generatePasswordResetLink(email, actionCodeSettings);
+        const url = new URL(link);
+        const oobCode = url.searchParams.get("oobCode") || "";
+        const action = url.searchParams.get("mode") || "resetPassword";
+        await sendTemplatedEmail("password_reset", email, "Reset Your Infinite Campus Password", {
+            DISPLAYNAME: displayName,
+            EMAIL: email,
+            OOBCODE: oobCode,
+            ACTION: action
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("[Auth Email] send-password-reset Error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Send Reset Email" });
+    }
+});
+app.post("/auth/send-two-factor", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { code } = req.body;
+        if (!code) return res.status(400).json({ error: "Code Required" });
+        const firebaseUser = await admin.auth().getUser(uid);
+        const email = firebaseUser.email;
+        const profile = readDataPath(`users/${uid}/profile`);
+        const displayName = profile?.displayName || "User";
+        await sendTemplatedEmail("two_factor", email, "Your Infinite Campus Two-Factor Code", {
+            DISPLAYNAME: displayName,
+            EMAIL: email,
+            UID: uid,
+            SECONDFACTOR: code
+        });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("[Auth Email] send-two-factor Error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Send 2FA Email" });
     }
 });
 app.post("/check_pass", (req, res) => {
@@ -3016,14 +3137,30 @@ async function grantPremium(uid, amount) {
         } else {
             updateDataPath(`users/${uid}/profile`, { isDonater: true });
         }
-        const displayName = readDataPath(`users/${uid}/profile/displayName`) || "Unknown";
+        const profile = readDataPath(`users/${uid}/profile`);
+        const displayName = profile?.displayName || "User";
+        const userEmail = readDataPath(`users/${uid}/settings/userEmail`);
+        const tierLabel = getPremiumTierLabel(profile);
+        const expireMs = profile?.preExpire ? profile.preExpire - Date.now() : null;
+        const expireStr = expireMs ? formatExpire(expireMs) : "3 months";
+        const amountStr = `$${(amount / 100).toFixed(2)}`;
+        if (amount >= 200 && userEmail) {
+            await sendTemplatedEmail("premium_purchased", userEmail, "Your Infinite Campus Premium Is Now Active!", {
+                DISPLAYNAME: displayName,
+                TIER: tierLabel,
+                EXPIRE: expireStr,
+                EMAIL: userEmail,
+                UID: uid,
+                AMOUNT: amountStr
+            }).catch(err => console.error("[Email] premium_purchased failed:", err.message));
+        }
         if (amount >= 1000) {
             await sendDiscordEmbedPre({
                 title: "Premium T3 Purchased",
                 color: 0xFF0000,
                 fields: [
                     { name: "Name", value: displayName, inline: false },
-                    { name: "Amount", value: `$${(amount / 100).toFixed(2)}`, inline: true },
+                    { name: "Amount", value: amountStr, inline: true },
                     { name: "Duration", value: "3 Months", inline: true }
                 ],
                 timestamp: new Date().toISOString()
@@ -3035,7 +3172,7 @@ async function grantPremium(uid, amount) {
                 color: 0xFFA500,
                 fields: [
                     { name: "Name", value: displayName, inline: false },
-                    { name: "Amount", value: `$${(amount / 100).toFixed(2)}`, inline: true },
+                    { name: "Amount", value: amountStr, inline: true },
                     { name: "Duration", value: "3 Months", inline: true }
                 ],
                 timestamp: new Date().toISOString()
@@ -3047,7 +3184,7 @@ async function grantPremium(uid, amount) {
                 color: 0xFFFF00,
                 fields: [
                     { name: "Name", value: displayName, inline: false },
-                    { name: "Amount", value: `$${(amount / 100).toFixed(2)}`, inline: true },
+                    { name: "Amount", value: amountStr, inline: true },
                     { name: "Duration", value: "3 Months", inline: true }
                 ],
                 timestamp: new Date().toISOString()
@@ -3059,7 +3196,7 @@ async function grantPremium(uid, amount) {
                 color: 0x00E5FF,
                 fields: [
                     { name: "Name", value: displayName, inline: false },
-                    { name: "Amount", value: `$${(amount / 100).toFixed(2)}`, inline: true }
+                    { name: "Amount", value: amountStr, inline: true }
                 ],
                 timestamp: new Date().toISOString()
             });
@@ -3249,33 +3386,6 @@ async function sendDMNotification(targetUid, senderUid, text) {
         console.error("DM Notification Error:", e.message || e);
     }
 }
-async function sendReplyNotification(targetUid, senderUid, senderDisplayName, channel, msgId, text) {
-    try {
-        if (targetUid && targetUid === senderUid) return;
-        const tokens = await _getPushTokensForUser(targetUid);
-        if (!tokens.length) return;
-        const data = getDataCache();
-        const settings = data?.notifications?.[targetUid]?.settings || {};
-        if (settings.replies === false) return;
-        const preview = (text || "").substring(0, 80);
-        const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
-        const title = senderDisplayName
-            ? `${senderDisplayName} Replied To You`
-            : "Someone Replied To You";
-        await admin.messaging().sendEachForMulticast({
-            tokens,
-            notification: { title, body: preview },
-            data: { type: "reply", url, channel: channel || "", msgId: String(msgId) },
-            webpush: { fcmOptions: { link: url } }
-        });
-        logEvent("notifications", {
-            id: `reply_${Date.now()}`,
-            data: { type: "reply", to: targetUid, from: senderUid || senderDisplayName, channel: channel || "", msgId: String(msgId) }
-        });
-    } catch (e) {
-        console.error("Reply Notification Error:", e.message || e);
-    }
-}
 async function sendMentionNotification(targetUid, senderUid, channel, msgId, text) {
     try {
         const tokens = await _getPushTokensForUser(targetUid);
@@ -3331,6 +3441,55 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
         });
     } catch (e) {
         console.error("Reaction Notification Error:", e.message || e);
+    }
+}
+async function sendReplyNotification(targetUid, senderUid, senderDisplayName, channel, msgId, text) {
+    try {
+        if (targetUid && targetUid === senderUid) return;
+        const tokens = await _getPushTokensForUser(targetUid);
+        if (!tokens.length) return;
+        const data = getDataCache();
+        const settings = data?.notifications?.[targetUid]?.settings || {};
+        if (settings.replies === false) return;
+        const preview = (text || "").substring(0, 80);
+        const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
+        const title = senderDisplayName
+            ? `${senderDisplayName} Replied To You`
+            : "Someone Replied To You";
+        await admin.messaging().sendEachForMulticast({
+            tokens,
+            notification: { title, body: preview },
+            data: { type: "reply", url, channel: channel || "", msgId: String(msgId) },
+            webpush: { fcmOptions: { link: url } }
+        });
+        logEvent("notifications", {
+            id: `reply_${Date.now()}`,
+            data: { type: "reply", to: targetUid, from: senderUid || senderDisplayName, channel: channel || "", msgId: String(msgId) }
+        });
+    } catch (e) {
+        console.error("Reply Notification Error:", e.message || e);
+    }
+}
+/**
+ * @param {string} templateName
+ * @param {string} toEmail
+ * @param {string} subject
+ * @param {Object} vars
+ */
+async function sendTemplatedEmail(templateName, toEmail, subject, vars = {}) {
+    try {
+        const html = renderTemplate(templateName, vars);
+        const result = await resend.emails.send({
+            from: "support@infinitecampus.xyz",
+            to: toEmail,
+            subject,
+            html
+        });
+        console.log(`[Email] Sent "${templateName}" To ${toEmail} — ID: ${result.data?.id}`);
+        return result;
+    } catch (err) {
+        console.error(`[Email] Failed To Send "${templateName}" To ${toEmail}:`, err.message);
+        throw err;
     }
 }
 async function sendVerificationNotification(uid, displayName) {
@@ -4930,18 +5089,57 @@ setInterval(() => {
 setInterval(async () => {
     try {
         const now = Date.now();
+        const ONE_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
         const _expData = getDataCache();
         if (!_expData.users) return;
         let _expiredCount = 0;
         for (const [_expUid, _expUserData] of Object.entries(_expData.users)) {
             const profile = _expUserData?.profile;
             if (!profile) continue;
-            if ((profile.premium1 || profile.premium2 || profile.premium3) && profile.preExpire && now >= profile.preExpire) {
+            const hasPremium = profile.premium1 || profile.premium2 || profile.premium3;
+            if (!hasPremium || !profile.preExpire) continue;
+            const timeLeft = profile.preExpire - now;
+            const userEmail = _expUserData?.settings?.userEmail;
+            const displayName = profile.displayName || "User";
+            const tierLabel = getPremiumTierLabel(profile);
+            if (timeLeft > 0 && timeLeft <= ONE_WEEK_MS && !profile.premiumNoticeSent && userEmail) {
+                try {
+                    await sendTemplatedEmail(
+                        "premium_notice",
+                        userEmail,
+                        "Your Infinite Campus Premium Expires Soon",
+                        {
+                            DISPLAYNAME: displayName,
+                            TIER: tierLabel,
+                            EXPIRE: formatExpire(timeLeft),
+                            EMAIL: userEmail,
+                            UID: _expUid
+                        }
+                    );
+                    updateDataPath(`users/${_expUid}/profile`, {
+                        [PREMIUM_NOTICE_SENT_KEY]: true
+                    });
+                } catch (e) {
+                    console.error("[Email] premium_notice Failed For", _expUid, e.message);
+                }
+            }
+            if (timeLeft <= 0) {
+                const hadEmail = userEmail;
+                const hadTier = tierLabel;
                 delete profile.premium1;
                 delete profile.premium2;
                 delete profile.premium3;
                 delete profile.preExpire;
+                delete profile.premiumNoticeSent;
                 _expiredCount++;
+                if (hadEmail) {
+                    sendTemplatedEmail("premium_expired", hadEmail, "Your Infinite Campus Premium Has Expired", {
+                        DISPLAYNAME: displayName,
+                        TIER: hadTier,
+                        EMAIL: hadEmail,
+                        UID: _expUid
+                    }).catch(e => console.error("[Email] premium_expired Failed For", _expUid, e.message));
+                }
             }
         }
         if (_expiredCount > 0) {

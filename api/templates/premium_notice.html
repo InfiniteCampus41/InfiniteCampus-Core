@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Your Premium Expires Soon – Infinite Campus</title>
+    <style>
+        body { margin: 0; padding: 0; background-color: #0a0a0a; font-family: 'Segoe UI', Arial, sans-serif; color: #ffffff; }
+        .wrapper { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+        .card { background: linear-gradient(135deg, #111111 0%, #1a1a1a 100%); border: 1px solid #2a2a2a; border-radius: 16px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #1f1400 0%, #2e1e00 50%, #3d2900 100%); padding: 40px 36px; text-align: center; position: relative; }
+        .header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #ffaa00, transparent); }
+        img { display: block; margin: 0 auto 20px; height:30px; border-radius:10px;}
+        .logo { font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #ffaa00; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+        .header h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
+        .header h1 span { color: #ffaa00; }
+        .header .subtitle { margin: 10px 0 0; color: #888; font-size: 14px; }
+        .body { padding: 36px; }
+        .greeting { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f0f0f0; }
+        .message { color: #aaa; font-size: 15px; line-height: 1.7; margin-bottom: 28px; }
+        .warning-box { background: linear-gradient(135deg, #2a1e0022, #ffaa0011); border: 1px solid #ffaa0044; border-radius: 10px; padding: 20px 24px; margin-bottom: 28px; }
+        .warning-box .warn-title { font-size: 13px; font-weight: 700; letter-spacing: 1.5px; color: #ffaa00; text-transform: uppercase; margin-bottom: 6px; }
+        .warning-box .warn-time { font-size: 32px; font-weight: 800; color: #fff; }
+        .warning-box .warn-sub { font-size: 13px; color: #888; margin-top: 4px; }
+        .details-grid { display: table; width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+        .detail-row { display: table-row; }
+        .detail-cell { display: table-cell; padding: 10px 14px; border-bottom: 1px solid #222; font-size: 14px; }
+        .detail-cell:first-child { color: #666; width: 40%; }
+        .detail-cell:last-child { color: #ddd; font-weight: 500; }
+        .cta-btn { display: block; background: linear-gradient(135deg, #ffaa00, #cc8800); color: #000; text-decoration: none; text-align: center; padding: 16px 32px; border-radius: 10px; font-size: 15px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 28px; }
+        .footer { padding: 24px 36px; text-align: center; border-top: 1px solid #1a1a1a; }
+        .footer p { color: #444; font-size: 12px; line-height: 1.6; margin: 4px 0; }
+        .footer a { color: #ffaa00; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <div class="logo"><img src="https://infinitecampus.xyz/res/icon.png">Infinite Campus</div>
+                <h1><span>Premium Expiring Soon</span></h1>
+                <p class="subtitle">Your Subscription Is Ending Soon</p>
+            </div>
+            <div class="body">
+                <div class="greeting">Hey {{DISPLAYNAME}},</div>
+                <p class="message">
+                    Just A Heads Up — Your <strong style="color:#fff;">Infinite Campus Premium {{TIER}}</strong> Subscription Will Be Expiring Soon. 
+                    Once It Expires, You'll Lose Access To Your Premium {{TIER}} Perks. Renew Now To Keep Things Going Without Any Interruption!
+                </p>
+                <div class="warning-box">
+                    <div class="warn-title">Time Remaining</div>
+                    <div class="warn-time">{{EXPIRE}}</div>
+                    <div class="warn-sub">Until Your Premium {{TIER}} Expires</div>
+                </div>
+                <div class="details-grid">
+                    <div class="detail-row">
+                        <div class="detail-cell">Account Email</div>
+                        <div class="detail-cell">{{EMAIL}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">User ID</div>
+                        <div class="detail-cell" style="font-family:monospace;font-size:12px;">{{UID}}</div>
+                    </div>
+                    <div class="detail-row">
+                        <div class="detail-cell">Current Plan</div>
+                        <div class="detail-cell">{{TIER}}</div>
+                    </div>
+                </div>
+                <a href="https://www.infinitecampus.xyz/InfiniteAccounts.html?donate=true" class="cta-btn">Renew Premium →</a>
+                <p class="message" style="font-size:13px;color:#666;">
+                    If You Choose Not To Renew, You Will Lose All Premium Featureds Once Your Subscription Ends.
+                    Thank You For Your Continued Support!
+                </p>
+            </div>
+            <div class="footer">
+                <p>This Email Was Sent To <a href="mailto:{{EMAIL}}">{{EMAIL}}</a></p>
+                <p>You Cannot Unsubscribe From These Types Of Emails, As They Are Security Emails</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
