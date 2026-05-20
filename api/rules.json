@@ -1,0 +1,312 @@
+{
+  "rules": {
+    ".read": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true || root.child('users').child(auth.uid).child('profile').child('isTester').val() === true )",
+    ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true || root.child('users').child(auth.uid).child('profile').child('isTester').val() === true )",
+    "articles": {
+      ".read": true,
+      "$slug": {
+        ".read": true,
+        "views": {
+          ".read": true,
+          ".write": true,
+          ".validate": "(  auth != null && (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isDev').val() === true  )) ||(  newData.isNumber() &&  data.isNumber() &&  newData.val() === data.val() + 1)"
+        }
+      },
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)"
+    },
+    "channels": {
+      ".read": "true",
+      "$channel": {
+        ".read": "true",
+        ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true)"
+      }
+    },
+    "notes": {
+      ".read": true,
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)"
+    },
+    "messages": {
+      "$channel": {
+        ".read": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||(  root.child('channels').child($channel).child('read').child('verified').val() === true &&  root.child('users').child(auth.uid).child('profile').child('verified').val() === true) ||(  root.child('channels').child($channel).child('read').child('isHAdmin').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true) ||(root.child('channels').child($channel).child('read').child('isAdmin').val() === true &&root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true) ||(  root.child('channels').child($channel).child('read').child('isDev').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isDev').val() === true) ||(root.child('channels').child($channel).child('read').child('isPartner').val() === true &&root.child('users').child(auth.uid).child('profile').child('isPartner').val() === true) ||(root.child('channels').child($channel).child('read').child('premium3').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium3').val() === true) ||(root.child('channels').child($channel).child('read').child('premium2').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium2').val() === true) ||(root.child('channels').child($channel).child('read').child('premium1').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium1').val() === true) ||(root.child('channels').child($channel).child('read').child('isDonater').val() === true &&root.child('users').child(auth.uid).child('profile').child('isDonater').val() === true) ||(root.child('channels').child($channel).child('read').child('isSus').val() === true &&root.child('users').child(auth.uid).child('profile').child('isSus').val() === true) ||(root.child('channels').child($channel).child('read').child('mileStone').val() === true &&root.child('users').child(auth.uid).child('profile').child('mileStone').val() === true) ||(root.child('channels').child($channel).child('read').child('isGuesser').val() === true &&root.child('users').child(auth.uid).child('profile').child('isGuesser').val() === true) ||(root.child('channels').child($channel).child('read').child('isUploader').val() === true &&root.child('users').child(auth.uid).child('profile').child('isUploader').val() === true) ||(root.child('channels').child($channel).child('read').child('isLink').val() === true &&root.child('users').child(auth.uid).child('profile').child('isLink').val() === true) ||(root.child('channels').child($channel).child('read').child('secure').val() === true &&root.child('users').child(auth.uid).child('profile').child('secure').val() === true) ||(root.child('channels').child($channel).child('read').child('guardian').val() === true &&root.child('users').child(auth.uid).child('profile').child('guardian').val() === true) ||(root.child('channels').child($channel).child('read').child('lanschool').val() === true &&root.child('users').child(auth.uid).child('profile').child('lanschool').val() === true) ||(root.child('channels').child($channel).child('read').child('linewize').val() === true &&root.child('users').child(auth.uid).child('profile').child('linewize').val() === true) ||(root.child('channels').child($channel).child('read').child('blocksi').val() === true &&root.child('users').child(auth.uid).child('profile').child('blocksi').val() === true)) ||root.child('channels').child($channel).child('guestRead').val() === true",
+        ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||(root.child('channels').child($channel).child('write').child('verified').val() === true &&root.child('users').child(auth.uid).child('profile').child('verified').val() === true) ||(root.child('channels').child($channel).child('write').child('isHAdmin').val() === true &&root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true) ||(root.child('channels').child($channel).child('write').child('isAdmin').val() === true &&root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true) ||(root.child('channels').child($channel).child('write').child('isDev').val() === true &&root.child('users').child(auth.uid).child('profile').child('isDev').val() === true) ||(root.child('channels').child($channel).child('write').child('isPartner').val() === true &&root.child('users').child(auth.uid).child('profile').child('isPartner').val() === true) ||(root.child('channels').child($channel).child('write').child('premium3').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium3').val() === true) ||(root.child('channels').child($channel).child('write').child('premium2').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium2').val() === true) ||(root.child('channels').child($channel).child('write').child('premium1').val() === true &&root.child('users').child(auth.uid).child('profile').child('premium1').val() === true) ||(root.child('channels').child($channel).child('write').child('isDonater').val() === true &&root.child('users').child(auth.uid).child('profile').child('isDonater').val() === true) ||(root.child('channels').child($channel).child('write').child('isSus').val() === true &&root.child('users').child(auth.uid).child('profile').child('isSus').val() === true) ||(root.child('channels').child($channel).child('write').child('mileStone').val() === true &&root.child('users').child(auth.uid).child('profile').child('mileStone').val() === true) ||(root.child('channels').child($channel).child('write').child('isGuesser').val() === true &&root.child('users').child(auth.uid).child('profile').child('isGuesser').val() === true) ||(root.child('channels').child($channel).child('write').child('isUploader').val() === true &&root.child('users').child(auth.uid).child('profile').child('isUploader').val() === true) ||(root.child('channels').child($channel).child('read').child('isLink').val() === true &&root.child('users').child(auth.uid).child('profile').child('isLink').val() === true) ||(root.child('channels').child($channel).child('read').child('secure').val() === true &&root.child('users').child(auth.uid).child('profile').child('secure').val() === true) ||(root.child('channels').child($channel).child('read').child('guardian').val() === true &&root.child('users').child(auth.uid).child('profile').child('guardian').val() === true) ||(root.child('channels').child($channel).child('read').child('lanschool').val() === true &&root.child('users').child(auth.uid).child('profile').child('lanschool').val() === true) ||(root.child('channels').child($channel).child('read').child('linewize').val() === true &&root.child('users').child(auth.uid).child('profile').child('linewize').val() === true) ||(root.child('channels').child($channel).child('read').child('blocksi').val() === true &&root.child('users').child(auth.uid).child('profile').child('blocksi').val() === true)) ||root.child('channels').child($channel).child('guestWrite').val() === true",
+        ".indexOn": [
+          "timestamp",
+          "uid"
+        ],
+        "$msg": {
+          ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||  (  root.child('channels').child($channel).child('write').child('verified').val() === true &&  root.child('users').child(auth.uid).child('profile').child('verified').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isHAdmin').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isAdmin').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isDev').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isDev').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isPartner').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isPartner').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('premium3').val() === true &&  root.child('users').child(auth.uid).child('profile').child('premium3').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('premium2').val() === true &&  root.child('users').child(auth.uid).child('profile').child('premium2').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('premium1').val() === true &&  root.child('users').child(auth.uid).child('profile').child('premium1').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isDonater').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isDonater').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isSus').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isSus').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('mileStone').val() === true &&  root.child('users').child(auth.uid).child('profile').child('mileStone').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isGuesser').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isGuesser').val() === true  ) ||  (  root.child('channels').child($channel).child('write').child('isUploader').val() === true &&  root.child('users').child(auth.uid).child('profile').child('isUploader').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('isLink').val() === true &&    root.child('users').child(auth.uid).child('profile').child('isLink').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('secure').val() === true &&    root.child('users').child(auth.uid).child('profile').child('secure').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('guardian').val() === true &&    root.child('users').child(auth.uid).child('profile').child('guardian').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('lanschool').val() === true &&    root.child('users').child(auth.uid).child('profile').child('lanschool').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('linewize').val() === true &&    root.child('users').child(auth.uid).child('profile').child('linewize').val() === true  ) ||  (    root.child('channels').child($channel).child('read').child('blocksi').val() === true &&    root.child('users').child(auth.uid).child('profile').child('blocksi').val() === true  )) &&(  !root.child('mutedUsers').child(auth.uid).exists()) ||(  (    root.child('mutedUsers').child(auth.uid).child('expires').val() != 'Never'  ) &&(    root.child('mutedUsers').child(auth.uid).child('expires').val() <= now  )) &&(  !data.exists() || (    data.child('sender').val() === auth.uid ||(      data.child('sender').val() === auth.uid || root.child('users').child(data.child('sender').val()).child('profile').child('isOwner').val() === true &&(        root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true      )    ) ||(      root.child('users').child(data.child('sender').val()).child('profile').child('isTester').val() === true &&(        data.child('sender').val() === auth.uid ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true      )    ) ||(      root.child('users').child(data.child('sender').val()).child('profile').child('isCoOwner').val() === true &&(        data.child('sender').val() === auth.uid || root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true      )    ) ||(      root.child('users').child(data.child('sender').val()).child('profile').child('isHAdmin').val() === true &&(        data.child('sender').val() === auth.uid ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true      )    ) ||(      root.child('users').child(data.child('sender').val()).child('profile').child('isAdmin').val() === true &&(        data.child('sender').val() === auth.uid ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true      )    )))",
+          "text": {
+            ".validate": "newData.isString() && (newData.val().length <= 1000 ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true)"
+          },
+          "reply": {
+            ".read": true
+          }
+        },
+        "$timestamp": {
+          ".write": "(newData.val() === null && auth != null && (  data.child(\"s\").val() === auth.uid ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isOwner\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isTester\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isCoOwner\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isHAdmin\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isAdmin\").val() === true)) ||(!data.exists() && !newData.val() === null) ||(data.exists() && newData.val() !== null && auth != null && (  data.child(\"s\").val() === auth.uid ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isOwner\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isTester\").val() === true ||  root.child(\"users\").child(auth.uid).child(\"profile\").child(\"isCoOwner\").val() === true))",
+          ".validate": "newData.val() === null ||(newData.child(\"anon\").val() === true && !newData.hasChild(\"s\")) ||(newData.hasChild(\"s\") && newData.child(\"anon\").val() !== true)"
+        }
+      }
+    },
+    "donations": {
+      ".read": true,
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)"
+    },
+    "notifications": {
+      ".read": true,
+      ".write": true,
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+        ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+        "tokens": {
+          ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+          ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))"
+        },
+        "settings": {
+          ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+          ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))"
+        }
+      }
+    },
+    "pushTokens": {
+      ".read": true,
+      ".write": true,
+      "$uid": {
+        ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+        ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+        "tokens": {
+          ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+          ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))"
+        },
+        "settings": {
+          ".read": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))",
+          ".write": "auth != null && (auth.uid === $uid || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||                root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true))"
+        }
+      }
+    },
+    "metadata": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('verified').val() === true ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true)",
+        "privateChats": {
+          "$otherUid": {
+            ".read": "auth != null && (auth.uid === $uid ||     auth.uid === $otherUid)",
+            ".write": "  auth != null &&  root.child('users').child(auth.uid).child('profile').child('verified').val() === true &&  (    auth.uid === $uid ||     auth.uid === $otherUid  )"
+          }
+        },
+        "mentions": {
+          "$messageId": {
+            ".read": "auth != null &&   auth.uid === $uid",
+            ".write": "  auth != null &&  root.child('users').child(auth.uid).child('profile').child('verified').val() === true &&  auth.uid === $uid"
+          }
+        }
+      }
+    },
+    "mutedUsers": {
+      ".read": "auth != null",
+      "$targetUid": {
+        ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||(root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true &&root.child('users').child($targetUid).child('profile').child('isOwner').val() !== true &&root.child('users').child($targetUid).child('profile').child('isTester').val() !== true &&root.child('users').child($targetUid).child('profile').child('isCoOwner').val() !== true) ||(root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true &&root.child('users').child($targetUid).child('profile').child('isOwner').val() !== true &&root.child('users').child($targetUid).child('profile').child('isTester').val() !== true &&root.child('users').child($targetUid).child('profile').child('isCoOwner').val() !== true &&root.child('users').child($targetUid).child('profile').child('isHAdmin').val() !== true) ||(root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true &&root.child('users').child($targetUid).child('profile').child('isOwner').val() !== true &&root.child('users').child($targetUid).child('profile').child('isTester').val() !== true &&root.child('users').child($targetUid).child('profile').child('isCoOwner').val() !== true &&root.child('users').child($targetUid).child('profile').child('isHAdmin').val() !== true &&root.child('users').child($targetUid).child('profile').child('isAdmin').val() !== true))"
+      }
+    },
+    "partners": {
+      ".read": true,
+      "$uid": {
+        "$partnerName": {
+          ".read": true,
+          ".write": "auth != null && ((auth.uid === $uid &&root.child('users').child(auth.uid).child('isPartner').val() === true) ||root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true)"
+        }
+      }
+    },
+    "private": {
+      "$uid1": {
+        "$uid2": {
+          ".indexOn": [
+            "timestamp",
+            "uid"
+          ],
+          ".read": "auth != null && (root.child('users').child(auth.uid).child('profile').child('verified').val() === true) && (  auth.uid === $uid1 ||   auth.uid === $uid2)",
+          "$msg": {
+            ".read": "  auth != null &&  (    auth.uid === $uid1 ||     auth.uid === $uid2 ||   root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||   root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )",
+            ".write": "auth != null &&  root.child('users').child(auth.uid).child('profile').child('verified').val() === true &&  (  !root.child('mutedUsers').child(auth.uid).exists()  ) ||  (    (      root.child('mutedUsers').child(auth.uid).child('expires').val() != 'Never'    ) &&    (    root.child('mutedUsers').child(auth.uid).child('expires').val() <= now    )  ) &&  (    auth.uid === $uid1 ||     auth.uid === $uid2 ||  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )",
+            "text": {
+              ".validate": "    newData.isString() && (      newData.val().length <= 1000 ||      root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||      root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||      root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true    )  "
+            }
+          }
+        }
+      }
+    },
+    "poll": {
+      "$iconNum": {
+        "$voteId": {
+          ".read": true,
+          ".write": "auth != null"
+        }
+      }
+    },
+    "reset": {
+      ".read": true,
+      ".write": true
+    },
+    "site": {
+      ".read": true,
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)"
+    },
+    "typing": {
+      ".read": "auth != null",
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true)",
+      "$channel": {
+        "$typingUser": {
+          ".read": "auth != null &&root.child('users').child(auth.uid).child('profile').child('verified').val() === true",
+          ".write": "auth != null && (auth.uid === $typingUser) &&(  root.child('users').child(auth.uid).child('profile').child('verified').val() === true) || auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true)"
+        }
+      }
+    },
+    "updates": {
+      ".read": true,
+      ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true ||root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)"
+    },
+    "users": {
+      ".read": true,
+      "$uid": {
+        ".read": true,
+        ".write": "auth != null && (auth.uid === $uid) || (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true || root.child('users').child(auth.uid).child('profile').child('isTester').val() === true)",
+        "profile": {
+          ".read": true,
+          ".write": "auth != null && ((    auth.uid === $uid && !(     newData.child('isOwner').exists() ||     newData.child('isTester').exists() ||     newData.child('isCoOwner').exists() ||     newData.child('isHAdmin').exists() ||     newData.child('isAdmin').exists() ||     newData.child('isDev').exists() ||     newData.child('verified').exists()   )  ) ||   (    (      root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||     root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||     root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true    )  ))",
+          "bio": {
+            ".read": true,
+            ".write": "  auth != null && (    auth.uid === $uid ||  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  newData.val().length <= 50"
+          },
+          "online": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "uploads": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "votes": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||     root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "pic": {
+            ".read": true,
+            ".write": "auth != null && (    auth.uid === $uid ||     root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||     root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "displayName": {
+            ".read": true,
+            ".write": "auth != null && (auth.uid === $uid || root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true || root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ) && ( newData.isString() && newData.val().length <= 20 && /^[^\\s]+$/.test(newData.val()))"
+          },
+          "dUsername": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true)"
+          },
+          "isOwner": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isTester": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isCoOwner": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isHAdmin": {
+            ".read": true,
+            ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isAdmin": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isDev": {
+            ".read": true,
+            ".write": "auth != null && (root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isPartner": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "premium3": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "premium2": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "premium1": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isDonater": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isSus": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "mileStone": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isGuesser": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isUploader": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "preExpire": {
+            ".read": "auth != null",
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "isLink": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "secure": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  (  root.child('users').child(auth.uid).child('profile').child('guardian').val() != true &&  root.child('users').child(auth.uid).child('profile').child('lanschool').val() != true &&  root.child('users').child(auth.uid).child('profile').child('linewize').val() != true &&  root.child('users').child(auth.uid).child('profile').child('blocksi').val() != true  ) ||  (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "guardian": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  (  root.child('users').child(auth.uid).child('profile').child('secure').val() != true &&  root.child('users').child(auth.uid).child('profile').child('lanschool').val() != true &&  root.child('users').child(auth.uid).child('profile').child('linewize').val() != true &&  root.child('users').child(auth.uid).child('profile').child('blocksi').val() != true  ) ||  (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "lanschool": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  (  root.child('users').child(auth.uid).child('profile').child('secure').val() != true &&  root.child('users').child(auth.uid).child('profile').child('guardian').val() != true &&  root.child('users').child(auth.uid).child('profile').child('linewize').val() != true &&  root.child('users').child(auth.uid).child('profile').child('blocksi').val() != true  ) ||  (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "linewize": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  (  root.child('users').child(auth.uid).child('profile').child('secure').val() != true &&  root.child('users').child(auth.uid).child('profile').child('guardian').val() != true &&  root.child('users').child(auth.uid).child('profile').child('lanschool').val() != true &&  root.child('users').child(auth.uid).child('profile').child('blocksi').val() != true  ) ||  (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "blocksi": {
+            ".read": true,
+            ".write": "auth != null && (  auth.uid === $uid ||    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  ) &&  (  root.child('users').child(auth.uid).child('profile').child('secure').val() != true &&  root.child('users').child(auth.uid).child('profile').child('guardian').val() != true &&  root.child('users').child(auth.uid).child('profile').child('lanschool').val() != true &&  root.child('users').child(auth.uid).child('profile').child('linewize').val() != true  ) ||  (    root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          },
+          "verified": {
+            ".read": true,
+            ".write": "auth != null && (  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||   root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||   root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true  )"
+          }
+        },
+        "settings": {
+          ".read": true,
+          ".write": "auth != null && auth.uid === $uid",
+          "userEmail": {
+            ".read": "auth != null && (    auth.uid === $uid ||   root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isCoOwner').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isHAdmin').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isAdmin').val() === true ||    root.child('users').child(auth.uid).child('profile').child('isDev').val() === true)",
+            ".write": "auth != null && (    auth.uid === $uid ||  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true)"
+          },
+          "color": {
+            ".read": true,
+            ".write": "auth != null && (auth.uid === $uid ||  root.child('users').child(auth.uid).child('profile').child('isOwner').val() === true ||  root.child('users').child(auth.uid).child('profile').child('isTester').val() === true  )"
+          }
+        }
+      }
+    }
+  }
+}

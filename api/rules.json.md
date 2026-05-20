@@ -1,1 +1,0 @@
-This File Contains The Database Rules. It Is A Seperate File To Avoid Restarts Every Time I Change The Rules.

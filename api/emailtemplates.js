@@ -40,8 +40,8 @@ export function formatExpire(ms) {
  * @returns {string}
  */
 export function getPremiumTierLabel(profile) {
-    if (profile?.premium3) return "Infinite Campus Premium T3";
-    if (profile?.premium2) return "Infinite Campus Premium T2";
-    if (profile?.premium1) return "Infinite Campus Premium T1";
+    if (profile?.premium3) return "T3";
+    if (profile?.premium2) return "T2";
+    if (profile?.premium1) return "T1";
     return "Premium";
 }

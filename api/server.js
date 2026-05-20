@@ -23,6 +23,8 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
+import { WebSocketManager, WebSocketShardEvents, WorkerShardingStrategy } from "@discordjs/ws";
+import { REST } from "@discordjs/rest";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -40,6 +42,8 @@ const ALLOWED_EXTS = new Set([".mp4", ".mov", ".mkv", ".ts", ".webm", ".avi", ".
 const ALLOWED_PFP_EXTS = new Set([".png", ".jpeg", ".jpg", ".webp", ".ico"]);
 let alreadyArchived = false;
 let alreadyCleared = false;
+const anonSessions = new Map();
+const ANON_SESSION_TTL = 24 * 60 * 60 * 1000;
 const applicantMessages = new Map();
 const APPLY_DIR = path.join(__dirname, "apply");
 const APPLY_JSON = path.join(__dirname, "apply.json");
@@ -72,8 +76,6 @@ let DISCORD_CHANNEL_MAP = (() => {
 })();
 let DISCORD_DISABLED = false;
 let discordGatewayActive = null;
-let discordGatewayWs = null;
-let discordMessageListenerAttached = false;
 const discordMsgIdToTimestamp = {};
 const discordQueue = [];
 const DISCORD_QUEUE_DIR = path.join(__dirname, "discord_queue");
@@ -93,20 +95,7 @@ const donationSessions = new Map();
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
 const FOLDER_LIMIT_MB = 1024;
-let gatewayCanResume = false;
-let gatewayHeartbeatInterval = null;
-let gatewayReconnectTimer = null;
-let gatewayResumeUrl = null;
-let gatewaySessionId = null;
-let gatewaySeq = null;
 const httpServer = createServer(app);
-const ioLive = new IOServer(httpServer, {
-    path: "/socket_io_live_" + UNIQUE_SUFFIX,
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
-});
 const ioRealtime = new IOServer(httpServer, {
     path: "/socket_io_realtime_" + UNIQUE_SUFFIX,
     cors: {
@@ -115,8 +104,7 @@ const ioRealtime = new IOServer(httpServer, {
     }
 });
 let lastCreateTime = 0;
-let liveInterval = null;
-let liveMode = false;
+let _listFilesInterval = null;
 let LOCKDOWN = false;
 const logid = "1460410323369721868";
 const MAX_APPLY_BYTES = 30 * 1024 * 1024 * 1024;
@@ -284,7 +272,7 @@ app.use((req, res, next) => {
         "Access-Control-Allow-Methods", 
         "GET, POST, PUT, DELETE, OPTIONS, PATCH"
     );
-    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, uploadedby, ngrok-skip-browser-warning, x-admin-password, fileId, chunkIndex, totalChunks, filename, x-user-id, X-File-Id, X-Chunk-Number, X-Total-Chunks, X-Filename, X-User-Id");
+    res.header("Access-Control-Allow-Headers", "Content-Type, Authorization, uploadedby, ngrok-skip-browser-warning, x-admin-password, fileId, chunkIndex, totalChunks, filename, x-user-id, X-File-Id, X-Chunk-Number, X-Total-Chunks, X-Filename, X-User-Id, X-Anon-Session");
     if (req.method === "OPTIONS") return res.sendStatus(200);
     next();
 });
@@ -313,7 +301,8 @@ app.use(cors({
         "X-Chunk-Number", 
         "X-Total-Chunks", 
         "X-Filename",
-        "X-User-Id"
+        "X-User-Id",
+        "X-Anon-Session"
     ]
 }));
 app.use(express.json({ limit: "10mb" }));
@@ -493,54 +482,16 @@ app.get("/admin/logs", (req, res) => {
         activeLinks: activeLinks.slice(-100),
     });
 });
-app.get("/api/messages", blockDiscordIfDisabled, async (req, res) => {
-    let channelId = req.query.channelId || DEFAULT_CHANNEL_ID;
-    const ALLOWED_CHANNELS = new Set([
-        '1464689808717774970',
-        '1456025656558092372',
-        '1334376148087603294',
-        '1334376903179767860',
-        '1334377094876237918',
-        '1334377158789042226',
-        '1334377258609147967',
-        '1018614763250520127',
-        '1389334335114580229',
-        '1389630067457527879',
-        '1389703415810101308',
-        '1392882466351616153',
-        '1309160050904006696',
-        '1309164699417448550',
-        '1007051892821594183',
-        '1086362556203028540',
-        '1390991482650886215',
-        '1391898825588740108',
-        '1401659961880088668'
-    ]);
-    if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, channelId)) return;
-    const allMessages = [];
-    let lastId = null;
-    let fetchMore = true;
-    try {
-        while (fetchMore) {
-            const params = lastId ? { limit: 100, before: lastId } : { limit: 100 };
-            const response = await discordRequest({
-                method: "get",
-                url: `https://discord.com/api/v10/channels/${channelId}/messages`,
-                params,
-            });
-            const messages = response.data;
-            allMessages.push(...messages);
-            if (messages.length < 100) fetchMore = false;
-            else {
-                lastId = messages[messages.length - 1].id;
-                await new Promise((resolve) => setTimeout(resolve, 250));
-            }
-        }
-        res.json(allMessages);
-    } catch (err) {
-        console.error("Message Fetch Error:", err.response?.data || err.message);
-        res.status(500).json({ error: "Failed To Fetch Messages" });
-    }
+app.get("/api/guest-channel-info", async (req, res) => {
+    const channel = req.query.channel;
+    if (!channel) return res.status(400).json({ error: "Missing channel" });
+    const data = getDataCache();
+    const chData = data?.channels?.[channel];
+    if (!chData) return res.json({ guestRead: false, guestWrite: false });
+    res.json({
+        guestRead: !!(chData.guestRead),
+        guestWrite: !!(chData.guestWrite),
+    });
 });
 app.get("/api/movies-json", (req, res) => {
     const pass = req.headers["x-admin-password"];
@@ -1159,6 +1110,21 @@ app.post("/admin/lockdown", (req, res) => {
     console.log(`LOCKDOWN Is Now ${LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
     res.json({ lockdown: LOCKDOWN });
 });
+app.post("/api/anon-name", (req, res) => {
+    let { name, sessionToken } = req.body;
+    if (!name || typeof name !== "string") return res.status(400).json({ error: "Missing name" });
+    name = name.trim().slice(0, 32);
+    if (!name) return res.status(400).json({ error: "Name cannot be empty" });
+    const forbidden = /^(anonymous|admin|owner|system|bot|discord|hacker41|f3inti|yoyomaster95|nitrix67|gmacbride)/i;
+    if (forbidden.test(name) && name.toLowerCase() !== "anonymous") {
+        return res.status(400).json({ error: "That Name Is Reserved" });
+    }
+    if (!sessionToken || !anonSessions.has(sessionToken)) {
+        sessionToken = crypto.randomBytes(24).toString("hex");
+    }
+    anonSessions.set(sessionToken, { name, createdAt: Date.now() });
+    res.json({ sessionToken, name });
+});
 app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
     const { filename } = req.body;
     if (!filename) return res.json({ ok: false, message: "No Filename Provided" });
@@ -1334,21 +1300,27 @@ app.post("/delete", rateLimit("delete"), async (req, res) => {
         const newDataSnap = new DataSnapshot(null);
         const userProfile = dataJson?.users?.[uid]?.profile || {};
         const auth = { uid, ...userProfile };
+        const isHighAdmin = !!(userProfile.isOwner || userProfile.isCoOwner || userProfile.isTester || userProfile.isHAdmin);
+        const isAnonMessage = oldValue && oldValue.anon === true && !oldValue.s;
         const { rule, wildcards } = getRuleForOperation(rules, path, "write");
         if (
-            !rule ||
-            !evaluate(rule, {
-                auth,
-                root,
-                data: dataSnap,
-                newData: newDataSnap,
-                wildcards,
-            })
+            !(isHighAdmin && isAnonMessage) &&
+            (
+                !rule ||
+                !evaluate(rule, {
+                    auth,
+                    root,
+                    data: dataSnap,
+                    newData: newDataSnap,
+                    wildcards,
+                })
+            )
         ) {
             return res.status(403).json({ error: "Delete denied" });
         }
         const validateRule = getRuleForOperation(rules, path, "validate").rule;
         if (
+            !(isHighAdmin && isAnonMessage) &&
             validateRule &&
             !evaluate(validateRule, {
                 auth,
@@ -1940,65 +1912,6 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
         res.status(500).json({ ok: false, message: err.message });
     }
 });
-app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (req, res) => {
-    const { message, channelId } = req.body;
-    const file = req.file;
-    let targetChannel = channelId || DEFAULT_CHANNEL_ID;
-    const ALLOWED_CHANNELS = new Set([
-        '1464689808717774970',
-        '1389703415810101308',
-        '1389334335114580229',
-        '1309160050904006696',
-        '1309164699417448550',
-        '1007051892821594183',
-        '1086362556203028540',
-        '1334945403912720586',
-        '1390991482650886215',
-        '1391898825588740108',
-        '1401659961880088668',
-        '1334377158789042226'
-    ]);
-    if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
-    try {
-        if (file) {
-            const formData = new FormData();
-            formData.append("content", message || "");
-            formData.append("files[0]", file.buffer, {
-                filename: file.originalname,
-                contentType: file.mimetype,
-            });
-            await discordRequest({
-                method: "post",
-                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
-                data: formData,
-                headers: formData.getHeaders(),
-            });
-            const report = loadReportJSON();
-            const day = new Date().getDate().toString();
-            if (!report.report[day]) report.report[day] = {};
-            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
-            report.report[day]["sent"].count += 2;
-            saveReportJSON(report);
-        } else {
-            await discordRequest({
-                method: "post",
-                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
-                data: { content: message },
-                headers: { "Content-Type": "application/json" },
-            });
-            const report = loadReportJSON();
-            const day = new Date().getDate().toString();
-            if (!report.report[day]) report.report[day] = {};
-            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
-            report.report[day]["sent"].count++;
-            saveReportJSON(report);
-        }
-        res.status(200).send("Message Sent");
-    } catch (err) {
-        console.error("Discord Error:", err.response?.data || err.message);
-        res.status(500).send("Failed To Send Message");
-    }
-});
 app.post("/square-webhook",
     express.raw({ type: "application/json" }),
     async (req, res) => {
@@ -2052,62 +1965,6 @@ app.post("/tokenUsed", async (req, res) => {
     }
     res.sendStatus(200);
 });
-app.post("/upload",blockDiscordIfDisabled,memoryUpload.single("file"), async (req, res) => {
-    const { channelId } = req.body;
-    const file = req.file;
-    let targetChannel = channelId || DEFAULT_CHANNEL_ID;
-    const ALLOWED_CHANNELS = new Set([
-        '1464689808717774970',
-        '1389703415810101308',
-        '1389334335114580229',
-        '1309160050904006696',
-        '1309164699417448550',
-        '1007051892821594183',
-        '1086362556203028540',
-        '1334945403912720586',
-        '1390991482650886215',
-        '1391898825588740108',
-        '1401659961880088668',
-        '1334377158789042226'
-    ]);
-    if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
-    if (!file) return res.status(400).send("No File Uploaded");
-        const MAX_SIZE = 10 * 1024 * 1024;
-        if (file.size > MAX_SIZE) {
-            fs.unlink(file.path, () => {});
-            return res.status(400).send("File exceeds 10MB limit");
-        }
-        try {
-            const formData = new FormData();
-            formData.append("files[0]", fs.createReadStream(file.path), {
-                filename: file.originalname,
-                contentType: file.mimetype,
-            });
-            await discordRequest({
-                method: "post",
-                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
-                data: formData,
-                headers: formData.getHeaders(),
-            });
-            logEvent("file-uploads", {
-                id: `file_${Date.now()}`,
-                data: {
-                    author: req.headers["x-user-id"] || "unknown"
-                }
-            });
-            fs.unlink(file.path, (err) => {
-                if (err) console.error("Failed to delete temp file:", err);
-            });
-            res.status(200).send("File Uploaded");
-        } catch (err) {
-            if (file?.path) {
-                fs.unlink(file.path, () => {});
-            }
-            console.error("File Upload Error:", err.response?.data || err.message);
-            res.status(500).send("Failed To Upload File");
-        }
-    }
-);
 app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (req, res) => {
     try {
         const { uid } = req.body;
@@ -2326,7 +2183,8 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
     });
 }, async (req, res) => {
         try {
-        const uid = await verifyToken(req);
+        let uid = null;
+        try { uid = await verifyToken(req); } catch { uid = null; }
         let path = req.body?.path;
         let value = req.body?.value;
         if (typeof path === "string") {
@@ -2337,6 +2195,47 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
         }
         const uploadedFile = req.file || null;
         if (!Array.isArray(path)) return res.status(400).json({ error: "Path Must Be Array" });
+        if (!uid) {
+            const isNewMessage = path.length === 3 && path[0] === "messages";
+            const isEdit      = path.length === 4 && path[0] === "messages";
+            const isDelete    = value === null;
+            if (isEdit || isDelete) {
+                return res.status(403).json({ error: "Guests Cannot Edit Or Delete Messages." });
+            }
+            if (!isNewMessage) {
+                return res.status(403).json({ error: "Unauthorized" });
+            }
+            const channelName = path[1];
+            const dataJsonG = getDataCache();
+            const chDataG = dataJsonG?.channels?.[channelName];
+            if (!chDataG?.guestWrite) {
+                return res.status(403).json({ error: "This Channel Does Not Allow Guest Messages." });
+            }
+            const anonSessionToken = req.headers["x-anon-session"] || req.body?.anonSession || null;
+            const anonName = resolveAnonName(anonSessionToken);
+            const msgText = (value?.t || value?.text || "").trim();
+            if (!msgText) return res.status(400).json({ error: "Empty message" });
+            if (/@everyone\b/i.test(msgText) || /@here\b/i.test(msgText)) {
+                return res.status(403).json({ error: "@everyone And @here Are Not Allowed." });
+            }
+            if (msgText.length > 500) {
+                return res.status(400).json({ error: "Guest Messages Are Limited To 500 Characters." });
+            }
+            const ts = Date.now();
+            const guestMsg = { u: anonName, t: msgText, anon: true };
+            if (value?.r) guestMsg.r = value.r;
+            const dataJsonW = getDataCache();
+            if (!dataJsonW.messages) dataJsonW.messages = {};
+            if (!dataJsonW.messages[channelName]) dataJsonW.messages[channelName] = {};
+            dataJsonW.messages[channelName][String(ts)] = guestMsg;
+            saveData(dataJsonW);
+            broadcastUpdate(["messages", channelName, String(ts)], guestMsg);
+            if (DISCORD_CHANNEL_MAP[channelName]) {
+                bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null).catch(() => {});
+            }
+            return res.json({ success: true });
+        }
+        if (!uid) return res.status(401).json({ error: "Unauthorized" });
         if (
             path.length === 3 && path[0] === "messages" &&
             value && typeof value === "object" &&
@@ -2641,44 +2540,7 @@ process.on("SIGINT", () => {
 });
 rl.on("line", (input) => {
     const trimmed = input.trim();
-    if (liveMode) {
-        const files = fs.readdirSync(UPLOADS_DIR).filter((f) => {
-            try {
-                return fs.statSync(path.join(UPLOADS_DIR, f)).isFile();
-            } catch {
-                return false;
-            }
-        });
-        if (trimmed.toUpperCase().startsWith("DELETE")) {
-            const parts = trimmed.split(" ").filter(Boolean);
-            const num = parseInt(parts[1]) - 1;
-            if (!isNaN(num) && files[num]) {
-                fs.unlinkSync(path.join(UPLOADS_DIR, files[num]));
-                console.log(`\nDeleted ${files[num]}`);
-            } else {
-                console.log("\nInvalid File Number For DELETE.");
-            }
-        } else if (trimmed.toUpperCase() === "MENU") {
-            liveMode = false;
-            if (liveInterval) clearInterval(liveInterval);
-            console.log("\nReturning To Main Menu");
-            mainMenu();
-            return;
-        } else if (!isNaN(parseInt(trimmed))) {
-            const num = parseInt(trimmed) - 1;
-            if (files[num]) {
-                const file = files[num];
-                const url = `https://www.infinitecampus.xyz/InfiniteUploaders.html?file=${file}`;
-                console.log(`\nDownload Link: ${url}`);
-                activeLinks.push({ url, ts: Date.now() });
-            } else {
-                console.log("\nInvalid File Number.");
-            }
-        } else if (trimmed.length === 0) {
-        } else {
-            console.log(`\nUnknown Command: ${trimmed}`);
-        }
-    } else {
+    {
         switch (trimmed) {
             case "1":
                 listFilesLive();
@@ -2704,7 +2566,8 @@ rl.setPrompt("> ");
 wss.on("connection", async (ws, req) => {
     try {
         const url = new URL(req.url, `http://${req.headers.host}`);
-        const token = url.searchParams.get("token");
+        const rawToken = url.searchParams.get("token");
+        const token = rawToken && rawToken !== "null" ? rawToken : null;
         const wsPath = JSON.parse(url.searchParams.get("path") || "[]");
         const limit = Number(url.searchParams.get("limit") || 50);
         let uid = null;
@@ -2723,14 +2586,15 @@ wss.on("connection", async (ws, req) => {
             const userProfile = dataJson?.users?.[uid]?.profile || {};
             auth = { uid, ...userProfile };
         }
+        let guestAllowed = false;
+        if (!uid && wsPath.length >= 2 && wsPath[0] === "messages") {
+            const chName = wsPath[1];
+            const chData = dataJson?.channels?.[chName];
+            guestAllowed = !!(chData?.guestRead);
+        }
         const { rule, wildcards } = getRuleForOperation(rules, wsPath, "read");
-        if (rule && !evaluate(rule, {
-            auth,
-            root,
-            data: root,
-            newData: root,
-            wildcards
-        })) {
+        const rulePass = !rule || evaluate(rule, { auth, root, data: root, newData: root, wildcards });
+        if (!rulePass && !guestAllowed) {
             return ws.close();
         }
         try {
@@ -2743,9 +2607,9 @@ wss.on("connection", async (ws, req) => {
             const filtered = filterDataByRules(current, wsPath, auth, root, rules);
             const snapshotStr = JSON.stringify(filtered);
             ws.send(snapshotStr);
-            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: snapshotStr, rules, lastPollAt: Date.now() });
+            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: snapshotStr, rules, lastPollAt: Date.now(), guestAllowed });
         } catch (e) {
-            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: null, rules, lastPollAt: 0 });
+            wsClients.set(ws, { uid, path: wsPath, auth, limit, lastData: null, rules, lastPollAt: 0, guestAllowed });
         }
         ws.on("close", () => {
             wsClients.delete(ws);
@@ -3806,12 +3670,6 @@ function archiveReport() {
     }
     saveReportJSON({ report: {} });
 }
-function blockDiscordIfDisabled(req, res, next) {
-    if (DISCORD_DISABLED) {
-        return res.status(403).json({ error: "Discord integration disabled" });
-    }
-    next();
-}
 function broadcastUpdate(changedPath, newValue) {
     for (const [ws, clientInfo] of wsClients.entries()) {
         if (ws.readyState !== ws.OPEN) continue;
@@ -4091,8 +3949,7 @@ function invalidateDataCache() {
     _dataCache = null;
 }
 function listFilesLive() {
-    liveMode = true;
-    if (liveInterval) clearInterval(liveInterval);
+    if (_listFilesInterval) clearInterval(_listFilesInterval);
     const renderList = () => {
         const files = fs.readdirSync(UPLOADS_DIR).filter((f) => fs.statSync(path.join(UPLOADS_DIR, f)).isFile());
         const lines = [];
@@ -4141,7 +3998,7 @@ function listFilesLive() {
         lines.push("Type MENU To Return To The Main Menu.");
         renderScreen(lines);
     };
-    liveInterval = setInterval(renderList, 1000);
+    _listFilesInterval = setInterval(renderList, 1000);
     renderList();
 }
 function listMovies() {
@@ -4245,10 +4102,9 @@ function logEvent(eventType, eventData) {
     saveReportJSON(report);
 }
 function mainMenu() {
-    liveMode = false;
-    if (liveInterval) {
-        clearInterval(liveInterval);
-        liveInterval = null;
+    if (_listFilesInterval) {
+        clearInterval(_listFilesInterval);
+        _listFilesInterval = null;
     }
     console.log("\n FILE SERVER MENU");
     console.log("1  Files");
@@ -4412,6 +4268,11 @@ function requireAdminPassword(req, res, next) {
         }
     }
     next();
+}
+function resolveAnonName(sessionToken) {
+    if (!sessionToken) return "Anonymous";
+    const s = anonSessions.get(sessionToken);
+    return s?.name || "Anonymous";
 }
 function restoreApplicantMessages() {
     const data = loadApplyJSON();
@@ -4683,245 +4544,134 @@ function startDiscordGateway() {
         discordIdToChannelName[id] = name;
     }
     const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
-    let reconnectAttempts = 0;
-    const MAX_RECONNECT_ATTEMPTS = 10;
-    const BASE_RECONNECT_DELAY = 3000;
-    const MAX_RECONNECT_DELAY = 5 * 60 * 1000;
-    async function connect() {
-        if (discordGatewayWs) {
-            try { discordGatewayWs.close(); } catch {}
-            discordGatewayWs = null;
+    const rest = new REST({ version: "10" }).setToken(DISCORD_BOT_TOKEN);
+    const manager = new WebSocketManager({
+        token: DISCORD_BOT_TOKEN,
+        intents: 33281,
+        rest,
+    });
+    discordGatewayActive = manager;
+    function buildAttachmentHtml(att) {
+        const attUrl = att.proxy_url || att.url || "";
+        if (!attUrl) return "";
+        const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+        const name = att.filename || attUrl;
+        if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(name)) {
+            return `<img src="${proxied}" alt="${name}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+        } else if (/\.(mp4|webm|mov)(\?|$)/i.test(name)) {
+            return `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+        } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(name)) {
+            return `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
         }
-        if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
-        const wsUrl = (gatewayCanResume && gatewayResumeUrl)
-            ? `${gatewayResumeUrl}/?v=10&encoding=json`
-            : "wss://gateway.discord.gg/?v=10&encoding=json";
-        let ws;
-        try {
-            const { WebSocket: WsClient } = await import("ws");
-            ws = new WsClient(wsUrl);
-        } catch (e) {
-            console.error("Failed to open gateway WebSocket:", e.message);
-            scheduleGatewayReconnect(BASE_RECONNECT_DELAY);
+        return `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${name}</a>`;
+    }
+    manager.on(WebSocketShardEvents.Dispatch, ({ data: d }) => {
+        if (!d || !d.t) return;
+        if (d.t === "READY") {
+            console.log("[DiscordBridge] Gateway Ready, Session:", d.d?.session_id);
             return;
         }
-        discordGatewayWs = ws;
-        ws.on("message", (raw) => {
-            let payload;
-            try { payload = JSON.parse(raw.toString()); } catch { return; }
-            const { op, d, s, t } = payload;
-            if (s != null) gatewaySeq = s;
-            if (op === 10) {
-                const interval = d.heartbeat_interval;
-                if (gatewayHeartbeatInterval) clearInterval(gatewayHeartbeatInterval);
-                const jitter = Math.floor(Math.random() * interval);
-                setTimeout(() => {
-                    if (ws.readyState === ws.OPEN) {
-                        ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
-                    }
-                }, jitter);
-                gatewayHeartbeatInterval = setInterval(() => {
-                    if (ws.readyState === ws.OPEN) {
-                        ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
-                    }
-                }, interval);
-                if (gatewayCanResume && gatewaySessionId && gatewaySeq != null) {
-                    console.log("[DiscordGateway] Sending RESUME for session:", gatewaySessionId, "seq:", gatewaySeq);
-                    ws.send(JSON.stringify({
-                        op: 6,
-                        d: {
-                            token: DISCORD_BOT_TOKEN,
-                            session_id: gatewaySessionId,
-                            seq: gatewaySeq
-                        }
-                    }));
-                } else {
-                    console.log("[DiscordGateway] Sending IDENTIFY");
-                    ws.send(JSON.stringify({
-                        op: 2,
-                        d: {
-                            token: DISCORD_BOT_TOKEN,
-                            intents: 33281,
-                            properties: {
-                                os: "linux",
-                                browser: "ic-bridge",
-                                device: "ic-bridge"
+        if (d.t === "RESUMED") {
+            console.log("[DiscordGateway] Session Successfully Resumed");
+            return;
+        }
+        if (d.t === "MESSAGE_CREATE") {
+            const msg = d.d;
+            if (!watchedChannelIds.has(msg.channel_id)) return;
+            if (msg.author?.bot && botSentDiscordIds.has(msg.id)) return;
+            const channelName = discordIdToChannelName[msg.channel_id];
+            if (!channelName) return;
+            const ts = discordMsgToTimestamp(msg.id);
+            const baseContent = (msg.content || msg.embeds?.[0]?.description || "")
+                .replace(/@everyone\b/gi, "@\u200beveryone")
+                .replace(/@here\b/gi, "@\u200bhere");
+            const attachHtml = (msg.attachments || []).map(buildAttachmentHtml).join("");
+            const embedHtml  = (msg.embeds || []).map(serializeDiscordEmbed).join("");
+            const fullContent = baseContent
+                + (attachHtml ? (baseContent ? "\n" + attachHtml : attachHtml) : "")
+                + (embedHtml  ? "\n" + embedHtml : "");
+            if (!fullContent) return;
+            const avatarHash = msg.author?.avatar;
+            const userId     = msg.author?.id;
+            const avatarUrl  = avatarHash
+                ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
+                : `https://cdn.discordapp.com/embed/avatars/0.png`;
+            const entry = {
+                u: msg.author?.username || "Unknown",
+                a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+                t: fullContent,
+                _discordId: msg.id,
+            };
+            if (msg.referenced_message) {
+                entry.r = discordMsgToTimestamp(msg.referenced_message.id);
+            }
+            writeDiscordMsgToData(channelName, msg.id, entry, ts);
+            if (msg.referenced_message) {
+                try {
+                    const refTs = discordMsgToTimestamp(msg.referenced_message.id);
+                    const replyData = getDataCache();
+                    const repliedEntry = replyData?.messages?.[channelName]?.[String(refTs)];
+                    if (repliedEntry) {
+                        const replierDiscordUsername = (msg.author?.username || "").toLowerCase();
+                        const originalSenderUid = repliedEntry.s || null;
+                        if (originalSenderUid) {
+                            const originalSenderProfile = replyData?.users?.[originalSenderUid]?.profile || {};
+                            const linkedDiscordUsername = (originalSenderProfile.dUsername || "").toLowerCase();
+                            if (!linkedDiscordUsername || linkedDiscordUsername !== replierDiscordUsername) {
+                                sendReplyNotification(
+                                    originalSenderUid, null,
+                                    msg.author?.username || "Someone",
+                                    channelName, ts, msg.content || ""
+                                );
                             }
                         }
-                    }));
-                }
-            } else if (op === 11) {
-            } else if (op === 1) {
-                if (ws.readyState === ws.OPEN) {
-                    ws.send(JSON.stringify({ op: 1, d: gatewaySeq }));
-                }
-            } else if (op === 7) {
-                console.log("[DiscordGateway] Op 7 Reconnect received — will resume");
-                gatewayCanResume = true;
-                scheduleGatewayReconnect(1000);
-            } else if (op === 9) {
-                const resumable = d === true;
-                console.warn("[DiscordGateway] Op 9 Invalid Session — resumable:", resumable);
-                gatewayCanResume = resumable;
-                if (!resumable) {
-                    gatewaySessionId = null;
-                    gatewaySeq = null;
-                }
-                scheduleGatewayReconnect(1000 + Math.floor(Math.random() * 4000));
-            } else if (op === 0 && t === "READY") {
-                gatewaySessionId = d.session_id;
-                gatewayResumeUrl = d.resume_gateway_url || null;
-                gatewayCanResume = true;
-                reconnectAttempts = 0;
-                console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId, "resume_url:", gatewayResumeUrl);
-            } else if (op === 0 && t === "RESUMED") {
-                reconnectAttempts = 0;
-                console.log("[DiscordGateway] Session successfully resumed");
-            } else if (op === 0 && t === "MESSAGE_CREATE") {
-                if (!watchedChannelIds.has(d.channel_id)) return;
-                if (d.author?.bot) {
-                    if (botSentDiscordIds.has(d.id)) return;
-                }
-                const channelName = discordIdToChannelName[d.channel_id];
-                if (!channelName) return;
-                const ts = discordMsgToTimestamp(d.id);
-                const baseContent = (d.content || d.embeds?.[0]?.description || "")
-                    .replace(/@everyone\b/gi, "@\u200beveryone")
-                    .replace(/@here\b/gi, "@\u200bhere");
-                const gatewayAttachments = d.attachments || [];
-                let gatewayAttachmentHtml = "";
-                for (const att of gatewayAttachments) {
-                    const attUrl = att.proxy_url || att.url || "";
-                    if (!attUrl) continue;
-                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
-                    const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
-                    const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
-                    const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
-                    if (isImage) {
-                        gatewayAttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
-                    } else if (isVideo) {
-                        gatewayAttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
-                    } else if (isAudio) {
-                        gatewayAttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
-                    } else {
-                        gatewayAttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
                     }
+                } catch (replyNotifErr) {
+                    console.error("Discord Reply Notification Error:", replyNotifErr.message || replyNotifErr);
                 }
-                const content = baseContent
-                    + (gatewayAttachmentHtml ? (baseContent ? "\n" + gatewayAttachmentHtml : gatewayAttachmentHtml) : "");
-                let gatewayEmbedHtml = "";
-                for (const embed of (d.embeds || [])) {
-                    gatewayEmbedHtml += serializeDiscordEmbed(embed);
-                }
-                const fullContent = content + (gatewayEmbedHtml ? (content ? "\n" + gatewayEmbedHtml : gatewayEmbedHtml) : "");
-                if (!fullContent) return;
-                const avatarHash = d.author?.avatar;
-                const userId = d.author?.id;
-                const avatarUrl = avatarHash
-                    ? `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.png?size=64`
-                    : `https://cdn.discordapp.com/embed/avatars/0.png`;
-                const entry = {
-                    u: d.author?.username || "Unknown",
-                    a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
-                    t: fullContent,
-                    _discordId: d.id,
-                };
-                if (d.referenced_message) {
-                    entry.r = discordMsgToTimestamp(d.referenced_message.id);
-                }
-                console.log(channelName);
-                writeDiscordMsgToData(channelName, d.id, entry, ts);
-                if (d.referenced_message) {
-                    try {
-                        const refTs = discordMsgToTimestamp(d.referenced_message.id);
-                        const replyData = getDataCache();
-                        const repliedEntry = replyData?.messages?.[channelName]?.[String(refTs)];
-                        if (repliedEntry) {
-                            const replierDiscordUsername = (d.author?.username || "").toLowerCase();
-                            const originalSenderUid = repliedEntry.s || null;
-                            if (originalSenderUid) {
-                                const originalSenderProfile = replyData?.users?.[originalSenderUid]?.profile || {};
-                                const linkedDiscordUsername = (originalSenderProfile.dUsername || "").toLowerCase();
-                                if (linkedDiscordUsername && linkedDiscordUsername === replierDiscordUsername) {
-                                } else {
-                                    sendReplyNotification(
-                                        originalSenderUid,
-                                        null,
-                                        d.author?.username || "Someone",
-                                        channelName,
-                                        ts,
-                                        d.content || ""
-                                    );
-                                }
-                            }
-                        }
-                    } catch (replyNotifErr) {
-                        console.error("Discord Reply Notification Error:", replyNotifErr.message || replyNotifErr);
-                    }
-                }
-            } else if (op === 0 && t === "MESSAGE_UPDATE") {
-                if (!watchedChannelIds.has(d.channel_id)) return;
-                const channelName = discordIdToChannelName[d.channel_id];
-                if (!channelName) return;
-                const ref = discordMsgIdToTimestamp[d.id];
-                if (!ref) return;
-                const data = getDataCache();
-                const existing = data?.messages?.[channelName]?.[ref.timestamp];
-                if (!existing || !existing.u) return;
-                existing.t = d.content || existing.t;
-                existing.e = "edited";
-                data.messages[channelName][ref.timestamp] = existing;
+            }
+            return;
+        }
+        if (d.t === "MESSAGE_UPDATE") {
+            const msg = d.d;
+            if (!watchedChannelIds.has(msg.channel_id)) return;
+            const channelName = discordIdToChannelName[msg.channel_id];
+            if (!channelName) return;
+            const ref = discordMsgIdToTimestamp[msg.id];
+            if (!ref) return;
+            const data = getDataCache();
+            const existing = data?.messages?.[channelName]?.[ref.timestamp];
+            if (!existing || !existing.u) return;
+            existing.t = msg.content || existing.t;
+            existing.e = "edited";
+            data.messages[channelName][ref.timestamp] = existing;
+            saveData(data);
+            broadcastUpdate(["messages", channelName, String(ref.timestamp)], existing);
+            return;
+        }
+        if (d.t === "MESSAGE_DELETE") {
+            const msg = d.d;
+            if (!watchedChannelIds.has(msg.channel_id)) return;
+            const channelName = discordIdToChannelName[msg.channel_id];
+            if (!channelName) return;
+            const ref = discordMsgIdToTimestamp[msg.id];
+            if (!ref) return;
+            const data = getDataCache();
+            if (data?.messages?.[channelName]?.[ref.timestamp]) {
+                delete data.messages[channelName][ref.timestamp];
                 saveData(data);
-                broadcastUpdate(["messages", channelName, String(ref.timestamp)], existing);
-            } else if (op === 0 && t === "MESSAGE_DELETE") {
-                if (!watchedChannelIds.has(d.channel_id)) return;
-                const channelName = discordIdToChannelName[d.channel_id];
-                if (!channelName) return;
-                const ref = discordMsgIdToTimestamp[d.id];
-                if (!ref) return;
-                const data = getDataCache();
-                if (data?.messages?.[channelName]?.[ref.timestamp]) {
-                    delete data.messages[channelName][ref.timestamp];
-                    saveData(data);
-                    broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
-                }
-                delete discordMsgIdToTimestamp[d.id];
+                broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
             }
-        });
-        ws.on("close", (code) => {
-            console.warn("[DiscordGateway] Connection closed, code:", code);
-            if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
-            const nonResumableCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
-            if (nonResumableCodes.has(code)) {
-                console.error(`[DiscordGateway] Non-resumable close code ${code} — clearing session`);
-                gatewayCanResume = false;
-                gatewaySessionId = null;
-                gatewaySeq = null;
-            } else {
-                gatewayCanResume = !!(gatewaySessionId && gatewaySeq != null);
-            }
-            discordGatewayActive = null;
-            scheduleGatewayReconnect(5000);
-        });
-        ws.on("error", (e) => {
-            console.error("Gateway Error:", e.message);
-        });
-    }
-    function scheduleGatewayReconnect(baseDelay) {
-        if (gatewayReconnectTimer) return;
-        reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-            console.error(`[DiscordGateway] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up to avoid token ban. Restart the server to retry.`);
+            delete discordMsgIdToTimestamp[msg.id];
             return;
         }
-        const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
-        console.log(`[DiscordGateway] Scheduling reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s`);
-        gatewayReconnectTimer = setTimeout(() => {
-            gatewayReconnectTimer = null;
-            connect();
-        }, delay);
-    }
-    connect();
+    });
+    manager.on(WebSocketShardEvents.Error, ({ error }) => {
+        console.error("[DiscordGateway] Shard Error:", error?.message || error);
+    });
+    manager.connect().catch((err) => {
+        console.error("[DiscordGateway] Failed To Connect:", err?.message || err);
+    });
 }
 function toggleLockdown() {
     LOCKDOWN = !LOCKDOWN;
@@ -5155,6 +4905,12 @@ setInterval(() => {
         acceptStatus.clear();
     }
 }, 10 * 60 * 1000);
+setInterval(() => {
+    const now = Date.now();
+    for (const [tok, s] of anonSessions) {
+        if (now - s.createdAt > ANON_SESSION_TTL) anonSessions.delete(tok);
+    }
+}, 60 * 60 * 1000);
 setInterval(async () => {
     if (wsClients.size === 0) return;
     let dataJson;
@@ -5188,15 +4944,11 @@ setInterval(async () => {
         }
     }
 }, WS_POLL_INTERVAL_TYPING);
-setupSocketHandlers(ioLive, "LIVE");
 setupSocketHandlers(ioRealtime, "REALTIME");
 scheduleDailyClear();
 restoreApplicantMessages();
 watchForNewUsers();
 (async () => {
     await runInitialDiscordSync();
-    if (!discordGatewayActive) {
-        startDiscordGateway()
-        discordGatewayActive = true;
-    }
+    startDiscordGateway();
 })();
