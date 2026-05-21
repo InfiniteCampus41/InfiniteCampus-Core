@@ -95,8 +95,12 @@ const donationSessions = new Map();
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
 const FOLDER_LIMIT_MB = 1024;
+const GATEWAY_BASE_RECONNECT_DELAY = 3000;
 let gatewayCanResume = false;
 let gatewayHeartbeatInterval = null;
+const GATEWAY_MAX_RECONNECT_ATTEMPTS = 10;
+const GATEWAY_MAX_RECONNECT_DELAY = 5 * 60 * 1000;
+let gatewayReconnectAttempts = 0;
 let gatewayReconnectTimer = null;
 let gatewayResumeUrl = null;
 let gatewaySessionId = null;
@@ -1316,7 +1320,7 @@ app.post("/delete", rateLimit("delete"), async (req, res) => {
         const userProfile = dataJson?.users?.[uid]?.profile || {};
         const auth = { uid, ...userProfile };
         const isHighAdmin = !!(userProfile.isOwner || userProfile.isCoOwner || userProfile.isTester || userProfile.isHAdmin);
-        const isAnonMessage = oldValue && oldValue.anon === true && !oldValue.s;
+        const isAnonMessage = oldValue && (oldValue.sender === "anon" || (oldValue.anon === true && !oldValue.s));
         const { rule, wildcards } = getRuleForOperation(rules, path, "write");
         if (
             !(isHighAdmin && isAnonMessage) &&
@@ -2229,7 +2233,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             const anonSessionToken = req.headers["x-anon-session"] || req.body?.anonSession || null;
             const anonName = resolveAnonName(anonSessionToken);
             const msgText = (value?.t || value?.text || "").trim();
-            if (!msgText) return res.status(400).json({ error: "Empty message" });
+            if (!msgText && !uploadedFile) return res.status(400).json({ error: "Empty Message" });
             if (/@everyone\b/i.test(msgText) || /@here\b/i.test(msgText)) {
                 return res.status(403).json({ error: "@everyone And @here Are Not Allowed." });
             }
@@ -2237,7 +2241,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 return res.status(400).json({ error: "Guest Messages Are Limited To 500 Characters." });
             }
             const ts = Date.now();
-            const guestMsg = { u: anonName, t: msgText, anon: true };
+            const guestMsg = { u: anonName, t: msgText, sender: "anon" };
             if (value?.r) guestMsg.r = value.r;
             const dataJsonW = getDataCache();
             if (!dataJsonW.messages) dataJsonW.messages = {};
@@ -2245,8 +2249,89 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             dataJsonW.messages[channelName][String(ts)] = guestMsg;
             saveData(dataJsonW);
             broadcastUpdate(["messages", channelName, String(ts)], guestMsg);
-            if (DISCORD_CHANNEL_MAP[channelName]) {
-                bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null).catch(() => {});
+            if (uploadedFile) {
+                try {
+                    const fname = uploadedFile.originalname || "file";
+                    const fileBuffer = uploadedFile.buffer;
+                    const targetDiscordChannel = DISCORD_CHANNEL_MAP[channelName] || logid;
+                    const uploadForm = new FormData();
+                    uploadForm.append(
+                        "payload_json",
+                        JSON.stringify({ content: `**${anonName}** (guest) uploaded a file:` })
+                    );
+                    uploadForm.append("files[0]", fileBuffer, {
+                        filename: fname,
+                        contentType: uploadedFile.mimetype || "application/octet-stream",
+                    });
+                    const uploadResp = await discordRequestForce({
+                        method: "post",
+                        url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages`,
+                        data: uploadForm,
+                        headers: uploadForm.getHeaders(),
+                    });
+                    const discordAttachment = uploadResp?.data?.attachments?.[0];
+                    const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
+                    const guestUploadDiscordMsgId = uploadResp?.data?.id || null;
+                    if (guestUploadDiscordMsgId) {
+                        botSentDiscordIds.add(guestUploadDiscordMsgId);
+                        saveBotSentDiscordIds();
+                        guestMsg._discordMirrorId = guestUploadDiscordMsgId;
+                    }
+                    if (cdnUrl) {
+                        const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                        let attachHtml = "";
+                        if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
+                            attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;" data-fname="${fname}">`;
+                        } else if (/\.(mp4|webm|mov)(\?|$)/i.test(fname)) {
+                            attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${fname}"></video>`;
+                        } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(fname)) {
+                            attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${fname}"></audio>`;
+                        } else {
+                            attachHtml = `<a href="${proxied}" target="_blank" style="color:#4fa3ff;">${fname}</a>`;
+                        }
+                        const existingT = guestMsg.t || "";
+                        guestMsg.t = existingT ? existingT + "\n" + attachHtml : attachHtml;
+                        guestMsg._attachmentUrl = cdnUrl;
+                    }
+                    if (!DISCORD_CHANNEL_MAP[channelName] && guestUploadDiscordMsgId) {
+                        try {
+                            await discordRequestForce({
+                                method: "delete",
+                                url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages/${guestUploadDiscordMsgId}`,
+                            });
+                        } catch {}
+                        guestMsg._discordMirrorId = undefined;
+                    }
+                    dataJsonW.messages[channelName][String(ts)] = guestMsg;
+                    saveData(dataJsonW);
+                    broadcastUpdate(["messages", channelName, String(ts)], guestMsg);
+                } catch (err) {
+                    console.error("Guest File Upload Error", err);
+                } finally {
+                    try { fs.unlinkSync(uploadedFile.path); } catch {}
+                }
+            }
+            if (DISCORD_CHANNEL_MAP[channelName] && !uploadedFile) {
+                (async () => {
+                    try {
+                        const discordMsgId = await bridgeWebsiteMsgToDiscord(
+                            channelName, null,
+                            `${anonName}: ${msgText}\n-# This User Is Not Logged In`,
+                            null
+                        );
+                        if (discordMsgId) {
+                            const latestData = getDataCache();
+                            if (latestData?.messages?.[channelName]?.[String(ts)]) {
+                                latestData.messages[channelName][String(ts)]._discordMirrorId = discordMsgId;
+                                saveData(latestData);
+                            }
+                        }
+                    } catch {}
+                })();
+            } else if (DISCORD_CHANNEL_MAP[channelName] && !guestMsg._discordMirrorId) {
+                if (msgText) {
+                    bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null).catch(() => {});
+                }
             }
             return res.json({ success: true });
         }
@@ -2326,7 +2411,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 const fileBuffer = uploadedFile.buffer;
                 const targetDiscordChannel = DISCORD_CHANNEL_MAP[channel] || logid;
                 const uploadForm = new FormData();
-                uploadForm.append("payload_json", JSON.stringify({ content: "" }));
+                const uploaderProfile = getDataCache()?.users?.[uid]?.profile || {};
+                const uploaderName = uploaderProfile.displayName || "User";
+                uploadForm.append("payload_json", JSON.stringify({ content: `**${uploaderName}** Uploaded A File:` }));
                 uploadForm.append("files[0]", fileBuffer, {
                     filename: fname,
                     contentType: uploadedFile.mimetype || "application/octet-stream",
@@ -2344,11 +2431,11 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                     const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                     let attachHtml = "";
                     if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
-                        attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                        attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;" data-fname="${fname}">`;
                     } else if (/\.(mp4|webm|mov)(\?|$)/i.test(fname)) {
-                        attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                        attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${fname}"></video>`;
                     } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(fname)) {
-                        attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                        attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${fname}"></audio>`;
                     } else {
                         attachHtml = `<a href="${proxied}" target="_blank" style="color:#4fa3ff;">${fname}</a>`;
                     }
@@ -3553,9 +3640,9 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 if (isImage) {
                     attachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
                 } else if (isVideo) {
-                    attachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                    attachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${att.filename}" || 'video'"></video>`;
                 } else if (isAudio) {
-                    attachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                    attachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${att.filename}" || 'audio'"></audio>`;
                 } else {
                     attachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
                 }
@@ -4559,10 +4646,6 @@ function startDiscordGateway() {
         discordIdToChannelName[id] = name;
     }
     const watchedChannelIds = new Set(Object.values(DISCORD_CHANNEL_MAP));
-    let reconnectAttempts = 0;
-    const MAX_RECONNECT_ATTEMPTS = 10;
-    const BASE_RECONNECT_DELAY = 3000;
-    const MAX_RECONNECT_DELAY = 5 * 60 * 1000;
     async function connect() {
         if (discordGatewayWs) {
             try { discordGatewayWs.close(); } catch {}
@@ -4648,16 +4731,14 @@ function startDiscordGateway() {
                 gatewaySessionId = d.session_id;
                 gatewayResumeUrl = d.resume_gateway_url || null;
                 gatewayCanResume = true;
-                reconnectAttempts = 0;
+                gatewayReconnectAttempts = 0;
                 console.log("[DiscordBridge] Gateway connected, session:", gatewaySessionId, "resume_url:", gatewayResumeUrl);
             } else if (op === 0 && t === "RESUMED") {
-                reconnectAttempts = 0;
+                gatewayReconnectAttempts = 0;
                 console.log("[DiscordGateway] Session successfully resumed");
             } else if (op === 0 && t === "MESSAGE_CREATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
-                if (d.author?.bot) {
-                    if (botSentDiscordIds.has(d.id)) return;
-                }
+                if (d.author?.bot) return;
                 const channelName = discordIdToChannelName[d.channel_id];
                 if (!channelName) return;
                 const ts = discordMsgToTimestamp(d.id);
@@ -4676,9 +4757,9 @@ function startDiscordGateway() {
                     if (isImage) {
                         gatewayAttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
                     } else if (isVideo) {
-                        gatewayAttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;"></video>`;
+                        gatewayAttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${att.filename}" || 'video'"></video>`;
                     } else if (isAudio) {
-                        gatewayAttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;"></audio>`;
+                        gatewayAttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${att.filename}" || 'audio'"></audio>`;
                     } else {
                         gatewayAttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
                     }
@@ -4785,13 +4866,13 @@ function startDiscordGateway() {
     }
     function scheduleGatewayReconnect(baseDelay) {
         if (gatewayReconnectTimer) return;
-        reconnectAttempts++;
-        if (reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
-            console.error(`[DiscordGateway] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up to avoid token ban. Restart the server to retry.`);
+        gatewayReconnectAttempts++;
+        if (gatewayReconnectAttempts > GATEWAY_MAX_RECONNECT_ATTEMPTS) {
+            console.error(`[DiscordGateway] Max reconnect attempts (${GATEWAY_MAX_RECONNECT_ATTEMPTS}) reached. Giving up to avoid token ban. Restart the server to retry.`);
             return;
         }
-        const delay = Math.min(baseDelay * Math.pow(2, reconnectAttempts - 1), MAX_RECONNECT_DELAY);
-        console.log(`[DiscordGateway] Scheduling reconnect attempt ${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s`);
+        const delay = Math.min(baseDelay * Math.pow(2, gatewayReconnectAttempts - 1), GATEWAY_MAX_RECONNECT_DELAY);
+        console.log(`[DiscordGateway] Scheduling reconnect attempt ${gatewayReconnectAttempts}/${GATEWAY_MAX_RECONNECT_ATTEMPTS} in ${Math.round(delay / 1000)}s`);
         gatewayReconnectTimer = setTimeout(() => {
             gatewayReconnectTimer = null;
             connect();
