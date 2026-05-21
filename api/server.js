@@ -4857,7 +4857,7 @@ function startDiscordGateway() {
         ws.on("close", (code) => {
             console.warn("[DiscordGateway] Connection closed, code:", code);
             if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
-            const nonResumableCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014, 1005]);
+            const nonResumableCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
             if (nonResumableCodes.has(code)) {
                 console.error(`[DiscordGateway] Non-resumable Close Code ${code} — Clearing Session`);
                 gatewayCanResume = false;
