@@ -4738,7 +4738,16 @@ function startDiscordGateway() {
                 console.log("[DiscordGateway] Session successfully resumed");
             } else if (op === 0 && t === "MESSAGE_CREATE") {
                 if (!watchedChannelIds.has(d.channel_id)) return;
-                if (d.author?.bot) return;
+                const ALLOWED_BOT_ID = process.env.ALLOWED_BOT_ID || "YOUR_BOT_ID_HERE";
+                const ALLOWED_BOT_CHANNEL_IDS = new Set(
+                    (process.env.ALLOWED_BOT_CHANNEL_IDS || "").split(",").map(s => s.trim()).filter(Boolean)
+                );
+                if (d.author?.bot) {
+                    if (d.author.id === ALLOWED_BOT_ID && ALLOWED_BOT_CHANNEL_IDS.has(d.channel_id)) {
+                    } else {
+                        return;
+                    }
+                }
                 const channelName = discordIdToChannelName[d.channel_id];
                 if (!channelName) return;
                 const ts = discordMsgToTimestamp(d.id);
