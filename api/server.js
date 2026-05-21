@@ -1134,7 +1134,7 @@ app.post("/api/anon-name", (req, res) => {
     if (!name || typeof name !== "string") return res.status(400).json({ error: "Missing name" });
     name = name.trim().slice(0, 32);
     if (!name) return res.status(400).json({ error: "Name cannot be empty" });
-    const forbidden = /^(anonymous|admin|owner|system|bot|discord|hacker41|f3inti|yoyomaster95|nitrix67|gmacbride)/i;
+    const forbidden = /^(anonymous|admin|owner|system|bot|discord|hacker41|f3inti|yoyomaster95|nitrix67|gmacbride|infinitecampus)/i;
     if (forbidden.test(name) && name.toLowerCase() !== "anonymous") {
         return res.status(400).json({ error: "That Name Is Reserved" });
     }
@@ -2251,13 +2251,14 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             broadcastUpdate(["messages", channelName, String(ts)], guestMsg);
             if (uploadedFile) {
                 try {
-                    const fname = uploadedFile.originalname || "file";
+                    const fname = uploadedFile.originalname || "File";
+                    const fsize = formatBytes(uploadedFile?.size) || "";
                     const fileBuffer = uploadedFile.buffer;
                     const targetDiscordChannel = DISCORD_CHANNEL_MAP[channelName] || logid;
                     const uploadForm = new FormData();
                     uploadForm.append(
                         "payload_json",
-                        JSON.stringify({ content: `**${anonName}** (guest) uploaded a file:` })
+                        JSON.stringify({ content: `**${anonName}** (Guest) Uploaded A File:` })
                     );
                     uploadForm.append("files[0]", fileBuffer, {
                         filename: fname,
@@ -2281,13 +2282,13 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                         let attachHtml = "";
                         if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
-                            attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;" data-fname="${fname}">`;
+                            attachHtml = `<img src="${proxied}" alt="${fname}" data-fname="${fname}" data-fsize="${fsize}">`;
                         } else if (/\.(mp4|webm|mov)(\?|$)/i.test(fname)) {
-                            attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${fname}"></video>`;
+                            attachHtml = `<video src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></video>`;
                         } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(fname)) {
-                            attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${fname}"></audio>`;
+                            attachHtml = `<audio src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></audio>`;
                         } else {
-                            attachHtml = `<a href="${proxied}" target="_blank" style="color:#4fa3ff;">${fname}</a>`;
+                            attachHtml = `<file href="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></file>`;
                         }
                         const existingT = guestMsg.t || "";
                         guestMsg.t = existingT ? existingT + "\n" + attachHtml : attachHtml;
@@ -2407,7 +2408,8 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             const channel = path[1];
             const msgTimestamp = String(path[2]);
             try {
-                const fname = uploadedFile.originalname || "file";
+                const fname = uploadedFile.originalname || "File";
+                const fsize = formatBytes(uploadedFile?.size) || "";
                 const fileBuffer = uploadedFile.buffer;
                 const targetDiscordChannel = DISCORD_CHANNEL_MAP[channel] || logid;
                 const uploadForm = new FormData();
@@ -2431,13 +2433,13 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                     const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                     let attachHtml = "";
                     if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
-                        attachHtml = `<img src="${proxied}" alt="${fname}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;" data-fname="${fname}">`;
-                    } else if (/\.(mp4|webm|mov)(\?|$)/i.test(fname)) {
-                        attachHtml = `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${fname}"></video>`;
-                    } else if (/\.(mp3|ogg|wav|flac)(\?|$)/i.test(fname)) {
-                        attachHtml = `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${fname}"></audio>`;
+                        attachHtml = `<img src="${proxied}" alt="${fname}" data-size="${fsize}">`;
+                    } else if (/\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(fname)) {
+                        attachHtml = `<video src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></video>`;
+                    } else if (/\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(fname)) {
+                        attachHtml = `<audio src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></audio>`;
                     } else {
-                        attachHtml = `<a href="${proxied}" target="_blank" style="color:#4fa3ff;">${fname}</a>`;
+                        attachHtml = `<file href="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></file>`;
                     }
                     const data = getDataCache();
                     if (data?.messages?.[channel]?.[msgTimestamp]) {
@@ -3635,16 +3637,16 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 if (!attUrl) continue;
                 const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
                 const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
-                const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
-                const isAudio = /\.(mp3|ogg|wav|flac)(\?|$)/i.test(att.filename || attUrl);
+                const isVideo = /\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(att.filename || attUrl);
+                const isAudio = /\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(att.filename || attUrl);
                 if (isImage) {
-                    attachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                    attachmentHtml += `<img src="${proxied}" alt="${att.filename || 'Image'}" data-fsize="${formatBytes(att.size) || ''}">`;
                 } else if (isVideo) {
-                    attachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${att.filename}" || 'video'"></video>`;
+                    attachmentHtml += `<video src="${proxied}" data-fname="${att.filename}" || 'Video'" data-fsize="${formatBytes(att.size) || ''}"></video>`;
                 } else if (isAudio) {
-                    attachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${att.filename}" || 'audio'"></audio>`;
+                    attachmentHtml += `<audio src="${proxied}" data-fname="${att.filename || 'Audio'}" data-fsize="${formatBytes(att.size) || ''}"></audio>`;
                 } else {
-                    attachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
+                    attachmentHtml += `<file href="${proxied}" data-fname="${att.filename || 'File'}" data-fsize="${formatBytes(att.size) || ''}"></file>`;
                 }
             }
             let embedHtml = "";
@@ -4761,16 +4763,16 @@ function startDiscordGateway() {
                     if (!attUrl) continue;
                     const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
                     const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
-                    const isVideo = /\.(mp4|webm|mov)(\?|$)/i.test(att.filename || attUrl);
+                    const isVideo = /\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(att.filename || attUrl);
                     const isAudio = /\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(att.filename || attUrl);
                     if (isImage) {
-                        gatewayAttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'image'}" class="chat-img" style="max-width:300px;margin-top:6px;border-radius:6px;cursor:pointer;">`;
+                        gatewayAttachmentHtml += `<img src="${proxied}" alt="${att.filename || 'Image'}" data-fsize="${formatBytes(att.size) || ''}">`;
                     } else if (isVideo) {
-                        gatewayAttachmentHtml += `<video src="${proxied}" controls style="max-width:300px;margin-top:6px;border-radius:6px;" data-fname="${att.filename}" || 'video'"></video>`;
+                        gatewayAttachmentHtml += `<video src="${proxied}" data-fname="${att.filename || 'Video'}" data-fsize="${formatBytes(att.size) || ''}></video>`;
                     } else if (isAudio) {
-                        gatewayAttachmentHtml += `<audio src="${proxied}" controls style="margin-top:6px;" data-fname="${att.filename}" || 'audio'"></audio>`;
+                        gatewayAttachmentHtml += `<audio src="${proxied}" data-fname="${att.filename || 'Audio'}" data-fsize="${formatBytes(att.size) || ''}"></audio>`;
                     } else {
-                        gatewayAttachmentHtml += `<br><a href="${proxied}" target="_blank" style="color:#4fa3ff;">${att.filename || 'Download File'}</a>`;
+                        gatewayAttachmentHtml += `<file href="${proxied}" data-fname="${att.filename || 'File'}" data-fsize="${formatBytes(att.size) || ''}></file>`;
                     }
                 }
                 const content = baseContent
