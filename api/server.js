@@ -92,6 +92,15 @@ const diskStorage = multer.diskStorage({
 });
 const diskUpload = multer({ storage: diskStorage, limits: { fileSize: UPLOAD_LIMIT_MB * 1024 * 1024 } });
 const donationSessions = new Map();
+const EMAIL_TEMPLATES = [
+    { id: "premium_notice", label: "Premium Expiring Soon", defaultSubject: "Your Infinite Campus Premium Expires Soon", vars: ["DISPLAYNAME", "TIER", "EXPIRE", "EMAIL", "UID"] },
+    { id: "premium_expired", label: "Premium Expired", defaultSubject: "Your Infinite Campus Premium Has Expired", vars: ["DISPLAYNAME", "TIER", "EMAIL", "UID"] },
+    { id: "premium_purchased", label: "Premium Purchased", defaultSubject: "Your Infinite Campus Premium Is Now Active!", vars: ["DISPLAYNAME", "TIER", "EMAIL", "UID"] },
+    { id: "email_change", label: "Email Change Confirmation", defaultSubject: "Confirm Your Infinite Campus Email Change", vars: ["DISPLAYNAME", "LINK"] },
+    { id: "email_verify", label: "Email Verification", defaultSubject: "Verify Your Infinite Campus Email", vars: ["DISPLAYNAME", "LINK"] },
+    { id: "password_reset", label: "Password Reset", defaultSubject: "Reset Your Infinite Campus Password", vars: ["DISPLAYNAME", "LINK"] },
+    { id: "two_factor", label: "Two-Factor Code", defaultSubject: "Your Infinite Campus Two-Factor Code", vars: ["DISPLAYNAME", "CODE"] },
+];
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
 const FOLDER_LIMIT_MB = 1024;
@@ -1466,6 +1475,18 @@ app.post("/discordVerifyConfirm", async (req, res) => {
         message: "Discord Account Verified"
     });
 });
+app.get("/email/templates", verifyFirebaseToken, (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isTester)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        res.json({ success: true, templates: EMAIL_TEMPLATES });
+    } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
 app.post("/email", verifyFirebaseToken, async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -1473,8 +1494,17 @@ app.post("/email", verifyFirebaseToken, async (req, res) => {
         if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isTester)) {
             return res.status(403).json({ error: "Not Authorized" });
         }
-        const { to, subject, text, html } = req.body;
-        if (!to || !subject || (!text && !html)) {
+        const { to, subject, text, html, templateName, templateVars } = req.body;
+        let finalHtml = html;
+        let finalText = text;
+        if (templateName) {
+            try {
+                finalHtml = renderTemplate(templateName, templateVars || {});
+            } catch (tmplErr) {
+                return res.status(400).json({ success: false, error: `Template Render Failed: ${tmplErr.message}` });
+            }
+        }
+        if (!to || !subject || (!finalText && !finalHtml)) {
             return res.status(400).json({
                 success: false,
                 error: "Missing to, subject, and text/html"
@@ -1484,8 +1514,8 @@ app.post("/email", verifyFirebaseToken, async (req, res) => {
             from: "support@infinitecampus.xyz",
             to,
             subject,
-            text,
-            html
+            text: finalText,
+            html: finalHtml
         });
         try {
             const senderProfile = readDataPath(`users/${uid}/profile`);
