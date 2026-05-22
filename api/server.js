@@ -1931,6 +1931,65 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
         res.status(500).json({ ok: false, message: err.message });
     }
 });
+app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (req, res) => {
+    const { message, channelId } = req.body;
+    const file = req.file;
+    let targetChannel = channelId || DEFAULT_CHANNEL_ID;
+    const ALLOWED_CHANNELS = new Set([
+        '1464689808717774970',
+        '1389703415810101308',
+        '1389334335114580229',
+        '1309160050904006696',
+        '1309164699417448550',
+        '1007051892821594183',
+        '1086362556203028540',
+        '1334945403912720586',
+        '1390991482650886215',
+        '1391898825588740108',
+        '1401659961880088668',
+        '1334377158789042226'
+    ]);
+    if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
+    try {
+        if (file) {
+            const formData = new FormData();
+            formData.append("content", message || "");
+            formData.append("files[0]", file.buffer, {
+                filename: file.originalname,
+                contentType: file.mimetype,
+            });
+            await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
+                data: formData,
+                headers: formData.getHeaders(),
+            });
+            const report = loadReportJSON();
+            const day = new Date().getDate().toString();
+            if (!report.report[day]) report.report[day] = {};
+            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
+            report.report[day]["sent"].count += 2;
+            saveReportJSON(report);
+        } else {
+            await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${targetChannel}/messages`,
+                data: { content: message },
+                headers: { "Content-Type": "application/json" },
+            });
+            const report = loadReportJSON();
+            const day = new Date().getDate().toString();
+            if (!report.report[day]) report.report[day] = {};
+            if (!report.report[day]["sent"]) report.report[day]["sent"] = { count: 0 };
+            report.report[day]["sent"].count++;
+            saveReportJSON(report);
+        }
+        res.status(200).send("Message Sent");
+    } catch (err) {
+        console.error("Discord Error:", err.response?.data || err.message);
+        res.status(500).send("Failed To Send Message");
+    }
+});
 app.post("/square-webhook",
     express.raw({ type: "application/json" }),
     async (req, res) => {
