@@ -148,6 +148,8 @@ let memoryUpload = multer({
         filename: (req,file,cb)=>cb(null,Date.now()+"-"+file.originalname)
     })
 });
+const mirrorIdMap = {}
+const MOVIE_ACCEPTS_DIR = path.join(__dirname, "movieaccepts");
 const MOVIES_DIR = path.join(__dirname, "movies");
 const MOVIES_JSON = path.join(__dirname, "movies.json");
 const MSG_SLOWMODE_MS = 3000;
@@ -284,6 +286,7 @@ if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(APPLY_DIR)) fs.mkdirSync(APPLY_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_TEMP_DIR)) fs.mkdirSync(UPLOADS_TEMP_DIR, { recursive: true });
 if (!fs.existsSync(MOVIES_DIR)) fs.mkdirSync(MOVIES_DIR, { recursive: true });
+if (!fs.existsSync(MOVIE_ACCEPTS_DIR)) fs.mkdirSync(MOVIE_ACCEPTS_DIR, { recursive: true });
 if (!fs.existsSync(READY_DIR)) fs.mkdirSync(READY_DIR, { recursive: true });
 if (!fs.existsSync(QUEUE_DIR)) fs.mkdirSync(QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(DISCORD_QUEUE_DIR)) fs.mkdirSync(DISCORD_QUEUE_DIR, { recursive: true });
@@ -567,8 +570,53 @@ app.get("/discord-media-proxy", async (req, res) => {
     if (!url) return res.status(400).send("Bad URL");
     let parsed;
     try { parsed = new URL(url); } catch { return res.status(400).send("Invalid URL"); }
+    async function tryFetchWithRefresh(targetUrl) {
+        const r = await fetch(targetUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+        if (r.ok) return { r, finalUrl: targetUrl };
+        if ((r.status === 403 || r.status === 404) && targetUrl.includes("cdn.discordapp.com/attachments/")) {
+            try {
+                const attachmentPath = new URL(targetUrl).pathname;
+                const parts = attachmentPath.split("/").filter(Boolean);
+                if (parts.length >= 3) {
+                    const channelId = parts[1];
+                    const messageId = parts[2];
+                    const refreshResp = await axios({
+                        method: "get",
+                        url: `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
+                        headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
+                    });
+                    const freshAttachments = refreshResp?.data?.attachments || [];
+                    const fname = parts[parts.length - 1].split("?")[0];
+                    const freshAtt = freshAttachments.find(a => (a.filename || "").split("?")[0] === fname) || freshAttachments[0];
+                    if (freshAtt) {
+                        const freshUrl = freshAtt.url || freshAtt.proxy_url;
+                        if (freshUrl && freshUrl !== targetUrl) {
+                            try {
+                                const data = getDataCache();
+                                for (const [ch, msgs] of Object.entries(data.messages || {})) {
+                                    for (const [ts, msg] of Object.entries(msgs || {})) {
+                                        if (msg && msg._attachmentUrl && msg._attachmentUrl === targetUrl) {
+                                            msg._attachmentUrl = freshUrl;
+                                            const proxied = `/discord-media-proxy?url=${encodeURIComponent(freshUrl)}`;
+                                            if (msg.t) msg.t = msg.t.replace(encodeURIComponent(targetUrl), encodeURIComponent(freshUrl));
+                                            data.messages[ch][ts] = msg;
+                                            saveData(data);
+                                            broadcastUpdate(["messages", ch, String(ts)], msg);
+                                        }
+                                    }
+                                }
+                            } catch {}
+                            const r2 = await fetch(freshUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+                            if (r2.ok) return { r: r2, finalUrl: freshUrl };
+                        }
+                    }
+                }
+            } catch {}
+        }
+        return { r, finalUrl: targetUrl };
+    }
     try {
-        const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+        const { r } = await tryFetchWithRefresh(url);
         if (!r.ok) return res.status(r.status).send("Upstream error");
         const ct = r.headers.get("content-type") || "application/octet-stream";
         const cl = r.headers.get("content-length");
@@ -2365,7 +2413,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                     if (guestUploadDiscordMsgId) {
                         botSentDiscordIds.add(guestUploadDiscordMsgId);
                         saveBotSentDiscordIds();
-                        guestMsg._discordMirrorId = guestUploadDiscordMsgId;
+                        setMirrorId(channelName, ts, guestUploadDiscordMsgId);
                     }
                     if (cdnUrl) {
                         const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
@@ -2390,7 +2438,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                                 url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages/${guestUploadDiscordMsgId}`,
                             });
                         } catch {}
-                        guestMsg._discordMirrorId = undefined;
+                        deleteMirrorId(channelName, ts);
                     }
                     dataJsonW.messages[channelName][String(ts)] = guestMsg;
                     saveData(dataJsonW);
@@ -2410,15 +2458,11 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                             null
                         );
                         if (discordMsgId) {
-                            const latestData = getDataCache();
-                            if (latestData?.messages?.[channelName]?.[String(ts)]) {
-                                latestData.messages[channelName][String(ts)]._discordMirrorId = discordMsgId;
-                                saveData(latestData);
-                            }
+                            setMirrorId(channelName, ts, discordMsgId);
                         }
                     } catch {}
                 })();
-            } else if (DISCORD_CHANNEL_MAP[channelName] && !guestMsg._discordMirrorId) {
+            } else if (DISCORD_CHANNEL_MAP[channelName] && !getMirrorId(channelName, ts)) {
                 if (msgText) {
                     bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null).catch(() => {});
                 }
@@ -2540,7 +2584,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         if (uploadedDiscordMsgId) {
                             botSentDiscordIds.add(uploadedDiscordMsgId);
                             saveBotSentDiscordIds();
-                            data.messages[channel][msgTimestamp]._discordMirrorId = uploadedDiscordMsgId;
+                            setMirrorId(channel, msgTimestamp, uploadedDiscordMsgId);
                         }
                         saveData(data);
                         broadcastUpdate(path, data.messages[channel][msgTimestamp]);
@@ -2576,7 +2620,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                     if (DISCORD_CHANNEL_MAP[channel]) {
                         const latestData = getDataCache();
                         const latestEntry = latestData?.messages?.[channel]?.[msgTimestamp];
-                        if (!uploadedFile || !latestEntry?._discordMirrorId) {
+                        if (!uploadedFile || !getMirrorId(channel, msgTimestamp)) {
                             const discordMsgId = await bridgeWebsiteMsgToDiscord(
                                 channel,
                                 newValue.s,
@@ -2584,11 +2628,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                                 newValue.r || null
                             );
                             if (discordMsgId) {
-                                const data = getDataCache();
-                                if (data?.messages?.[channel]?.[msgTimestamp]) {
-                                    data.messages[channel][msgTimestamp]._discordMirrorId = discordMsgId;
-                                    saveData(data);
-                                }
+                                setMirrorId(channel, msgTimestamp, discordMsgId);
                             }
                         }
                     }
@@ -2625,7 +2665,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                     if (DISCORD_CHANNEL_MAP[channel]) {
                         const latestData = getDataCache();
                         const latestEntry = latestData?.messages?.[channel]?.[msgTimestamp];
-                        if (!uploadedFile || !latestEntry?._discordMirrorId) {
+                        if (!uploadedFile || !getMirrorId(channel, msgTimestamp)) {
                             const discordMsgId = await bridgeWebsiteMsgToDiscord(
                                 channel,
                                 newValue.sender,
@@ -2633,11 +2673,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                                 newValue.reply || null
                             );
                             if (discordMsgId) {
-                                const data = getDataCache();
-                                if (data?.messages?.[channel]?.[msgTimestamp]) {
-                                    data.messages[channel][msgTimestamp]._discordMirrorId = discordMsgId;
-                                    saveData(data);
-                                }
+                                setMirrorId(channel, msgTimestamp, discordMsgId);
                             }
                         }
                     }
@@ -2821,12 +2857,13 @@ async function bridgeDeleteToDiscord(channelName, timestamp) {
     const data = getDataCache();
     const entry = data?.messages?.[channelName]?.[timestamp];
     if (!entry) return;
-    if (!entry._discordMirrorId) return;
+    const mirrorId = getMirrorId(channelName, timestamp);
+    if (!mirrorId) return;
     if (entry.u) return;
     try {
         await discordRequestForce({
             method: "delete",
-            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${mirrorId}`,
         });
     } catch (e) {
         console.error("Failed To Delete Discord Mirror Message:", e.message);
@@ -2836,11 +2873,12 @@ async function bridgeDeleteToDiscordWithEntry(channelName, timestamp, entry) {
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
     if (!discordChannelId) return;
     if (!entry) return;
-    if (!entry._discordMirrorId) return;
+    const mirrorId = getMirrorId(channelName, timestamp);
+    if (!mirrorId) return;
     try {
         await discordRequestForce({
             method: "delete",
-            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${mirrorId}`,
         });
     } catch (e) {
         console.error("Failed To Delete Discord Mirror Message:", e.message);
@@ -2853,13 +2891,14 @@ async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
     const entry = data?.messages?.[channelName]?.[timestamp];
     if (!entry) return;
     if (entry.u) return;
-    if (!entry._discordMirrorId) return;
+    const mirrorId = getMirrorId(channelName, timestamp);
+    if (!mirrorId) return;
     try {
         const profile = data?.users?.[senderUid]?.profile || {};
         const displayName = profile.displayName || "User";
         await discordRequestForce({
             method: "patch",
-            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${entry._discordMirrorId}`,
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${mirrorId}`,
             data: { content: `**${displayName}**: ${newText}` },
             headers: { "Content-Type": "application/json" },
         });
@@ -3126,6 +3165,7 @@ async function finishAccept(movieName) {
             clearInterval(acceptIntervals.get(movieName));
             acceptIntervals.delete(movieName);
         }
+        deleteAcceptResume(movieName);
     }, 5000);
 }
 async function finishReject(movieName) {
@@ -3270,6 +3310,125 @@ async function loadRules() {
     const data = await fs.promises.readFile("./rules.json", "utf-8");
     return JSON.parse(data).rules;
 }
+async function resumeInProgressAccepts() {
+    const resumes = loadAllAcceptResumes();
+    if (resumes.length === 0) return;
+    console.log(`[AcceptResume] Found ${resumes.length} In-Progress Accept(s) To Resume`);
+    for (const resume of resumes) {
+        const { movieName, discordMessageId, percent, status, lastKnownEta } = resume;
+        if (!movieName) continue;
+        const srcPath = path.join(APPLY_DIR, movieName);
+        if (!fs.existsSync(srcPath)) {
+            console.warn(`[AcceptResume] Source File Missing For ${movieName}, Skipping Resume`);
+            deleteAcceptResume(movieName);
+            continue;
+        }
+        console.log(`[AcceptResume] Resuming Accept For: ${movieName} (Was ${percent ?? 0}% — ${status ?? "unknown"})`);
+        if (discordMessageId) {
+            applicantMessages.set(movieName, discordMessageId);
+            try {
+                const embed = {
+                    title: `ACCEPTING: ${movieName}`,
+                    color: 0xf1c40f,
+                    fields: [
+                        { name: "Status", value: "Server Restarted — Resuming..." },
+                        { name: "Percent", value: `${percent ?? 0}%` },
+                        { name: "Last Known ETA", value: lastKnownEta ? formatETA(lastKnownEta) : "Recalculating..." }
+                    ]
+                };
+                await discordRequest({
+                    method: "patch",
+                    url: `https://discord.com/api/v10/channels/${logid}/messages/${discordMessageId}`,
+                    data: { embeds: [embed] },
+                    headers: { "Content-Type": "application/json" }
+                });
+            } catch (e) {
+                console.warn(`[AcceptResume] Could Not Update Discord Message For ${movieName}:`, e.message);
+            }
+        }
+        acceptStatus.set(movieName, {
+            status: "running",
+            percent: percent ?? 0,
+            remainingSec: lastKnownEta ?? null,
+            message: "Resuming After Server Restart",
+            updated: Date.now()
+        });
+        const fakeSocket = {
+            emit: (event, data) => {
+                if (event === "jobLog") console.log(`[AcceptResume][${movieName}] ${data.text}`);
+            }
+        };
+        (async () => {
+            await startAcceptProcess(movieName, discordMessageId);
+            try {
+                fakeSocket.emit("jobLog", { filename: movieName, text: "Probing File For Duration..." });
+                const probeCmd = `ffprobe -v quiet -print_format json -show_format "${srcPath.replace(/"/g, '\\"')}"`;
+                let probeOut = "";
+                try {
+                    const { stdout } = await execProm(probeCmd);
+                    probeOut = stdout;
+                } catch (e) { probeOut = ""; }
+                let duration = 0;
+                try {
+                    const probeJson = probeOut ? JSON.parse(probeOut) : null;
+                    duration = parseFloat((probeJson?.format?.duration) || 0);
+                } catch { duration = 0; }
+                const baseTarget = sanitize(path.parse(movieName).name);
+                const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
+                const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
+                const copyPath = path.join(APPLY_DIR, copyName);
+                const scaledPathTemp = path.join(APPLY_DIR, scaledName);
+                const workId = `${movieName}_resumed_${Date.now()}`;
+                acceptStatus.set(movieName, { status: "copying", percent: 0, remainingSec: null, message: "Copying Container", updated: Date.now() });
+                await runFfmpegWithProgress(fakeSocket, workId, movieName, movieName, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container");
+                try { fs.unlinkSync(srcPath); } catch (e) {}
+                await new Promise(r => setTimeout(r, 500));
+                acceptStatus.set(movieName, { status: "scaling", percent: 0, remainingSec: null, message: "Scaling", updated: Date.now() });
+                await runFfmpegWithProgress(fakeSocket, workId, movieName, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360");
+                try { fs.unlinkSync(copyPath); } catch (e) {}
+                const finalFileName = `${baseTarget}.mp4`;
+                const destination = path.join(MOVIES_DIR, finalFileName);
+                let finalDest = destination;
+                let counter = 1;
+                while (fs.existsSync(finalDest)) {
+                    finalDest = path.join(MOVIES_DIR, `${baseTarget}_${counter}.mp4`);
+                    counter++;
+                }
+                fs.renameSync(scaledPathTemp, finalDest);
+                const moviesJson = loadMoviesJSON();
+                const baseName = path.basename(finalDest);
+                let uploaderUid = null;
+                try {
+                    const metaPath = path.join(APPLY_DIR, movieName + ".json");
+                    if (fs.existsSync(metaPath)) {
+                        const meta = JSON.parse(fs.readFileSync(metaPath));
+                        uploaderUid = meta.uid || meta.uploadedBy || null;
+                        fs.unlinkSync(metaPath);
+                    }
+                    if (uploaderUid && uploaderUid !== "unknown") {
+                        try { updateDataPath(`users/${uploaderUid}/profile`, { isUploader: true }); } catch {}
+                        try {
+                            const currentUploads = readDataPath(`users/${uploaderUid}/profile/uploads`);
+                            updateDataPath(`users/${uploaderUid}/profile`, { uploads: (typeof currentUploads === "number" ? currentUploads : 0) + 1 });
+                        } catch {}
+                    }
+                } catch {}
+                const idBasename = path.basename(finalDest, ".mp4");
+                const cleanName = idBasename.replace(/_\d+$/, "");
+                const tmdbData = await findMovieId(cleanName);
+                if (!moviesJson[baseName]) {
+                    moviesJson[baseName] = { order: getNextOrder(moviesJson), uploadedBy: uploaderUid, db_id: tmdbData.id || null, cover: tmdbData.cover || null, rating: tmdbData.rating || null };
+                    saveMoviesJSON(moviesJson);
+                }
+                acceptStatus.set(movieName, { status: "completed", percent: 100, remainingSec: 0, message: "Completed", updated: Date.now() });
+                await finishAccept(movieName);
+            } catch (err) {
+                console.error(`[AcceptResume] Resumed Accept Failed For ${movieName}:`, err.message);
+                acceptStatus.set(movieName, { status: "error", percent: 0, remainingSec: null, message: err.message || "Unknown Error", updated: Date.now() });
+            }
+        })();
+    }
+}
 async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, inputPath, outputPath, knownDuration, ffmpegArgs, humanLabel ) {
     return new Promise((resolve, reject) => {
         socket.emit("jobLog", { filename: filenameLabel, text: `${humanLabel} — Starting` });
@@ -3278,6 +3437,8 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
         const ff = spawn("ffmpeg", args, { stdio: ["ignore", "pipe", "pipe"] });
         let stdoutBuf = "";
         let stderrBuf = "";
+        let lastSaveTime = Date.now();
+        const SAVE_INTERVAL_MS = 15 * 60 * 1000;
         ff.stdout.on("data", (chunk) => {
             stdoutBuf += chunk.toString();
             const lines = stdoutBuf.split(/\r?\n/);
@@ -3317,6 +3478,19 @@ async function runFfmpegWithProgress(socket, workId, statusKey, filenameLabel, i
                         remainingSec: Math.round(remainingSec),
                         text: `${humanLabel}: ${pct}% — ETA ${etaText}`
                     });
+                    const now = Date.now();
+                    if (now - lastSaveTime >= SAVE_INTERVAL_MS) {
+                        lastSaveTime = now;
+                        const discordMessageId = applicantMessages.get(statusKey) || null;
+                        saveAcceptResume(statusKey, {
+                            movieName: statusKey,
+                            discordMessageId,
+                            percent: pct,
+                            status: humanLabel,
+                            lastKnownEta: Math.round(remainingSec),
+                            savedAt: now
+                        });
+                    }
                 }
             });
         });
@@ -3599,14 +3773,14 @@ async function sendVerificationNotification(uid, displayName) {
         data: { type: "verifyUser", uid, displayName }
     });
 }
-async function startAcceptProcess(movieName) {
+async function startAcceptProcess(movieName, existingMessageId = null) {
     updateApply(movieName, {
         status: "Copying",
         percent: 0,
         eta: null
     });
-    const oldMsgId = applicantMessages.get(movieName);
-    if (oldMsgId) {
+    const oldMsgId = existingMessageId || applicantMessages.get(movieName);
+    if (oldMsgId && !existingMessageId) {
         await discordRequest({
             method: "delete",
             url: `https://discord.com/api/v10/channels/${logid}/messages/${oldMsgId}`
@@ -3621,14 +3795,43 @@ async function startAcceptProcess(movieName) {
             { name: "Time Left", value: "Calculating...", inline: false }
         ]
     };
-    const msg = await discordRequest({
-        method: "post",
-        url: `https://discord.com/api/v10/channels/${logid}/messages`,
-        data: { embeds: [embed] },
-        headers: { "Content-Type": "application/json" }
-    });
-    const messageId = msg.data.id;
+    let messageId = existingMessageId;
+    if (!messageId) {
+        const msg = await discordRequest({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${logid}/messages`,
+            data: { embeds: [embed] },
+            headers: { "Content-Type": "application/json" }
+        });
+        messageId = msg.data.id;
+    } else {
+        try {
+            await discordRequest({
+                method: "patch",
+                url: `https://discord.com/api/v10/channels/${logid}/messages/${messageId}`,
+                data: { embeds: [embed] },
+                headers: { "Content-Type": "application/json" }
+            });
+        } catch (e) {
+            console.warn(`[AcceptResume] Could Not Patch Existing Discord Message, Posting New:`, e.message);
+            const msg = await discordRequest({
+                method: "post",
+                url: `https://discord.com/api/v10/channels/${logid}/messages`,
+                data: { embeds: [embed] },
+                headers: { "Content-Type": "application/json" }
+            });
+            messageId = msg.data.id;
+        }
+    }
     applicantMessages.set(movieName, messageId);
+    saveAcceptResume(movieName, {
+        movieName,
+        discordMessageId: messageId,
+        percent: 0,
+        status: "Copying",
+        lastKnownEta: null,
+        savedAt: Date.now()
+    });
     if (acceptIntervals.has(movieName)) clearInterval(acceptIntervals.get(movieName));
     const interval = setInterval(async () => {
         const status = acceptStatus.get(movieName);
@@ -3677,6 +3880,7 @@ async function syncDiscordHistory(channelName, discordChannelId) {
     if (!data.messages[channelName]) data.messages[channelName] = {};
     const existing = data.messages[channelName];
     const existingTs = new Set(Object.keys(existing).map(Number));
+    let mirrorIdsDirty = false;
     for (const [ts, entry] of Object.entries(existing)) {
         if (entry?._discordId) {
             discordMsgIdToTimestamp[entry._discordId] = {
@@ -3684,6 +3888,15 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 timestamp: Number(ts)
             };
         }
+        if (entry?._discordMirrorId) {
+            setMirrorId(channelName, ts, entry._discordMirrorId);
+            delete entry._discordMirrorId;
+            data.messages[channelName][ts] = entry;
+            mirrorIdsDirty = true;
+        }
+    }
+    if (mirrorIdsDirty) {
+        saveData(data);
     }
     const state = discordBridgeState[channelName] || {};
     if (state.synced) return;
@@ -3715,6 +3928,19 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 };
                 continue;
             }
+            if (botSentDiscordIds.has(discordMsg.id)) {
+                discordMsgIdToTimestamp[discordMsg.id] = { channel: channelName, timestamp: ts };
+                const _syncMsgs = data?.messages?.[channelName] || {};
+                for (const [wts, wEntry] of Object.entries(_syncMsgs)) {
+                    if (wEntry?._discordMirrorId === String(discordMsg.id)) {
+                        setMirrorId(channelName, wts, discordMsg.id);
+                        mirrorIdsDirty = true;
+                        break;
+                    }
+                }
+                existingTs.add(ts);
+                continue;
+            }
             if (!discordMsg.content && !discordMsg.embeds?.length && !discordMsg.attachments?.length) {
                 continue;
             }
@@ -3739,8 +3965,17 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 }
             }
             let embedHtml = "";
-            for (const embed of (discordMsg.embeds || [])) {
-                embedHtml += serializeDiscordEmbed(embed);
+            const validEmbeds = (discordMsg.embeds || []).filter(e => {
+                if (!e) return false;
+                const t = (e.type || "").toLowerCase();
+                if (t === "image" || t === "gifv" || t === "video") return false;
+                const url = e.url || e.thumbnail?.url || "";
+                if (/\.(gif|png|jpg|jpeg|webp)([\?#]|$)/i.test(url)) return false;
+                if (/youtube\.com|youtu\.be|tiktok\.com|tenor\.com/i.test(url)) return false;
+                return true;
+            });
+            if (validEmbeds.length > 0) {
+                embedHtml = serializeDiscordEmbed(validEmbeds[0]);
             }
             const fullContent = content
                 + (attachmentHtml ? (content ? "\n" + attachmentHtml : attachmentHtml) : "")
@@ -3763,7 +3998,22 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 _discordId: discordMsg.id
             };
             if (discordMsg.referenced_message) {
-                entry.r = discordMsgToTimestamp(discordMsg.referenced_message.id);
+                const refTs = discordMsgToTimestamp(discordMsg.referenced_message.id);
+                let resolvedReplyTs = refTs;
+                const refEntry = data?.messages?.[channelName]?.[String(refTs)];
+                const refMirrorId = getMirrorId(channelName, refTs);
+                if (refEntry && refMirrorId) {
+                    resolvedReplyTs = refTs;
+                } else if (!refEntry) {
+                    const msgs = data?.messages?.[channelName] || {};
+                    for (const [wts] of Object.entries(msgs)) {
+                        if (getMirrorId(channelName, wts) === String(discordMsg.referenced_message.id)) {
+                            resolvedReplyTs = Number(wts);
+                            break;
+                        }
+                    }
+                }
+                entry.r = resolvedReplyTs;
             }
             if (discordMsg.edited_timestamp) {
                 entry.e = "edited";
@@ -3863,6 +4113,13 @@ function archiveReport() {
     }
     saveReportJSON({ report: {} });
 }
+function blockDiscordIfDisabled(req, res, next) {
+    let DISCORD_DISABLED = false;
+    if (DISCORD_DISABLED) {
+        return res.status(403).json({ error: "Discord integration disabled" });
+    }
+    next();
+}
 function broadcastUpdate(changedPath, newValue) {
     for (const [ws, clientInfo] of wsClients.entries()) {
         if (ws.readyState !== ws.OPEN) continue;
@@ -3929,6 +4186,14 @@ function clearCompletedApplies() {
         console.error("Failed To Clear Completed Applies:", err);
     }
 }
+function deleteAcceptResume(movieName) {
+    try {
+        const resumePath = path.join(MOVIE_ACCEPTS_DIR, sanitize(movieName) + ".resume.json");
+        if (fs.existsSync(resumePath)) fs.unlinkSync(resumePath);
+    } catch (e) {
+        console.error(`[AcceptResume] Failed To Delete Resume For ${movieName}:`, e.message);
+    }
+}
 function deleteApply(movieName) {
     const data = loadApplyJSON();
     delete data[movieName];
@@ -3947,6 +4212,9 @@ function deleteFilePrompt() {
         }
         mainMenu();
     });
+}
+function deleteMirrorId(channelName, timestamp) {
+    delete mirrorIdMap[`${channelName}:${timestamp}`];
 }
 function discordMsgToTimestamp(snowflakeId) {
     return Number((BigInt(snowflakeId) >> 22n) + 1420070400000n);
@@ -4115,6 +4383,17 @@ function getDataCache() {
 function getIP(req) {
     return req.headers["x-forwarded-for"]?.split(",")[0] || req.socket?.remoteAddress || "unknown";
 }
+function getMirrorId(channelName, timestamp) {
+    const key = `${channelName}:${timestamp}`;
+    if (mirrorIdMap[key]) return mirrorIdMap[key];
+    const data = getDataCache();
+    const entry = data?.messages?.[channelName]?.[String(timestamp)];
+    if (entry?._discordMirrorId) {
+        mirrorIdMap[key] = String(entry._discordMirrorId);
+        return mirrorIdMap[key];
+    }
+    return null;
+}
 function getNextOrder(moviesJson) {
     const orders = Object.values(moviesJson).map(m => m.order);
     if (orders.length === 0) return 1;
@@ -4220,6 +4499,23 @@ function listMovies() {
 }
 function loadAccLogs() {
     return JSON.parse(fs.readFileSync(ACCLOGS_PATH, "utf8") || "{}");
+}
+function loadAllAcceptResumes() {
+    try {
+        if (!fs.existsSync(MOVIE_ACCEPTS_DIR)) return [];
+        return fs.readdirSync(MOVIE_ACCEPTS_DIR)
+            .filter(f => f.endsWith(".resume.json"))
+            .map(f => {
+                try {
+                    const raw = fs.readFileSync(path.join(MOVIE_ACCEPTS_DIR, f), "utf8");
+                    return JSON.parse(raw);
+                } catch { return null; }
+            })
+            .filter(Boolean);
+    } catch (e) {
+        console.error("[AcceptResume] Failed To Load Resumes:", e.message);
+        return [];
+    }
 }
 function loadApplyJSON() {
     let data = {};
@@ -4481,6 +4777,14 @@ function safeName(original) {
     const ts = Date.now();
     return `${base}_${ts}${ext || ".mp4"}`;
 }
+function saveAcceptResume(movieName, data) {
+    try {
+        const resumePath = path.join(MOVIE_ACCEPTS_DIR, sanitize(movieName) + ".resume.json");
+        fs.writeFileSync(resumePath, JSON.stringify(data, null, 2), "utf8");
+    } catch (e) {
+        console.error(`[AcceptResume] Failed To Save Resume For ${movieName}:`, e.message);
+    }
+}
 function saveAccLogs(data) {
     fs.writeFileSync(ACCLOGS_PATH, JSON.stringify(data, null, 2));
 }
@@ -4582,6 +4886,20 @@ function serializeDiscordEmbed(embed) {
     html += `</div>`;
     const b64 = Buffer.from(html).toString("base64");
     return `<discord-embed-b64 data="${b64}"></discord-embed-b64>`;
+}
+function setMirrorId(channelName, timestamp, discordMirrorId) {
+    mirrorIdMap[`${channelName}:${timestamp}`] = String(discordMirrorId);
+    try {
+        const data = getDataCache();
+        const entry = data?.messages?.[channelName]?.[String(timestamp)];
+        if (entry) {
+            entry._discordMirrorId = String(discordMirrorId);
+            data.messages[channelName][String(timestamp)] = entry;
+            saveData(data);
+        }
+    } catch (e) {
+        console.error("[setMirrorId] Failed to persist _discordMirrorId to data.json:", e.message);
+    }
 }
 function setupSocketHandlers(ioInstance, label) {
     ioInstance.on("connection", (socket) => {
@@ -4867,8 +5185,17 @@ function startDiscordGateway() {
                 const content = baseContent
                     + (gatewayAttachmentHtml ? (baseContent ? "\n" + gatewayAttachmentHtml : gatewayAttachmentHtml) : "");
                 let gatewayEmbedHtml = "";
-                for (const embed of (d.embeds || [])) {
-                    gatewayEmbedHtml += serializeDiscordEmbed(embed);
+                const validGatewayEmbeds = (d.embeds || []).filter(e => {
+                    if (!e) return false;
+                    const t = (e.type || "").toLowerCase();
+                    if (t === "image" || t === "gifv" || t === "video") return false;
+                    const url = e.url || e.thumbnail?.url || "";
+                    if (/\.(gif|png|jpg|jpeg|webp)([\?#]|$)/i.test(url)) return false;
+                    if (/youtube\.com|youtu\.be|tiktok\.com|tenor\.com/i.test(url)) return false;
+                    return true;
+                });
+                if (validGatewayEmbeds.length > 0) {
+                    gatewayEmbedHtml = serializeDiscordEmbed(validGatewayEmbeds[0]);
                 }
                 const fullContent = content + (gatewayEmbedHtml ? (content ? "\n" + gatewayEmbedHtml : gatewayEmbedHtml) : "");
                 if (!fullContent) return;
@@ -4884,9 +5211,39 @@ function startDiscordGateway() {
                     _discordId: d.id,
                 };
                 if (d.referenced_message) {
-                    entry.r = discordMsgToTimestamp(d.referenced_message.id);
+                    const refTs = discordMsgToTimestamp(d.referenced_message.id);
+                    let resolvedReplyTs = refTs;
+                    try {
+                        const cachedData = getDataCache();
+                        const refEntry = cachedData?.messages?.[channelName]?.[String(refTs)];
+                        const refMirrorId = getMirrorId(channelName, refTs);
+                        if (refEntry && refMirrorId) {
+                            resolvedReplyTs = refTs;
+                        } else if (!refEntry) {
+                            const msgs = cachedData?.messages?.[channelName] || {};
+                            for (const [wts] of Object.entries(msgs)) {
+                                if (getMirrorId(channelName, wts) === String(d.referenced_message.id)) {
+                                    resolvedReplyTs = Number(wts);
+                                    break;
+                                }
+                            }
+                        }
+                    } catch {}
+                    entry.r = resolvedReplyTs;
                 }
                 console.log(channelName);
+                if (botSentDiscordIds.has(d.id)) {
+                    discordMsgIdToTimestamp[d.id] = { channel: channelName, timestamp: ts };
+                    const _mirrorData = getDataCache();
+                    const _mirrorMsgs = _mirrorData?.messages?.[channelName] || {};
+                    for (const [wts, wEntry] of Object.entries(_mirrorMsgs)) {
+                        if (wEntry?._discordMirrorId === String(d.id)) {
+                            setMirrorId(channelName, wts, d.id);
+                            break;
+                        }
+                    }
+                    return;
+                }
                 writeDiscordMsgToData(channelName, d.id, entry, ts);
                 if (d.referenced_message) {
                     try {
@@ -5262,4 +5619,5 @@ watchForNewUsers();
         startDiscordGateway()
         discordGatewayActive = true;
     }
+    await resumeInProgressAccepts();
 })();
