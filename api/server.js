@@ -23,6 +23,7 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
+import { trackAttachmentsForMessage, untrackAttachmentsForMessage, startAttachmentRefreshLoop } from "./attachmentTracker.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -4025,6 +4026,7 @@ async function syncDiscordHistory(channelName, discordChannelId) {
             };
             existingTs.add(ts);
             totalNew++;
+            trackAttachmentsForMessage(channelName, ts, discordMsg.id, entry.t || "");
         }
         if (messages.length < 100) {
             fetchMore = false;
@@ -5300,6 +5302,7 @@ function startDiscordGateway() {
                     broadcastUpdate(["messages", channelName, String(ref.timestamp)], null);
                 }
                 delete discordMsgIdToTimestamp[d.id];
+                untrackAttachmentsForMessage(channelName, ref.timestamp);
             }
         });
         ws.on("close", (code) => {
@@ -5391,6 +5394,7 @@ function writeDiscordMsgToData(channelName, discordMsgId, entry, ts) {
     saveData(data);
     discordMsgIdToTimestamp[discordMsgId] = { channel: channelName, timestamp: ts };
     broadcastUpdate(["messages", channelName, String(ts)], entryWithTs);
+    trackAttachmentsForMessage(channelName, ts, discordMsgId, entry.t || "");
 }
 setInterval(async () => {
     let processed = 0;
@@ -5620,4 +5624,5 @@ watchForNewUsers();
         discordGatewayActive = true;
     }
     await resumeInProgressAccepts();
+    startAttachmentRefreshLoop({ discordRequestForce, getDataCache, saveData, broadcastUpdate });
 })();
