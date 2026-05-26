@@ -23,7 +23,7 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
-import { trackAttachmentsForMessage, untrackAttachmentsForMessage, startAttachmentRefreshLoop } from "./attachmentTracker.js";
+import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop } from "./attachmentTracker.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -4027,6 +4027,9 @@ async function syncDiscordHistory(channelName, discordChannelId) {
             existingTs.add(ts);
             totalNew++;
             trackAttachmentsForMessage(channelName, ts, discordMsg.id, entry.t || "");
+            if (attachments.length > 0) {
+                trackDiscordAttachments(channelName, ts, discordMsg.id, attachments);
+            }
         }
         if (messages.length < 100) {
             fetchMore = false;
@@ -5247,6 +5250,9 @@ function startDiscordGateway() {
                     return;
                 }
                 writeDiscordMsgToData(channelName, d.id, entry, ts);
+                if (gatewayAttachments.length > 0) {
+                    trackDiscordAttachments(channelName, ts, d.id, gatewayAttachments);
+                }
                 if (d.referenced_message) {
                     try {
                         const refTs = discordMsgToTimestamp(d.referenced_message.id);

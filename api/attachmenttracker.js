@@ -26,7 +26,14 @@ function saveAttachments(data) {
 function parseCdnUrl(url) {
     try {
         const parsed = new URL(url);
-        if (!parsed.hostname.includes("discordapp.com") && !parsed.hostname.includes("discord.com")) return null;
+        const host = parsed.hostname;
+        const isDiscordCdn =
+            host === "cdn.discordapp.com" ||
+            host === "media.discordapp.net" ||
+            host.endsWith(".discordapp.com") ||
+            host.endsWith(".discordapp.net") ||
+            host.endsWith(".discord.com");
+        if (!isDiscordCdn) return null;
         const parts = parsed.pathname.split("/").filter(Boolean);
         if (parts[0] !== "attachments" || parts.length < 4) return null;
         const channelId = parts[1];
@@ -50,7 +57,10 @@ function extractCdnUrlsFromContent(content) {
     while ((match = regex.exec(content)) !== null) {
         try {
             const decoded = decodeURIComponent(match[1]);
-            if (decoded.includes("cdn.discordapp.com/attachments/")) {
+            if (
+                decoded.includes("cdn.discordapp.com/attachments/") ||
+                decoded.includes("media.discordapp.net/attachments/")
+            ) {
                 urls.push(decoded);
             }
         } catch {}
@@ -87,6 +97,38 @@ export function trackAttachmentsForMessage(websiteChannel, msgTimestamp, discord
     if (dirty) {
         saveAttachments(attachments);
         console.log(`[AttachmentTracker] Tracked ${cdnUrls.length} attachment(s) for msg ${discordMsgId} in #${websiteChannel}`);
+    }
+}
+/**
+ * @param {string} websiteChannel
+ * @param {number} msgTimestamp
+ * @param {string} discordMsgId
+ * @param {Array<{url: string, proxy_url?: string, filename?: string}>} discordAttachments
+ */
+export function trackDiscordAttachments(websiteChannel, msgTimestamp, discordMsgId, discordAttachments) {
+    if (!discordMsgId || !Array.isArray(discordAttachments) || discordAttachments.length === 0) return;
+    const attachments = loadAttachments();
+    let count = 0;
+    for (const att of discordAttachments) {
+        const rawUrl = att.url || att.proxy_url || "";
+        if (!rawUrl) continue;
+        const parsed = parseCdnUrl(rawUrl);
+        if (!parsed) continue;
+        const filename = att.filename || parsed.filename;
+        attachments[rawUrl] = {
+            discordMsgId,
+            channelId:      parsed.channelId,
+            filename,
+            expiresAt:      parsed.expiresAt,
+            websiteChannel,
+            msgTimestamp:   Number(msgTimestamp),
+            rawUrl,
+        };
+        count++;
+    }
+    if (count > 0) {
+        saveAttachments(attachments);
+        console.log(`[AttachmentTracker] Tracked ${count} raw attachment(s) for msg ${discordMsgId} in #${websiteChannel}`);
     }
 }
 /**
