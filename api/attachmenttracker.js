@@ -56,12 +56,13 @@ function extractCdnUrlsFromContent(content) {
     let match;
     while ((match = regex.exec(content)) !== null) {
         try {
-            const decoded = decodeURIComponent(match[1]);
+            const encodedInContent = match[1];
+            const decoded = decodeURIComponent(encodedInContent);
             if (
                 decoded.includes("cdn.discordapp.com/attachments/") ||
                 decoded.includes("media.discordapp.net/attachments/")
             ) {
-                urls.push(decoded);
+                urls.push({ decoded, encodedInContent });
             }
         } catch {}
     }
@@ -79,7 +80,7 @@ export function trackAttachmentsForMessage(websiteChannel, msgTimestamp, discord
     if (cdnUrls.length === 0) return;
     const attachments = loadAttachments();
     let dirty = false;
-    for (const rawUrl of cdnUrls) {
+    for (const { decoded: rawUrl } of cdnUrls) {
         const parsed = parseCdnUrl(rawUrl);
         if (!parsed) continue;
         const key = rawUrl;
@@ -174,7 +175,7 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
             if (cdnUrls.length === 0) continue;
             const discordMsgId = msgEntry._discordId;
             if (!discordMsgId) continue;
-            for (const rawUrl of cdnUrls) {
+            for (const { decoded: rawUrl, encodedInContent } of cdnUrls) {
                 const parsed = parseCdnUrl(rawUrl);
                 if (!parsed) continue;
                 const { channelId, filename } = parsed;
@@ -185,10 +186,10 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
                         discordMsgId,
                         websiteChannel,
                         msgTimestamp: Number(msgTimestamp),
-                        urls: new Map(), // rawUrl -> filename
+                        urls: new Map(), 
                     });
                 }
-                byMsg.get(msgKey).urls.set(rawUrl, filename);
+                byMsg.get(msgKey).urls.set(rawUrl, { filename, encodedInContent });
             }
         }
     }
@@ -227,7 +228,7 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
         if (!msgEntry) continue;
         let updatedContent = msgEntry.t || "";
         let contentChanged = false;
-        for (const [rawUrl, filename] of urls.entries()) {
+        for (const [rawUrl, { filename }] of urls.entries()) {
             const freshAtt =
                 freshAttachments.find(a => {
                     const fname = (a.filename || "").split("?")[0];
@@ -236,12 +237,17 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
             if (!freshAtt) continue;
             const freshUrl = freshAtt.url || freshAtt.proxy_url;
             if (!freshUrl) continue;
-            const oldEncoded = encodeURIComponent(rawUrl);
             const newEncoded = encodeURIComponent(freshUrl);
-            if (updatedContent.includes(oldEncoded) && oldEncoded !== newEncoded) {
-                updatedContent = updatedContent.split(oldEncoded).join(newEncoded);
-                contentChanged = true;
-            }
+            const pathKey = encodeURIComponent(rawUrl.split("?")[0]);
+            const proxyParamRegex = new RegExp(
+                `(\/discord-media-proxy\?url=)(${pathKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\s>]*)`,
+                "g"
+            );
+            const before = updatedContent;
+            updatedContent = updatedContent.replace(proxyParamRegex, (_, prefix, _oldEncoded) => {
+                return prefix + newEncoded;
+            });
+            if (updatedContent !== before) contentChanged = true;
             const parsedFresh = parseCdnUrl(freshUrl);
             attachments[freshUrl] = {
                 discordMsgId,
