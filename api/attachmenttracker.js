@@ -172,10 +172,12 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
             if (!content || typeof content !== "string") continue;
             const cdnUrls = extractCdnUrlsFromContent(content);
             if (cdnUrls.length === 0) continue;
+            const discordMsgId = msgEntry._discordId;
+            if (!discordMsgId) continue;
             for (const rawUrl of cdnUrls) {
                 const parsed = parseCdnUrl(rawUrl);
                 if (!parsed) continue;
-                const { channelId, messageId: discordMsgId, filename } = parsed;
+                const { channelId, filename } = parsed;
                 const msgKey = `${channelId}:${discordMsgId}`;
                 if (!byMsg.has(msgKey)) {
                     byMsg.set(msgKey, {
@@ -183,14 +185,13 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
                         discordMsgId,
                         websiteChannel,
                         msgTimestamp: Number(msgTimestamp),
-                        urls: new Map(),
+                        urls: new Map(), // rawUrl -> filename
                     });
                 }
                 byMsg.get(msgKey).urls.set(rawUrl, filename);
             }
         }
     }
-
     if (byMsg.size === 0) {
         console.log("[AttachmentTracker] No attachment URLs found in existing messages.");
         return;
@@ -208,10 +209,19 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
             });
             freshAttachments = resp?.data?.attachments || [];
         } catch (e) {
-            console.error(`[AttachmentTracker] Startup scan: failed to fetch Discord msg ${discordMsgId}:`, e.message);
+            const status = e?.response?.status ?? e?.status ?? null;
+            if (status === 404) {
+                console.warn(`[AttachmentTracker] Startup scan: Discord msg ${discordMsgId} not found (deleted); removing stale entries.`);
+                for (const rawUrl of urls.keys()) delete attachments[rawUrl];
+            } else {
+                console.error(`[AttachmentTracker] Startup scan: failed to fetch Discord msg ${discordMsgId} (status ${status}):`, e.message);
+            }
             continue;
         }
-        if (freshAttachments.length === 0) continue;
+        if (freshAttachments.length === 0) {
+            for (const rawUrl of urls.keys()) delete attachments[rawUrl];
+            continue;
+        }
         const liveData = getDataCache();
         const msgEntry = liveData?.messages?.[websiteChannel]?.[String(msgTimestamp)];
         if (!msgEntry) continue;
@@ -223,7 +233,6 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
                     const fname = (a.filename || "").split("?")[0];
                     return fname === filename;
                 }) || freshAttachments[0];
-
             if (!freshAtt) continue;
             const freshUrl = freshAtt.url || freshAtt.proxy_url;
             if (!freshUrl) continue;
@@ -295,7 +304,13 @@ export function startAttachmentRefreshLoop({ discordRequestForce, getDataCache, 
                 });
                 freshAttachments = resp?.data?.attachments || [];
             } catch (e) {
-                console.error(`[AttachmentTracker] Failed to refresh Discord msg ${discordMsgId}:`, e.message);
+                const status = e?.response?.status ?? e?.status ?? null;
+                if (status === 404) {
+                    console.warn(`[AttachmentTracker] Discord msg ${discordMsgId} not found (deleted); removing stale entries.`);
+                    for (const { key } of items) delete attachments[key];
+                } else {
+                    console.error(`[AttachmentTracker] Failed to refresh Discord msg ${discordMsgId} (status ${status}):`, e.message);
+                }
                 continue;
             }
             if (freshAttachments.length === 0) {
