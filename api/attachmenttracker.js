@@ -156,6 +156,114 @@ export function untrackAttachmentsForMessage(websiteChannel, msgTimestamp) {
  * @param {Function} deps.saveData
  * @param {Function} deps.broadcastUpdate
  */
+export async function scanAndRefreshExistingAttachments({ discordRequestForce, getDataCache, saveData, broadcastUpdate }) {
+    console.log("[AttachmentTracker] Scanning existing messages for attachment URLs to refresh...");
+    const data = getDataCache();
+    const messagesRoot = data?.messages;
+    if (!messagesRoot || typeof messagesRoot !== "object") {
+        console.log("[AttachmentTracker] No messages found in data cache; skipping startup scan.");
+        return;
+    }
+    const byMsg = new Map();
+    for (const [websiteChannel, channelMsgs] of Object.entries(messagesRoot)) {
+        if (!channelMsgs || typeof channelMsgs !== "object") continue;
+        for (const [msgTimestamp, msgEntry] of Object.entries(channelMsgs)) {
+            const content = msgEntry?.t;
+            if (!content || typeof content !== "string") continue;
+            const cdnUrls = extractCdnUrlsFromContent(content);
+            if (cdnUrls.length === 0) continue;
+            for (const rawUrl of cdnUrls) {
+                const parsed = parseCdnUrl(rawUrl);
+                if (!parsed) continue;
+                const { channelId, messageId: discordMsgId, filename } = parsed;
+                const msgKey = `${channelId}:${discordMsgId}`;
+                if (!byMsg.has(msgKey)) {
+                    byMsg.set(msgKey, {
+                        channelId,
+                        discordMsgId,
+                        websiteChannel,
+                        msgTimestamp: Number(msgTimestamp),
+                        urls: new Map(),
+                    });
+                }
+                byMsg.get(msgKey).urls.set(rawUrl, filename);
+            }
+        }
+    }
+
+    if (byMsg.size === 0) {
+        console.log("[AttachmentTracker] No attachment URLs found in existing messages.");
+        return;
+    }
+    console.log(`[AttachmentTracker] Found ${byMsg.size} Discord message(s) with attachments to refresh.`);
+    const attachments = loadAttachments();
+    let totalRefreshed = 0;
+    let totalChanged = 0;
+    for (const [, { channelId, discordMsgId, websiteChannel, msgTimestamp, urls }] of byMsg.entries()) {
+        let freshAttachments;
+        try {
+            const resp = await discordRequestForce({
+                method: "get",
+                url: `https://discord.com/api/v10/channels/${channelId}/messages/${discordMsgId}`,
+            });
+            freshAttachments = resp?.data?.attachments || [];
+        } catch (e) {
+            console.error(`[AttachmentTracker] Startup scan: failed to fetch Discord msg ${discordMsgId}:`, e.message);
+            continue;
+        }
+        if (freshAttachments.length === 0) continue;
+        const liveData = getDataCache();
+        const msgEntry = liveData?.messages?.[websiteChannel]?.[String(msgTimestamp)];
+        if (!msgEntry) continue;
+        let updatedContent = msgEntry.t || "";
+        let contentChanged = false;
+        for (const [rawUrl, filename] of urls.entries()) {
+            const freshAtt =
+                freshAttachments.find(a => {
+                    const fname = (a.filename || "").split("?")[0];
+                    return fname === filename;
+                }) || freshAttachments[0];
+
+            if (!freshAtt) continue;
+            const freshUrl = freshAtt.url || freshAtt.proxy_url;
+            if (!freshUrl) continue;
+            const oldEncoded = encodeURIComponent(rawUrl);
+            const newEncoded = encodeURIComponent(freshUrl);
+            if (updatedContent.includes(oldEncoded) && oldEncoded !== newEncoded) {
+                updatedContent = updatedContent.split(oldEncoded).join(newEncoded);
+                contentChanged = true;
+            }
+            const parsedFresh = parseCdnUrl(freshUrl);
+            attachments[freshUrl] = {
+                discordMsgId,
+                channelId,
+                filename: freshAtt.filename || filename,
+                expiresAt: parsedFresh?.expiresAt || null,
+                websiteChannel,
+                msgTimestamp,
+                rawUrl: freshUrl,
+            };
+            if (freshUrl !== rawUrl) delete attachments[rawUrl];
+            totalRefreshed++;
+        }
+        if (contentChanged) {
+            msgEntry.t = updatedContent;
+            liveData.messages[websiteChannel][String(msgTimestamp)] = msgEntry;
+            saveData(liveData);
+            broadcastUpdate(["messages", websiteChannel, String(msgTimestamp)], msgEntry);
+            totalChanged++;
+        }
+    }
+    saveAttachments(attachments);
+    console.log(`[AttachmentTracker] Startup scan complete: refreshed ${totalRefreshed} URL(s) across ${totalChanged} message(s).`);
+}
+/**
+ * @param {object} deps
+ * @param {Function} deps.discordRequestForce
+ * @param {Function} deps.getDataCache
+ * @param {Function} deps.saveData
+ * @param {Function} deps.broadcastUpdate
+ */
 export function startAttachmentRefreshLoop({ discordRequestForce, getDataCache, saveData, broadcastUpdate }) {
     console.log("[AttachmentTracker] Starting attachment refresh loop");
     async function refreshExpired() {

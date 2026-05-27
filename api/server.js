@@ -23,7 +23,7 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
-import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop } from "./attachmentTracker.js";
+import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments } from "./attachmentTracker.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -5630,5 +5630,6 @@ watchForNewUsers();
         discordGatewayActive = true;
     }
     await resumeInProgressAccepts();
+    await scanAndRefreshExistingAttachments({ discordRequestForce, getDataCache, saveData, broadcastUpdate });
     startAttachmentRefreshLoop({ discordRequestForce, getDataCache, saveData, broadcastUpdate });
 })();
