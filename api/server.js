@@ -178,6 +178,8 @@ const _rateLimitStore = new Map();
 const READY_DIR = path.join(__dirname, "ready");
 const REPORT_JSON = path.join(__dirname, "report.json");
 const resend = new Resend(process.env.RESEND_API_KEY);
+let _restrictedWordsCache = null;
+const RESTRICTED_WORDS_PATH = path.join(__dirname, "restrictedwords.json");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ROUTES = {
     UPLOAD: `/api/upload_apply_${UNIQUE_SUFFIX}`,
@@ -402,6 +404,36 @@ app.all("/admin/modify-data", verifyFirebaseToken, async (req, res) => {
         return res.status(405).json({ error: "Method Not Allowed" });
     } catch (err) {
         console.error("modify-data error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
+app.all("/admin/modify-restricted-words", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isHAdmin || profile.isDev)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        if (req.method === "GET") {
+            if (!fs.existsSync(RESTRICTED_WORDS_PATH)) {
+                fs.writeFileSync(RESTRICTED_WORDS_PATH, JSON.stringify({}, null, 2), "utf8");
+            }
+            const raw = fs.readFileSync(RESTRICTED_WORDS_PATH, "utf8");
+            return res.json({ words: JSON.parse(raw) });
+        }
+        if (req.method === "POST") {
+            const { words } = req.body;
+            if (!words || typeof words !== "object") {
+                return res.status(400).json({ error: "Missing or invalid words object" });
+            }
+            fs.writeFileSync(RESTRICTED_WORDS_PATH, JSON.stringify(words, null, 2), "utf8");
+            invalidateRestrictedWordsCache();
+            console.log(`[admin/modify-restricted-words] Saved by ${uid}`);
+            return res.json({ ok: true });
+        }
+        return res.status(405).json({ error: "Method Not Allowed" });
+    } catch (err) {
+        console.error("modify-restricted-words error:", err);
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
@@ -1186,6 +1218,77 @@ app.post("/admin/lockdown", (req, res) => {
     }
     console.log(`LOCKDOWN Is Now ${LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
     res.json({ lockdown: LOCKDOWN });
+});
+app.post("/admin/restart", verifyFirebaseToken, async (req, res) => {
+    try {
+        const pass = req.headers["x-admin-password"];
+        const validPasswords = [
+            process.env.ADMIN_PASSWORD,
+            process.env.ADMIN_PASSWORD_2,
+            process.env.YOYOMASTER,
+            process.env.NITRIX67
+        ];
+        if (!pass || !validPasswords.includes(pass)) {
+            return res.status(401).json({ error: "Unauthorized: Invalid Admin Password" });
+        }
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isTester)) {
+            return res.status(403).json({ error: "Forbidden: Owner Or Tester Role Required" });
+        }
+        const activeAccepts = [];
+        for (const [movieName, status] of acceptStatus.entries()) {
+            if (status.status === "running" || status.status === "copying" || status.status === "scaling") {
+                activeAccepts.push(movieName);
+            }
+        }
+        const runRestart = () => {
+            console.log(`[admin/restart] Running pm2 restart 0 (triggered by ${uid})`);
+            execProm("pm2 restart 0").catch(err => {
+                console.error("[admin/restart] pm2 restart 0 failed:", err.message);
+            });
+        };
+        if (activeAccepts.length > 0) {
+            let latestUpdated = 0;
+            for (const movieName of activeAccepts) {
+                const s = acceptStatus.get(movieName);
+                if (s && s.updated && s.updated > latestUpdated) {
+                    latestUpdated = s.updated;
+                }
+            }
+            const POLL_INTERVAL_MS = 10_000;
+            const POST_FINISH_DELAY_MS = 5 * 60 * 1000;
+            const pollAndRestart = () => {
+                const stillActive = activeAccepts.filter(name => {
+                    const s = acceptStatus.get(name);
+                    return s && (s.status === "running" || s.status === "copying" || s.status === "scaling");
+                });
+                if (stillActive.length === 0) {
+                    console.log(`[admin/restart] All accepts finished. Scheduling restart in 5 minutes.`);
+                    setTimeout(runRestart, POST_FINISH_DELAY_MS);
+                } else {
+                    setTimeout(pollAndRestart, POLL_INTERVAL_MS);
+                }
+            };
+            pollAndRestart();
+            return res.json({
+                ok: true,
+                status: "pending",
+                message: `${activeAccepts.length} movie(s) currently accepting (${activeAccepts.join(", ")}). Restart will run 5 minutes after they finish.`,
+                activeAccepts
+            });
+        } else {
+            runRestart();
+            return res.json({
+                ok: true,
+                status: "restarting",
+                message: "No active accepts found. Restarting pm2 process 0 now."
+            });
+        }
+    } catch (err) {
+        console.error("[admin/restart] Error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
 });
 app.post("/api/anon-name", (req, res) => {
     let { name, sessionToken } = req.body;
@@ -2378,6 +2481,14 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             if (msgText.length > 500) {
                 return res.status(400).json({ error: "Guest Messages Are Limited To 500 Characters." });
             }
+            const guestFilterResult = checkMessageForRestrictedWords(msgText, null);
+            if (guestFilterResult.blocked) {
+                return res.status(403).json({
+                    error: guestFilterResult.reason,
+                    blocked: true,
+                    blockedWord: guestFilterResult.word
+                });
+            }
             const ts = Date.now();
             const guestMsg = { u: anonName, t: msgText, sender: "anon" };
             if (value?.r) guestMsg.r = value.r;
@@ -2487,6 +2598,16 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 userProfile.isAdmin || userProfile.isHAdmin ||
                 userProfile.isTester
             );
+            if (!isAdminUser) {
+                const filterResult = checkMessageForRestrictedWords(msgText, userProfile);
+                if (filterResult.blocked) {
+                    return res.status(403).json({
+                        error: filterResult.reason,
+                        blocked: true,
+                        blockedWord: filterResult.word
+                    });
+                }
+            }
             if (!isAdminUser) {
                 const now = Date.now();
                 const lastSend = _msgSlowmodeStore.get(uid) || 0;
@@ -3316,15 +3437,38 @@ async function resumeInProgressAccepts() {
     if (resumes.length === 0) return;
     console.log(`[AcceptResume] Found ${resumes.length} In-Progress Accept(s) To Resume`);
     for (const resume of resumes) {
-        const { movieName, discordMessageId, percent, status, lastKnownEta } = resume;
+        const { movieName, discordMessageId, percent, status, lastKnownEta, stage, baseTarget, copyName, scaledName, duration: savedDuration } = resume;
         if (!movieName) continue;
         const srcPath = path.join(APPLY_DIR, movieName);
-        if (!fs.existsSync(srcPath)) {
-            console.warn(`[AcceptResume] Source File Missing For ${movieName}, Skipping Resume`);
+        const copyPath = copyName ? path.join(APPLY_DIR, copyName) : null;
+        const scaledPathTemp = scaledName ? path.join(APPLY_DIR, scaledName) : null;
+        const srcExists = fs.existsSync(srcPath);
+        const copyExists = copyPath && fs.existsSync(copyPath);
+        const scaledExists = scaledPathTemp && fs.existsSync(scaledPathTemp);
+        let resumeStage = null;
+        let resumeSrcPath = null;
+        let resumeCopyPath = copyPath;
+        let resumeScaledPathTemp = scaledPathTemp;
+        if (scaledExists) {
+            resumeStage = "scale";
+            resumeSrcPath = null;
+        } else if (copyExists) {
+            resumeStage = "scale";
+            resumeSrcPath = null;
+        } else if (srcExists) {
+            resumeStage = "copy";
+            resumeSrcPath = srcPath;
+        } else {
+            console.warn(`[AcceptResume] No Usable File Found For ${movieName} (checked src, copy, scaled), Skipping Resume`);
             deleteAcceptResume(movieName);
             continue;
         }
-        console.log(`[AcceptResume] Resuming Accept For: ${movieName} (Was ${percent ?? 0}% — ${status ?? "unknown"})`);
+        if (resumeStage === "scale" && (!resumeCopyPath || !resumeScaledPathTemp)) {
+            console.warn(`[AcceptResume] Resume For ${movieName} Is Missing Intermediate File Paths, Skipping`);
+            deleteAcceptResume(movieName);
+            continue;
+        }
+        console.log(`[AcceptResume] Resuming Accept For: ${movieName} at stage=${resumeStage} (Was ${percent ?? 0}% — ${status ?? "unknown"})`);
         if (discordMessageId) {
             applicantMessages.set(movieName, discordMessageId);
             try {
@@ -3363,39 +3507,44 @@ async function resumeInProgressAccepts() {
             await startAcceptProcess(movieName, discordMessageId);
             try {
                 fakeSocket.emit("jobLog", { filename: movieName, text: "Probing File For Duration..." });
-                const probeCmd = `ffprobe -v quiet -print_format json -show_format "${srcPath.replace(/"/g, '\\"')}"`;
-                let probeOut = "";
-                try {
-                    const { stdout } = await execProm(probeCmd);
-                    probeOut = stdout;
-                } catch (e) { probeOut = ""; }
-                let duration = 0;
-                try {
-                    const probeJson = probeOut ? JSON.parse(probeOut) : null;
-                    duration = parseFloat((probeJson?.format?.duration) || 0);
-                } catch { duration = 0; }
-                const baseTarget = sanitize(path.parse(movieName).name);
-                const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
-                const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
-                const copyPath = path.join(APPLY_DIR, copyName);
-                const scaledPathTemp = path.join(APPLY_DIR, scaledName);
+                let duration = savedDuration || 0;
+                if (!duration) {
+                    const probeTarget = (copyExists ? resumeCopyPath : (scaledExists ? resumeScaledPathTemp : resumeSrcPath));
+                    const probeCmd = `ffprobe -v quiet -print_format json -show_format "${probeTarget.replace(/"/g, '\\"')}"`;
+                    let probeOut = "";
+                    try {
+                        const { stdout } = await execProm(probeCmd);
+                        probeOut = stdout;
+                    } catch (e) { probeOut = ""; }
+                    try {
+                        const probeJson = probeOut ? JSON.parse(probeOut) : null;
+                        duration = parseFloat((probeJson?.format?.duration) || 0);
+                    } catch { duration = 0; }
+                }
+                const resolvedBaseTarget = baseTarget || sanitize(path.parse(movieName).name);
+                const resolvedCopyName = copyName || `${resolvedBaseTarget}_${Date.now()}_copy.mp4`;
+                const resolvedScaledName = scaledName || `${resolvedBaseTarget}_${Date.now()}_360.mp4`;
+                const resolvedCopyPath = copyPath || path.join(APPLY_DIR, resolvedCopyName);
+                const resolvedScaledPathTemp = scaledPathTemp || path.join(APPLY_DIR, resolvedScaledName);
                 const workId = `${movieName}_resumed_${Date.now()}`;
-                acceptStatus.set(movieName, { status: "copying", percent: 0, remainingSec: null, message: "Copying Container", updated: Date.now() });
-                await runFfmpegWithProgress(fakeSocket, workId, movieName, movieName, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container");
-                try { fs.unlinkSync(srcPath); } catch (e) {}
-                await new Promise(r => setTimeout(r, 500));
+                if (resumeStage === "copy") {
+                    acceptStatus.set(movieName, { status: "copying", percent: 0, remainingSec: null, message: "Copying Container", updated: Date.now() });
+                    await runFfmpegWithProgress(fakeSocket, workId, movieName, movieName, resumeSrcPath, resolvedCopyPath, duration, ["-y", "-i", resumeSrcPath, "-c", "copy", resolvedCopyPath], "Copying Container");
+                    try { fs.unlinkSync(resumeSrcPath); } catch (e) {}
+                    await new Promise(r => setTimeout(r, 500));
+                }
                 acceptStatus.set(movieName, { status: "scaling", percent: 0, remainingSec: null, message: "Scaling", updated: Date.now() });
-                await runFfmpegWithProgress(fakeSocket, workId, movieName, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360");
-                try { fs.unlinkSync(copyPath); } catch (e) {}
-                const finalFileName = `${baseTarget}.mp4`;
+                await runFfmpegWithProgress(fakeSocket, workId, movieName, resolvedCopyName, resolvedCopyPath, resolvedScaledPathTemp, duration, ["-y", "-i", resolvedCopyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", resolvedScaledPathTemp], "Scaling to 640x360");
+                try { fs.unlinkSync(resolvedCopyPath); } catch (e) {}
+                const finalFileName = `${resolvedBaseTarget}.mp4`;
                 const destination = path.join(MOVIES_DIR, finalFileName);
                 let finalDest = destination;
                 let counter = 1;
                 while (fs.existsSync(finalDest)) {
-                    finalDest = path.join(MOVIES_DIR, `${baseTarget}_${counter}.mp4`);
+                    finalDest = path.join(MOVIES_DIR, `${resolvedBaseTarget}_${counter}.mp4`);
                     counter++;
                 }
-                fs.renameSync(scaledPathTemp, finalDest);
+                fs.renameSync(resolvedScaledPathTemp, finalDest);
                 const moviesJson = loadMoviesJSON();
                 const baseName = path.basename(finalDest);
                 let uploaderUid = null;
@@ -3830,6 +3979,7 @@ async function startAcceptProcess(movieName, existingMessageId = null) {
         discordMessageId: messageId,
         percent: 0,
         status: "Copying",
+        stage: "copy",
         lastKnownEta: null,
         savedAt: Date.now()
     });
@@ -4147,6 +4297,42 @@ function broadcastUpdate(changedPath, newValue) {
         }
     }
 }
+function checkMessageForRestrictedWords(text, userProfile) {
+    if (!text) return { blocked: false };
+    if (
+        userProfile &&
+        (
+            userProfile.isOwner ||
+            userProfile.isCoOwner ||
+            userProfile.isHAdmin ||
+            userProfile.isDev ||
+            userProfile.isTester ||
+            userProfile.isAdmin
+        )
+    ) {
+        return { blocked: false };
+    }
+    const words = loadRestrictedWords();
+    if (!words || Object.keys(words).length === 0) return { blocked: false };
+    const normalized = normalizeText(text);
+    const noSpaces = normalized.replace(/\s+/g, "");
+    for (const [wordKey, wordData] of Object.entries(words)) {
+        const reason = wordData.reason || ("Your message contains a blocked word.");
+        const variations = Array.isArray(wordData.variations) ? wordData.variations : [wordKey];
+
+        for (const variation of variations) {
+            const normVariation = normalizeText(variation);
+            if (!normVariation) continue;
+            if (
+                normalized.includes(normVariation) ||
+                noSpaces.includes(normVariation)
+            ) {
+                return { blocked: true, word: wordKey, reason };
+            }
+        }
+    }
+    return { blocked: false };
+}
 function _checkRateLimit(identifier, endpoint) {
     if (!RATE_LIMIT_ENABLED) return null;
     const cfg = RATE_LIMITS[endpoint] || RATE_LIMITS.default;
@@ -4425,6 +4611,9 @@ function getRuleForOperation(rules, pathParts, type) {
 function invalidateDataCache() {
     _dataCache = null;
 }
+function invalidateRestrictedWordsCache() {
+    _restrictedWordsCache = null;
+}
 function listFilesLive() {
     if (_listFilesInterval) clearInterval(_listFilesInterval);
     const renderList = () => {
@@ -4576,6 +4765,19 @@ function loadReportJSON() {
         return { report: {} };
     }
 }
+function loadRestrictedWords() {
+    if (_restrictedWordsCache !== null) return _restrictedWordsCache;
+    try {
+        if (!fs.existsSync(RESTRICTED_WORDS_PATH)) {
+            fs.writeFileSync(RESTRICTED_WORDS_PATH, JSON.stringify({}, null, 2), "utf8");
+        }
+        _restrictedWordsCache = JSON.parse(fs.readFileSync(RESTRICTED_WORDS_PATH, "utf8"));
+    } catch (e) {
+        console.error("[WordFilter] Failed to load restrictedwords.json:", e.message);
+        _restrictedWordsCache = {};
+    }
+    return _restrictedWordsCache;
+}
 function logEvent(eventType, eventData) {
     const now = new Date();
     const day = now.getDate().toString();
@@ -4637,6 +4839,26 @@ function markExpiredTokens() {
         }
     }
     saveAccLogs(logs);
+}
+function normalizeText(text) {
+    return text
+        .toLowerCase()
+        .replace(/@/g, "a")
+        .replace(/4/g, "a")
+        .replace(/8/g, "b")
+        .replace(/[({[]/g, "c")
+        .replace(/3/g, "e")
+        .replace(/6/g, "g")
+        .replace(/9/g, "g")
+        .replace(/1/g, "i")
+        .replace(/!/g, "i")
+        .replace(/0/g, "o")
+        .replace(/\$/g, "s")
+        .replace(/5/g, "s")
+        .replace(/7/g, "t")
+        .replace(/2/g, "z")
+        .replace(/[^a-z0-9\s]/g, "")
+        .replace(/(.)\1{2,}/g, "$1$1");
 }
 function pathsMatch(clientPath, updatePath) {
     if (updatePath.length < clientPath.length) return false;
@@ -4962,6 +5184,20 @@ function setupSocketHandlers(ioInstance, label) {
                         message: "Copying Container",
                         updated: Date.now()
                     });
+                    const discordMsgIdForResume = applicantMessages.get(safeFile) || null;
+                    saveAcceptResume(safeFile, {
+                        movieName: safeFile,
+                        discordMessageId: discordMsgIdForResume,
+                        percent: 0,
+                        status: "Copying Container",
+                        stage: "copy",
+                        baseTarget,
+                        copyName,
+                        scaledName,
+                        duration,
+                        lastKnownEta: null,
+                        savedAt: Date.now()
+                    });
                     await runFfmpegWithProgress(socket, workId, safeFile, safeFile, srcPath, copyPath, duration, ["-y", "-i", srcPath, "-c", "copy", copyPath], "Copying Container" );
                     try { fs.unlinkSync(srcPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Original" }); } catch (e) { socket.emit("jobLog", { filename: safeFile, text: "Could Not Delete Original (Non-Fatal)." }); }
                     await new Promise(r => setTimeout(r, 500));
@@ -4971,6 +5207,19 @@ function setupSocketHandlers(ioInstance, label) {
                         remainingSec: null,
                         message: "Scaling",
                         updated: Date.now()
+                    });
+                    saveAcceptResume(safeFile, {
+                        movieName: safeFile,
+                        discordMessageId: discordMsgIdForResume,
+                        percent: 0,
+                        status: "Scaling",
+                        stage: "scale",
+                        baseTarget,
+                        copyName,
+                        scaledName,
+                        duration,
+                        lastKnownEta: null,
+                        savedAt: Date.now()
                     });
                     await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360" );
                     try { fs.unlinkSync(copyPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Intermediate Copy." }); } catch (e) {}

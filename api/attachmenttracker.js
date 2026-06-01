@@ -238,9 +238,10 @@ export async function scanAndRefreshExistingAttachments({ discordRequestForce, g
             const freshUrl = freshAtt.url || freshAtt.proxy_url;
             if (!freshUrl) continue;
             const newEncoded = encodeURIComponent(freshUrl);
-            const pathKey = encodeURIComponent(rawUrl.split("?")[0]);
+            const basePath = rawUrl.split("?")[0];
+            const encodedBasePath = encodeURIComponent(basePath);
             const proxyParamRegex = new RegExp(
-                `(\/discord-media-proxy\?url=)(${pathKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\s>]*)`,
+                `(\/discord-media-proxy\?url=)(${encodedBasePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\s>]*)`,
                 "g"
             );
             const before = updatedContent;
@@ -338,13 +339,15 @@ export function startAttachmentRefreshLoop({ discordRequestForce, getDataCache, 
                 }) || freshAttachments[0];
                 if (!freshAtt) continue;
                 const freshUrl = freshAtt.url || freshAtt.proxy_url;
-                if (!freshUrl || freshUrl === rec.rawUrl) continue;
+                if (!freshUrl) continue;
                 const newEncoded = encodeURIComponent(freshUrl);
-                const pathKey = encodeURIComponent(rec.rawUrl.split("?")[0]);
+                const basePath = rec.rawUrl.split("?")[0];
+                const encodedBasePath = encodeURIComponent(basePath);
                 const proxyParamRegex = new RegExp(
-                    `(\\/discord-media-proxy\\?url=)(${pathKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\\s>]*)`,
+                    `(\\/discord-media-proxy\\?url=)(${encodedBasePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\\s>]*)`,
                     "g"
                 );
+                if (updatedContent.includes(newEncoded)) continue;
                 const before = updatedContent;
                 updatedContent = updatedContent.replace(proxyParamRegex, (_, prefix, _oldEncoded) => {
                     return prefix + newEncoded;
