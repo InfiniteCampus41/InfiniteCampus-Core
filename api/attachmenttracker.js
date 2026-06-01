@@ -339,12 +339,17 @@ export function startAttachmentRefreshLoop({ discordRequestForce, getDataCache, 
                 if (!freshAtt) continue;
                 const freshUrl = freshAtt.url || freshAtt.proxy_url;
                 if (!freshUrl || freshUrl === rec.rawUrl) continue;
-                const oldEncoded = encodeURIComponent(rec.rawUrl);
                 const newEncoded = encodeURIComponent(freshUrl);
-                if (updatedContent.includes(oldEncoded)) {
-                    updatedContent = updatedContent.split(oldEncoded).join(newEncoded);
-                    contentChanged = true;
-                }
+                const pathKey = encodeURIComponent(rec.rawUrl.split("?")[0]);
+                const proxyParamRegex = new RegExp(
+                    `(\\/discord-media-proxy\\?url=)(${pathKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[^"'\\s>]*)`,
+                    "g"
+                );
+                const before = updatedContent;
+                updatedContent = updatedContent.replace(proxyParamRegex, (_, prefix, _oldEncoded) => {
+                    return prefix + newEncoded;
+                });
+                if (updatedContent !== before) contentChanged = true;
                 const parsedFresh = parseCdnUrl(freshUrl);
                 const newExpiresAt = parsedFresh?.expiresAt || null;
                 delete attachments[key];
