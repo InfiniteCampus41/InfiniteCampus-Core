@@ -4319,7 +4319,6 @@ function checkMessageForRestrictedWords(text, userProfile) {
     for (const [wordKey, wordData] of Object.entries(words)) {
         const reason = wordData.reason || ("Your message contains a blocked word.");
         const variations = Array.isArray(wordData.variations) ? wordData.variations : [wordKey];
-
         for (const variation of variations) {
             const normVariation = normalizeText(variation);
             if (!normVariation) continue;
