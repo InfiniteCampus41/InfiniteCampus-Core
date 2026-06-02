@@ -248,6 +248,8 @@ const uploadPfp = multer({
     }
 });
 const uploadProgress = new Map();
+let _usersCache = null;
+const USERS_PATH = path.join(__dirname, "users.json");
 let vm;
 const wsClients = new Map();
 const WS_POLL_INTERVAL_NORMAL = 3000;
@@ -294,6 +296,25 @@ if (!fs.existsSync(READY_DIR)) fs.mkdirSync(READY_DIR, { recursive: true });
 if (!fs.existsSync(QUEUE_DIR)) fs.mkdirSync(QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(DISCORD_QUEUE_DIR)) fs.mkdirSync(DISCORD_QUEUE_DIR, { recursive: true });
 if (!fs.existsSync(ARCHIVE_DIR)) fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+(function migrateUsersToUsersJson() {
+    try {
+        if (!fs.existsSync(USERS_PATH) || JSON.parse(fs.readFileSync(USERS_PATH, "utf-8") || "{}") && Object.keys(JSON.parse(fs.readFileSync(USERS_PATH, "utf-8") || "{}")).length === 0) {
+            if (fs.existsSync(DATA_PATH)) {
+                const rawData = JSON.parse(fs.readFileSync(DATA_PATH, "utf-8"));
+                if (rawData.users && typeof rawData.users === "object" && Object.keys(rawData.users).length > 0) {
+                    fs.writeFileSync(USERS_PATH, JSON.stringify(rawData.users, null, 2));
+                    console.log(`[Migration] Transferred ${Object.keys(rawData.users).length} user(s) from data.json to users.json`);
+                    delete rawData.users;
+                    fs.writeFileSync(DATA_PATH, JSON.stringify(rawData, null, 2));
+                } else if (!fs.existsSync(USERS_PATH)) {
+                    fs.writeFileSync(USERS_PATH, JSON.stringify({}));
+                }
+            }
+        }
+    } catch (e) {
+        console.error("[Migration] Failed to migrate users to users.json:", e.message);
+    }
+})();
 if (!fs.existsSync(ACCLOGS_PATH)) {
     fs.writeFileSync(ACCLOGS_PATH, JSON.stringify({}), "utf8");
 }
@@ -471,6 +492,60 @@ app.all("/admin/modify-rules", verifyFirebaseToken, async (req, res) => {
         return res.status(405).json({ error: "Method Not Allowed" });
     } catch (err) {
         console.error("modify-rules error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
+app.all("/admin/modify-users", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !profile.isOwner) {
+            return res.status(403).json({ error: "Not Authorized: Owner Only" });
+        }
+        if (req.method === "GET") {
+            const users = getUsersCache();
+            return res.json({ users });
+        }
+        if (req.method === "POST") {
+            const { users } = req.body;
+            if (!users || typeof users !== "object") {
+                return res.status(400).json({ error: "Missing Or Invalid Users Object" });
+            }
+            saveUsers(users);
+            if (_dataCache) _dataCache.users = users;
+            console.log(`[admin/modify-users] users.json Overwritten By Owner ${uid}`);
+            return res.json({ ok: true });
+        }
+        if (req.method === "PATCH") {
+            const { patches } = req.body;
+            if (!Array.isArray(patches) || patches.length === 0) {
+                return res.status(400).json({ error: "Missing Or Invalid Patches Array" });
+            }
+            const users = getUsersCache();
+            for (const { path: patchPath, value } of patches) {
+                if (typeof patchPath !== "string") continue;
+                const keys = patchPath.split("/").filter(Boolean);
+                if (keys.length === 0) continue;
+                let cur = users;
+                for (let i = 0; i < keys.length - 1; i++) {
+                    if (!cur[keys[i]] || typeof cur[keys[i]] !== "object") cur[keys[i]] = {};
+                    cur = cur[keys[i]];
+                }
+                const last = keys[keys.length - 1];
+                if (value === null || value === undefined) {
+                    delete cur[last];
+                } else {
+                    cur[last] = value;
+                }
+            }
+            saveUsers(users);
+            if (_dataCache) _dataCache.users = users;
+            console.log(`[admin/modify-users PATCH] ${patches.length} patch(es) applied by ${uid}`);
+            return res.json({ ok: true, patches: patches.length });
+        }
+        return res.status(405).json({ error: "Method Not Allowed" });
+    } catch (err) {
+        console.error("modify-users error:", err);
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
@@ -4194,7 +4269,7 @@ async function syncDiscordHistory(channelName, discordChannelId) {
     data.messages[channelName] = sorted;
     _dataCache = data;
     if (totalNew > 0) {
-        fs.writeFileSync("./data.json", JSON.stringify(data, null, 2));
+        saveData(data);
         console.log(`Synced ${totalNew} New Messages For #${channelName}`);
     } else {
         console.log(`No New Messages For #${channelName}`);
@@ -4567,6 +4642,12 @@ function formatTimes(date) {
 function getDataCache() {
     if (_dataCache === null) {
         _dataCache = JSON.parse(fs.readFileSync("./data.json", "utf-8"));
+        const users = getUsersCache();
+        if (users && typeof users === "object" && Object.keys(users).length > 0) {
+            _dataCache.users = users;
+        } else if (_dataCache.users) {
+            _usersCache = _dataCache.users;
+        }
     }
     return _dataCache;
 }
@@ -4607,11 +4688,25 @@ function getRuleForOperation(rules, pathParts, type) {
     if (current?.["." + type] !== undefined) lastRule = current["." + type];
     return { rule: lastRule, wildcards };
 }
+function getUsersCache() {
+    if (_usersCache === null) {
+        if (fs.existsSync(USERS_PATH)) {
+            _usersCache = JSON.parse(fs.readFileSync(USERS_PATH, "utf-8"));
+        } else {
+            _usersCache = {};
+        }
+    }
+    return _usersCache;
+}
 function invalidateDataCache() {
     _dataCache = null;
+    _usersCache = null;
 }
 function invalidateRestrictedWordsCache() {
     _restrictedWordsCache = null;
+}
+function invalidateUsersCache() {
+    _usersCache = null;
 }
 function listFilesLive() {
     if (_listFilesInterval) clearInterval(_listFilesInterval);
@@ -5023,8 +5118,13 @@ function saveBotSentDiscordIds() {
     } catch (e) { console.error("Failed To Save discordids.json:", e.message); }
 }
 function saveData(data) {
+    if (data.users && typeof data.users === "object") {
+        saveUsers(data.users);
+    }
+    const dataWithoutUsers = { ...data };
+    delete dataWithoutUsers.users;
     _dataCache = data;
-    fs.writeFileSync("./data.json", JSON.stringify(data, null, 2));
+    fs.writeFileSync("./data.json", JSON.stringify(dataWithoutUsers, null, 2));
 }
 function saveDiscordChannelMap() {
     try {
@@ -5036,6 +5136,10 @@ function saveMoviesJSON(data) {
 }
 function saveReportJSON(data) {
     fs.writeFileSync(REPORT_JSON, JSON.stringify(data, null, 2));
+}
+function saveUsers(usersData) {
+    _usersCache = usersData;
+    fs.writeFileSync(USERS_PATH, JSON.stringify(usersData, null, 2));
 }
 function scheduleDailyClear() {
     const now = new Date();
