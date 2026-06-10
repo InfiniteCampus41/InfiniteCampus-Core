@@ -155,6 +155,7 @@ const MOVIES_DIR = path.join(__dirname, "movies");
 const MOVIES_JSON = path.join(__dirname, "movies.json");
 const MSG_SLOWMODE_MS = 3000;
 const _msgSlowmodeStore = new Map();
+const MUSIC_API_3 = process.env.MUSIC_API_3;
 const onlineLastSeen = new Map();
 const PFP_COOLDOWN_MS = 3 * 60 * 1000;
 const pfpStorage = multer.memoryStorage();
@@ -193,8 +194,6 @@ const ROUTES = {
 };
 const RULES_PATH = path.join(__dirname, "rules.json");
 const SC_SEARCH_BASE = process.env.MUSIC_SEARCH_URL;
-const SC_PLAY_URL = (u, t) => process.env.MUSIC_PLAY_URL;
-const SC_DOWNLOAD_URL = (u, t) => process.env.MUSIC_DOWNLOAD_URL;
 const seenUsers = new Set();
 const server = httpServer.listen(PORT, () => {
     console.log(`Infinite Campus Server Running At http://localhost:${PORT}`);
@@ -885,7 +884,7 @@ app.get("/music/resolve", async (req, res) => {
     }
     try {
         const q = encodeURIComponent(`${artist} ${title}`);
-        const response = await fetch(`${SC_SEARCH_BASE}${q}&limit=5`);
+        const response = await fetch(`${SC_SEARCH_BASE}${q}&type=tracks&limit=5`);
         const data = await response.json();
         const hit = (data.collection || [])[0];
         if (!hit) {
@@ -896,8 +895,8 @@ app.get("/music/resolve", async (req, res) => {
         res.json({
             userPermalink,
             trackPermalink,
-            streamUrl:   SC_PLAY_URL(userPermalink, trackPermalink),
-            downloadUrl: SC_DL_URL(userPermalink, trackPermalink),
+            streamUrl:   `${MUSIC_API_3}${userPermalink}/${trackPermalink}`,
+            downloadUrl: `${MUSIC_API_3}${userPermalink}/${trackPermalink}?redirect=true`,
             artUrl: hit.artwork_url
                 ? hit.artwork_url.replace("-large", "-t500x500")
                 : (hit.user?.avatar_url || null)
