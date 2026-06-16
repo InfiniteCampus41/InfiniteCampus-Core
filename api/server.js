@@ -23,7 +23,7 @@ import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
-import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments } from "./attachmentTracker.js";
+import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmentTracker.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -673,13 +673,70 @@ app.get("/discord-channel-map", verifyFirebaseToken, async (req, res) => {
     }
 });
 app.get("/discord-media-proxy", async (req, res) => {
+    if (req.query.key) {
+        const stableKey = req.query.key;
+        let currentUrl = lookupCurrentUrl(stableKey);
+        if (!currentUrl) {
+            return res.status(404).send("Attachment not found");
+        }
+        async function fetchOrRefreshByKey(targetUrl) {
+            const r = await fetch(targetUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+            if (r.ok) return r;
+            try {
+                const parts = stableKey.split("/");
+                const channelId = parts[0];
+                const messageId = parts[1];
+                const filename  = parts[2];
+                const refreshResp = await axios({
+                    method: "get",
+                    url: `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
+                    headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
+                });
+                const freshAtts = refreshResp?.data?.attachments || [];
+                const freshAtt = freshAtts.find(a => (a.filename || "").split("?")[0] === filename) || freshAtts[0];
+                if (freshAtt) {
+                    const freshUrl = freshAtt.url || freshAtt.proxy_url;
+                    if (freshUrl && freshUrl !== targetUrl) {
+                        const { default: fs2 } = await import("fs");
+                        const { default: path2 } = await import("path");
+                        const attPath = path2.join(path2.dirname(fileURLToPath(import.meta.url)), "attachments.json");
+                        try {
+                            const atts = JSON.parse(fs2.readFileSync(attPath, "utf8"));
+                            if (atts[stableKey]) {
+                                const parsedFresh = new URL(freshUrl);
+                                const exHex = parsedFresh.searchParams.get("ex");
+                                atts[stableKey].currentUrl = freshUrl;
+                                atts[stableKey].expiresAt = exHex ? parseInt(exHex, 16) * 1000 : null;
+                            }
+                            fs2.writeFileSync(attPath, JSON.stringify(atts, null, 2), "utf8");
+                        } catch {}
+                        const r2 = await fetch(freshUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+                        if (r2.ok) return r2;
+                    }
+                }
+            } catch {}
+            return r;
+        }
+        try {
+            const r = await fetchOrRefreshByKey(currentUrl);
+            if (!r.ok) return res.status(r.status).send("Upstream error");
+            const ct = r.headers.get("content-type") || "application/octet-stream";
+            const cl = r.headers.get("content-length");
+            res.setHeader("Content-Type", ct);
+            res.setHeader("Cache-Control", "public, max-age=600");
+            if (cl) res.setHeader("Content-Length", cl);
+            r.body.pipe(res);
+        } catch (e) {
+            res.status(500).send("Proxy error: " + e.message);
+        }
+        return;
+    }
     const { url } = req.query;
     if (!url) return res.status(400).send("Bad URL");
-    let parsed;
-    try { parsed = new URL(url); } catch { return res.status(400).send("Invalid URL"); }
+    try { new URL(url); } catch { return res.status(400).send("Invalid URL"); }
     async function tryFetchWithRefresh(targetUrl) {
         const r = await fetch(targetUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-        if (r.ok) return { r, finalUrl: targetUrl };
+        if (r.ok) return r;
         if ((r.status === 403 || r.status === 404) && targetUrl.includes("cdn.discordapp.com/attachments/")) {
             try {
                 const attachmentPath = new URL(targetUrl).pathname;
@@ -687,43 +744,34 @@ app.get("/discord-media-proxy", async (req, res) => {
                 if (parts.length >= 3) {
                     const channelId = parts[1];
                     const messageId = parts[2];
+                    const fname = parts[parts.length - 1].split("?")[0];
+                    const stableKey = makeStableKey(channelId, messageId, fname);
+                    const knownFresh = lookupCurrentUrl(stableKey);
+                    if (knownFresh && knownFresh !== targetUrl) {
+                        const r2 = await fetch(knownFresh, { headers: { "User-Agent": "Mozilla/5.0" } });
+                        if (r2.ok) return r2;
+                    }
                     const refreshResp = await axios({
                         method: "get",
                         url: `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`,
                         headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
                     });
-                    const freshAttachments = refreshResp?.data?.attachments || [];
-                    const fname = parts[parts.length - 1].split("?")[0];
-                    const freshAtt = freshAttachments.find(a => (a.filename || "").split("?")[0] === fname) || freshAttachments[0];
+                    const freshAtts = refreshResp?.data?.attachments || [];
+                    const freshAtt = freshAtts.find(a => (a.filename || "").split("?")[0] === fname) || freshAtts[0];
                     if (freshAtt) {
                         const freshUrl = freshAtt.url || freshAtt.proxy_url;
                         if (freshUrl && freshUrl !== targetUrl) {
-                            try {
-                                const data = getDataCache();
-                                for (const [ch, msgs] of Object.entries(data.messages || {})) {
-                                    for (const [ts, msg] of Object.entries(msgs || {})) {
-                                        if (msg && msg._attachmentUrl && msg._attachmentUrl === targetUrl) {
-                                            msg._attachmentUrl = freshUrl;
-                                            const proxied = `/discord-media-proxy?url=${encodeURIComponent(freshUrl)}`;
-                                            if (msg.t) msg.t = msg.t.replace(encodeURIComponent(targetUrl), encodeURIComponent(freshUrl));
-                                            data.messages[ch][ts] = msg;
-                                            saveData(data);
-                                            broadcastUpdate(["messages", ch, String(ts)], msg);
-                                        }
-                                    }
-                                }
-                            } catch {}
-                            const r2 = await fetch(freshUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-                            if (r2.ok) return { r: r2, finalUrl: freshUrl };
+                            const r3 = await fetch(freshUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+                            if (r3.ok) return r3;
                         }
                     }
                 }
             } catch {}
         }
-        return { r, finalUrl: targetUrl };
+        return r;
     }
     try {
-        const { r } = await tryFetchWithRefresh(url);
+        const r = await tryFetchWithRefresh(url);
         if (!r.ok) return res.status(r.status).send("Upstream error");
         const ct = r.headers.get("content-type") || "application/octet-stream";
         const cl = r.headers.get("content-length");
@@ -2602,7 +2650,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         setMirrorId(channelName, ts, guestUploadDiscordMsgId);
                     }
                     if (cdnUrl) {
-                        const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                        const _guestParsedCdn = (() => { try { const u = new URL(cdnUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2], filename: p[3].split("?")[0] } : null; } catch { return null; } })();
+                        const _guestStableKey = _guestParsedCdn ? makeStableKey(_guestParsedCdn.channelId, _guestParsedCdn.messageId, _guestParsedCdn.filename) : null;
+                        const proxied = _guestStableKey ? `/discord-media-proxy?key=${encodeURIComponent(_guestStableKey)}` : `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                         let attachHtml = "";
                         if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
                             attachHtml = `<img src="${proxied}" alt="${fname}" data-fname="${fname}" data-fsize="${fsize}">`;
@@ -2759,7 +2809,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
                 const uploadedDiscordMsgId = uploadResp?.data?.id || null;
                 if (cdnUrl) {
-                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                    const _upParsedCdn = (() => { try { const u = new URL(cdnUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2], filename: p[3].split("?")[0] } : null; } catch { return null; } })();
+                    const _upStableKey = _upParsedCdn ? makeStableKey(_upParsedCdn.channelId, _upParsedCdn.messageId, _upParsedCdn.filename) : null;
+                    const proxied = _upStableKey ? `/discord-media-proxy?key=${encodeURIComponent(_upStableKey)}` : `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                     let attachHtml = "";
                     if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
                         attachHtml = `<img src="${proxied}" alt="${fname}" data-size="${fsize}">`;
@@ -4175,7 +4227,10 @@ async function syncDiscordHistory(channelName, discordChannelId) {
             for (const att of attachments) {
                 const attUrl = att.proxy_url || att.url || "";
                 if (!attUrl) continue;
-                const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                const _histFilename = (att.filename || attUrl.split("/").pop() || "file").split("?")[0];
+                const _histParsed = (() => { try { const u = new URL(attUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2] } : null; } catch { return null; } })();
+                const _histKey = _histParsed ? makeStableKey(_histParsed.channelId, _histParsed.messageId, _histFilename) : null;
+                const proxied = _histKey ? `/discord-media-proxy?key=${encodeURIComponent(_histKey)}` : `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
                 const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
                 const isVideo = /\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(att.filename || attUrl);
                 const isAudio = /\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(att.filename || attUrl);
@@ -4220,7 +4275,8 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 u: user?.username || "Unknown",
                 a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
                 t: fullContent,
-                _discordId: discordMsg.id
+                _discordId: discordMsg.id,
+                _discordUserId: user?.id || null,
             };
             if (discordMsg.referenced_message) {
                 const refTs = discordMsgToTimestamp(discordMsg.referenced_message.id);
@@ -4495,6 +4551,7 @@ function discordMsgToWebsite(discordMsg) {
         u: discordMsg.author?.username || "Unknown",
         a: proxiedAvatar,
         t: discordMsg.content || "",
+        _discordUserId: discordMsg.author?.id || null,
     };
     if (discordMsg.referenced_message) {
         const refTs = discordMsgToTimestamp(discordMsg.referenced_message.id);
@@ -5426,7 +5483,7 @@ function startDiscordGateway() {
             ws = new WsClient(wsUrl);
         } catch (e) {
             console.error("Failed to open gateway WebSocket:", e.message);
-            scheduleGatewayReconnect(BASE_RECONNECT_DELAY);
+            scheduleGatewayReconnect(GATEWAY_BASE_RECONNECT_DELAY);
             return;
         }
         discordGatewayWs = ws;
@@ -5465,7 +5522,7 @@ function startDiscordGateway() {
                         op: 2,
                         d: {
                             token: DISCORD_BOT_TOKEN,
-                            intents: 33281,
+                            intents: 33283,
                             properties: {
                                 os: "linux",
                                 browser: "ic-bridge",
@@ -5490,6 +5547,7 @@ function startDiscordGateway() {
                 if (!resumable) {
                     gatewaySessionId = null;
                     gatewaySeq = null;
+                    gatewayReconnectAttempts = 0;
                 }
                 scheduleGatewayReconnect(1000 + Math.floor(Math.random() * 4000));
             } else if (op === 0 && t === "READY") {
@@ -5524,7 +5582,10 @@ function startDiscordGateway() {
                 for (const att of gatewayAttachments) {
                     const attUrl = att.proxy_url || att.url || "";
                     if (!attUrl) continue;
-                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
+                    const _gwFilename = (att.filename || attUrl.split("/").pop() || "file").split("?")[0];
+                    const _gwParsed = (() => { try { const u = new URL(attUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2] } : null; } catch { return null; } })();
+                    const _gwKey = _gwParsed ? makeStableKey(_gwParsed.channelId, _gwParsed.messageId, _gwFilename) : null;
+                    const proxied = _gwKey ? `/discord-media-proxy?key=${encodeURIComponent(_gwKey)}` : `/discord-media-proxy?url=${encodeURIComponent(attUrl)}`;
                     const isImage = /\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(att.filename || attUrl);
                     const isVideo = /\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(att.filename || attUrl);
                     const isAudio = /\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(att.filename || attUrl);
@@ -5565,6 +5626,7 @@ function startDiscordGateway() {
                     a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
                     t: fullContent,
                     _discordId: d.id,
+                    _discordUserId: d.author?.id || null,
                 };
                 if (d.referenced_message) {
                     const refTs = discordMsgToTimestamp(d.referenced_message.id);
@@ -5660,6 +5722,41 @@ function startDiscordGateway() {
                 }
                 delete discordMsgIdToTimestamp[d.id];
                 untrackAttachmentsForMessage(channelName, ref.timestamp);
+            } else if (op === 0 && t === "GUILD_MEMBER_UPDATE") {
+                const userId = d.user?.id;
+                if (!userId) return;
+                const avatarHash = d.avatar || d.user?.avatar;
+                let newAvatarProxied = null;
+                if (avatarHash) {
+                    const ext = avatarHash.startsWith("a_") ? "gif" : "png";
+                    const guildId = d.guild_id;
+                    const avatarUrl = d.avatar
+                        ? `https://cdn.discordapp.com/guilds/${guildId}/users/${userId}/avatars/${d.avatar}.${ext}?size=64`
+                        : `https://cdn.discordapp.com/avatars/${userId}/${d.user.avatar}.${ext}?size=64`;
+                    newAvatarProxied = `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`;
+                } else {
+                    const defaultIndex = Number(BigInt(userId) >> 22n) % 6;
+                    const avatarUrl = `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+                    newAvatarProxied = `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`;
+                }
+                const newUsername = d.user?.username || null;
+                updateDiscordUserAcrossMessages(userId, newUsername, newAvatarProxied);
+            } else if (op === 0 && t === "USER_UPDATE") {
+                const userId = d.id;
+                if (!userId) return;
+                const avatarHash = d.avatar;
+                let newAvatarProxied = null;
+                if (avatarHash) {
+                    const ext = avatarHash.startsWith("a_") ? "gif" : "png";
+                    const avatarUrl = `https://cdn.discordapp.com/avatars/${userId}/${avatarHash}.${ext}?size=64`;
+                    newAvatarProxied = `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`;
+                } else {
+                    const defaultIndex = Number(BigInt(userId) >> 22n) % 6;
+                    const avatarUrl = `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+                    newAvatarProxied = `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`;
+                }
+                const newUsername = d.username || null;
+                updateDiscordUserAcrossMessages(userId, newUsername, newAvatarProxied);
             }
         });
         ws.on("close", (code) => {
@@ -5685,7 +5782,15 @@ function startDiscordGateway() {
         if (gatewayReconnectTimer) return;
         gatewayReconnectAttempts++;
         if (gatewayReconnectAttempts > GATEWAY_MAX_RECONNECT_ATTEMPTS) {
-            console.error(`[DiscordGateway] Max reconnect attempts (${GATEWAY_MAX_RECONNECT_ATTEMPTS}) reached. Giving up to avoid token ban. Restart the server to retry.`);
+            console.error(`[DiscordGateway] Max reconnect attempts (${GATEWAY_MAX_RECONNECT_ATTEMPTS}) reached. Will retry fresh in 10 minutes.`);
+            gatewayReconnectAttempts = 0;
+            gatewayCanResume = false;
+            gatewaySessionId = null;
+            gatewaySeq = null;
+            gatewayReconnectTimer = setTimeout(() => {
+                gatewayReconnectTimer = null;
+                connect();
+            }, 10 * 60 * 1000);
             return;
         }
         const delay = Math.min(baseDelay * Math.pow(2, gatewayReconnectAttempts - 1), GATEWAY_MAX_RECONNECT_DELAY);
@@ -5752,6 +5857,42 @@ function writeDiscordMsgToData(channelName, discordMsgId, entry, ts) {
     discordMsgIdToTimestamp[discordMsgId] = { channel: channelName, timestamp: ts };
     broadcastUpdate(["messages", channelName, String(ts)], entryWithTs);
     trackAttachmentsForMessage(channelName, ts, discordMsgId, entry.t || "");
+}
+/**
+ * @param {string} discordUserId
+ * @param {string|null} newUsername
+ * @param {string|null} newAvatarProxied
+ */
+function updateDiscordUserAcrossMessages(discordUserId, newUsername, newAvatarProxied) {
+    if (!discordUserId) return;
+    const data = getDataCache();
+    const messagesRoot = data?.messages;
+    if (!messagesRoot || typeof messagesRoot !== "object") return;
+    let totalUpdated = 0;
+    for (const [channelName, channelMsgs] of Object.entries(messagesRoot)) {
+        if (!channelMsgs || typeof channelMsgs !== "object") continue;
+        for (const [ts, msgEntry] of Object.entries(channelMsgs)) {
+            if (!msgEntry || msgEntry._discordUserId !== discordUserId) continue;
+            let changed = false;
+            if (newUsername && msgEntry.u !== newUsername) {
+                msgEntry.u = newUsername;
+                changed = true;
+            }
+            if (newAvatarProxied && msgEntry.a !== newAvatarProxied) {
+                msgEntry.a = newAvatarProxied;
+                changed = true;
+            }
+            if (changed) {
+                data.messages[channelName][ts] = msgEntry;
+                broadcastUpdate(["messages", channelName, ts], msgEntry);
+                totalUpdated++;
+            }
+        }
+    }
+    if (totalUpdated > 0) {
+        saveData(data);
+        console.log(`[DiscordBridge] Updated username/avatar for Discord user ${discordUserId} across ${totalUpdated} message(s)`);
+    }
 }
 setInterval(async () => {
     let processed = 0;

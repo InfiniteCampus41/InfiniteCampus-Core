@@ -1,0 +1,1 @@
+this file is for tracking the attachments so they properly show up on the website chat
