@@ -153,6 +153,8 @@ const mirrorIdMap = {}
 const MOVIE_ACCEPTS_DIR = path.join(__dirname, "movieaccepts");
 const MOVIES_DIR = path.join(__dirname, "movies");
 const MOVIES_JSON = path.join(__dirname, "movies.json");
+const SUBTITLES_DIR = path.join(__dirname, "subtitles");
+if (!fs.existsSync(SUBTITLES_DIR)) fs.mkdirSync(SUBTITLES_DIR, { recursive: true });
 const MSG_SLOWMODE_MS = 3000;
 const _msgSlowmodeStore = new Map();
 const MUSIC_API_3 = process.env.MUSIC_API_3;
@@ -1130,6 +1132,14 @@ app.get(ROUTES.STREAM_VIDEO, (req, res) => {
         console.error(e);
         res.status(500).send("Server Error");
     }
+});
+app.get(`/subtitles/${UNIQUE_SUFFIX}/:name`, (req, res) => {
+    const name = path.basename(req.params.name);
+    const filePath = path.join(SUBTITLES_DIR, name);
+    if (!fs.existsSync(filePath)) return res.status(404).send("Not Found");
+    res.setHeader("Content-Type", "text/vtt");
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    fs.createReadStream(filePath).pipe(res);
 });
 app.get("/verify-user", verifyFirebaseToken, async (req, res) => {
     const { uid, token } = req.query;
@@ -3453,6 +3463,39 @@ async function finishReject(movieName) {
     }
     deleteApply(movieName);
 }
+async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
+    try {
+        socket?.emit("jobLog", { filename: safeFile, text: "Starting Whisper transcription (this may take several minutes)..." });
+        const { nodewhisper } = await import("nodejs-whisper");
+        await nodewhisper(movieFilePath, {
+            modelName: "medium",
+            autoDownloadModelName: "medium",
+            whisperOptions: {
+                outputInVtt: true,
+                outputInSrt: false,
+                outputInCsv: false,
+                outputInText: false,
+                outputInWords: false,
+                wordTimestamps: false,
+                language: "en",
+            },
+        });
+        const vttSource = movieFilePath + ".vtt";
+        if (!fs.existsSync(vttSource)) {
+            console.warn(`[Whisper] VTT not found at expected path: ${vttSource}`);
+            return null;
+        }
+        const vttFileName = `${baseName}.vtt`;
+        const vttDest = path.join(SUBTITLES_DIR, vttFileName);
+        fs.renameSync(vttSource, vttDest);
+        socket?.emit("jobLog", { filename: safeFile, text: `Subtitles generated: ${vttFileName}` });
+        return `/subtitles/${UNIQUE_SUFFIX}/${vttFileName}`;
+    } catch (err) {
+        console.error("[Whisper] Subtitle generation failed:", err.message || err);
+        socket?.emit("jobLog", { filename: safeFile, text: `Whisper failed (non-fatal): ${err.message}` });
+        return null;
+    }
+}
 async function getUidByDisplayNameServer(displayName) {
     const data = getDataCache();
     const clean = (displayName || "").replace(/ 💎/g, "").toLowerCase();
@@ -4835,7 +4878,8 @@ function listMovies() {
             uploadedBy: moviesJson[f]?.uploadedBy || "User",
             db_id: moviesJson[f]?.db_id || null,
             cover: moviesJson[f]?.cover || null,
-            rating: moviesJson[f]?.rating || null
+            rating: moviesJson[f]?.rating || null,
+            subtitleUrl: moviesJson[f]?.subtitleUrl || null
         };
     });
     list.sort((a, b) => a.order - b.order);
@@ -5427,9 +5471,28 @@ function setupSocketHandlers(ioInstance, label) {
                             uploadedBy: uploaderUid,
                             db_id: tmdbData.id || null,
                             cover: tmdbData.cover || null,
-                            rating: tmdbData.rating || null
+                            rating: tmdbData.rating || null,
+                            subtitleUrl: null
                         };
                         saveMoviesJSON(moviesJson);
+                    }
+                    socket.emit("jobLog", { filename: safeFile, text: "Running Whisper for subtitles..." });
+                    acceptStatus.set(safeFile, {
+                        status: "transcribing",
+                        percent: 99,
+                        remainingSec: null,
+                        message: "Generating Subtitles",
+                        updated: Date.now()
+                    });
+                    const subtitleBaseName = path.basename(finalDest, ".mp4");
+                    const subtitleUrl = await generateSubtitles(finalDest, subtitleBaseName, socket, safeFile);
+                    if (subtitleUrl) {
+                        const latestMoviesJson = loadMoviesJSON();
+                        if (latestMoviesJson[baseName]) {
+                            latestMoviesJson[baseName].subtitleUrl = subtitleUrl;
+                            saveMoviesJSON(latestMoviesJson);
+                            socket.emit("jobLog", { filename: safeFile, text: `Subtitle URL saved: ${subtitleUrl}` });
+                        }
                     }
                     acceptStatus.set(safeFile, {
                         status: "completed",
