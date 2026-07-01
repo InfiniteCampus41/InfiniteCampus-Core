@@ -70,7 +70,7 @@ export function generateInviteCode() {
     return code;
 }
 function welcomeMessageText(groupName, inviteCode, hostUrl) {
-    return `Welcome to ${groupName}! This is the beginning of this channel.\nYou can invite more people into your group by sharing the link below:\nInvite Code: ${inviteCode}\nInvite Link: ${hostUrl}/join/${inviteCode}`;
+    return `Welcome to ${groupName}! This is the beginning of this channel.\nYou can invite more people into your group by sharing the link below:\nInvite Code: ${inviteCode}\nInvite Link: https://www.infinitecampus.xyz/join/${inviteCode}\nSecond Invite Link: https://instructure.space/join/${inviteCode}`;
 }
 export function getGroup(id) {
     const data = loadGroups();
@@ -122,7 +122,6 @@ export function createGroup(name, ownerUid, hostUrl) {
         createdAt,
         messages: {
             [welcomeMsgId]: {
-                system: true,
                 t: welcomeMessageText(name, inviteCode, hostUrl),
                 s: "K8DFw6au2sMLN0LvCo4T1A5quu43",
                 timestamp: createdAt

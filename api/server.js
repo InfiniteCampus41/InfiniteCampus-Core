@@ -1964,6 +1964,46 @@ app.post("/groups/create", verifyFirebaseToken, rateLimit("write"), async (req, 
         res.status(500).json({ error: "Could Not Create Group" });
     }
 });
+app.post("/groups/invite/:code", verifyFirebaseToken, async (req, res) => {
+    try {
+        const group = Groups.getGroupByInvite(req.params.code);
+        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
+        res.json({ success: true, id: group.id, name: group.name });
+    } catch (err) {
+        res.status(500).json({ error: "Lookup Failed" });
+    }
+});
+app.post("/groups/join", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = getDataCache()?.users?.[uid]?.profile || {};
+        if (!isVerifiedProfile(profile)) {
+            return res.status(403).json({ error: "You Must Be Verified To Join A Group" });
+        }
+        const inviteCode = (req.body?.inviteCode || "").trim();
+        if (!inviteCode) return res.status(400).json({ error: "Invite Code Is Required" });
+        const group = Groups.getGroupByInvite(inviteCode);
+        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
+        if (Groups.isMember(group, uid)) {
+            return res.json({ success: true, group, alreadyMember: true });
+        }
+        const result = Groups.addMember(group.id, uid);
+        if (result.error) return res.status(400).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        console.error("[Groups] join error:", err);
+        res.status(500).json({ error: "Could Not Join Group" });
+    }
+});
+app.post("/groups/mine", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const groups = Groups.getUserGroups(req.user.uid);
+        res.json({ success: true, groups });
+    } catch (err) {
+        console.error("[Groups] mine error:", err);
+        res.status(500).json({ error: "Could Not Load Groups" });
+    }
+});
 app.post("/groups/:id/delete-message", verifyFirebaseToken, rateLimit("delete"), async (req, res) => {
     try {
         const uid = req.user.uid;
@@ -2095,37 +2135,6 @@ app.post("/groups/:id/upload", verifyFirebaseToken, rateLimit("upload"), (req, r
         res.status(500).json({ error: "Could Not Upload File" });
     }
 });
-app.post("/groups/invite/:code", verifyFirebaseToken, async (req, res) => {
-    try {
-        const group = Groups.getGroupByInvite(req.params.code);
-        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
-        res.json({ success: true, id: group.id, name: group.name });
-    } catch (err) {
-        res.status(500).json({ error: "Lookup Failed" });
-    }
-});
-app.post("/groups/join", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
-    try {
-        const uid = req.user.uid;
-        const profile = getDataCache()?.users?.[uid]?.profile || {};
-        if (!isVerifiedProfile(profile)) {
-            return res.status(403).json({ error: "You Must Be Verified To Join A Group" });
-        }
-        const inviteCode = (req.body?.inviteCode || "").trim();
-        if (!inviteCode) return res.status(400).json({ error: "Invite Code Is Required" });
-        const group = Groups.getGroupByInvite(inviteCode);
-        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
-        if (Groups.isMember(group, uid)) {
-            return res.json({ success: true, group, alreadyMember: true });
-        }
-        const result = Groups.addMember(group.id, uid);
-        if (result.error) return res.status(400).json({ error: result.error });
-        res.json({ success: true, group: result.group });
-    } catch (err) {
-        console.error("[Groups] join error:", err);
-        res.status(500).json({ error: "Could Not Join Group" });
-    }
-});
 app.post("/groups/:id/kick", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
     try {
         const { targetUid } = req.body || {};
@@ -2175,15 +2184,6 @@ app.post("/groups/:id/transfer", verifyFirebaseToken, rateLimit("write"), async 
         res.json({ success: true, group: result.group });
     } catch (err) {
         res.status(500).json({ error: "Could Not Transfer Ownership" });
-    }
-});
-app.post("/groups/mine", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
-    try {
-        const groups = Groups.getUserGroups(req.user.uid);
-        res.json({ success: true, groups });
-    } catch (err) {
-        console.error("[Groups] mine error:", err);
-        res.status(500).json({ error: "Could Not Load Groups" });
     }
 });
 app.post("/limit-to-last", async (req, res) => {
