@@ -24,6 +24,7 @@ import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
 import { Resend } from "resend";
 import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmentTracker.js";
+import * as Groups from "./groupsStore.js";
 dotenv.config();
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -61,6 +62,8 @@ let _dataCacheDirty = false;
 const DATA_PATH = path.join(__dirname, "data.json");
 const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+const PRIVATE_MEDIA_CHANNEL_ID = process.env.PRIVATE_MEDIA_CHANNEL_ID || null;
+const GROUP_MEDIA_CHANNEL_ID = process.env.GROUP_MEDIA_CHANNEL_ID || null;
 const discordBridgeState = {};
 const DISCORD_CHANNEL_MAP_PATH = path.join(__dirname, "discord_channel_map.json");
 let DISCORD_CHANNEL_MAP = (() => {
@@ -181,6 +184,7 @@ const _rateLimitStore = new Map();
 const READY_DIR = path.join(__dirname, "ready");
 const REPORT_JSON = path.join(__dirname, "report.json");
 const resend = new Resend(process.env.RESEND_API_KEY);
+const { resolveHostUrl } = Groups;
 let _restrictedWordsCache = null;
 const RESTRICTED_WORDS_PATH = path.join(__dirname, "restrictedwords.json");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -565,6 +569,15 @@ app.delete("/admin/files/:filename", (req, res) => {
     }
     res.status(404).json({ error: "File Not Found" });
 });
+app.delete("/groups/:id", verifyFirebaseToken, rateLimit("delete"), async (req, res) => {
+    try {
+        const result = Groups.deleteGroup(req.params.id, req.user.uid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Delete Group" });
+    }
+});
 app.delete(ROUTES.DELETE_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
     const file = path.join(MOVIES_DIR, name + ".mp4");
@@ -608,6 +621,26 @@ app.get("/admin/files", (req, res) => {
     })
     .filter(Boolean);
     res.json(fileData);
+});
+app.get("/admin/groups", verifyFirebaseToken, async (req, res) => {
+    try {
+        const profile = getDataCache()?.users?.[req.user.uid]?.profile || {};
+        if (!isStaffProfile(profile)) return res.status(403).json({ error: "Not Authorized" });
+        res.json({ success: true, groups: Groups.getAllGroups() });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Load Groups" });
+    }
+});
+app.get("/admin/groups/:id", verifyFirebaseToken, async (req, res) => {
+    try {
+        const profile = getDataCache()?.users?.[req.user.uid]?.profile || {};
+        if (!isStaffProfile(profile)) return res.status(403).json({ error: "Not Authorized" });
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        res.json({ success: true, group });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Load Group" });
+    }
 });
 app.get("/admin/logs", (req, res) => {
     const pass = req.headers["x-admin-password"];
@@ -1914,6 +1947,245 @@ app.post("/github-webhook", express.json({ type: "application/json" }),async (re
         res.sendStatus(500);
     }
 });
+app.post("/groups/create", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = getDataCache()?.users?.[uid]?.profile || {};
+        if (!isVerifiedProfile(profile)) {
+            return res.status(403).json({ error: "You Must Be Verified To Create A Group" });
+        }
+        const name = (req.body?.name || "").trim();
+        if (!name) return res.status(400).json({ error: "Group Name Is Required" });
+        if (name.length > 60) return res.status(400).json({ error: "Group Name Is Too Long" });
+        const group = Groups.createGroup(name, uid, groupHostUrl(req));
+        res.json({ success: true, group });
+    } catch (err) {
+        console.error("[Groups] create error:", err);
+        res.status(500).json({ error: "Could Not Create Group" });
+    }
+});
+app.post("/groups/:id/delete-message", verifyFirebaseToken, rateLimit("delete"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { msgId } = req.body || {};
+        if (!msgId) return res.status(400).json({ error: "Missing msgId" });
+        const result = Groups.deleteMessage(req.params.id, msgId, uid, true);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Delete Message" });
+    }
+});
+app.post("/groups/:id/edit-message", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { msgId, text } = req.body || {};
+        if (!msgId || !text) return res.status(400).json({ error: "Missing msgId Or text" });
+        const result = Groups.editMessage(req.params.id, msgId, String(text).slice(0, 1000), uid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Edit Message" });
+    }
+});
+app.post("/groups/:id", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        if (!Groups.isMember(group, uid)) return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+        res.json({ success: true, group });
+    } catch (err) {
+        console.error("[Groups] get error:", err);
+        res.status(500).json({ error: "Could Not Load Group" });
+    }
+});
+app.post("/groups/:id/members", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        if (!Groups.isMember(group, uid)) return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+        const data = getDataCache();
+        const members = group.members.map(mUid => {
+            const p = data?.users?.[mUid]?.profile || {};
+            return { uid: mUid, displayName: p.displayName || "User", pic: p.pic ?? 0, isOwner: mUid === group.ownerUid };
+        });
+        res.json({ success: true, members, inviteCode: group.inviteCode, inviteLink: group.inviteLink, name: group.name, ownerUid: group.ownerUid });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Load Members" });
+    }
+});
+app.post("/groups/:id/message", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        if (!Groups.isMember(group, uid)) return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+        const text = (req.body?.text || "").trim();
+        const replyTo = req.body?.replyTo || null;
+        if (!text) return res.status(400).json({ error: "Message Cannot Be Empty" });
+        if (text.length > 1000) return res.status(400).json({ error: "Message Is Too Long" });
+        const msgObj = { s: uid, t: text };
+        if (replyTo) msgObj.r = replyTo;
+        const result = Groups.addMessage(group.id, msgObj);
+        res.json({ success: true, id: result.id, message: result.message });
+    } catch (err) {
+        console.error("[Groups] message error:", err);
+        res.status(500).json({ error: "Could Not Send Message" });
+    }
+});
+app.post("/groups/:id/upload", verifyFirebaseToken, rateLimit("upload"), (req, res, next) => {
+    const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+    upload.single("file")(req, res, (err) => {
+        if (err) {
+            if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
+                return res.status(400).json({ error: "File Size Must Be 10MB Or Less." });
+            }
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        if (!Groups.isMember(group, uid)) return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+        const uploadedFile = req.file;
+        if (!uploadedFile) return res.status(400).json({ error: "No File Provided" });
+        const fname = uploadedFile.originalname || "File";
+        const fsize = formatBytes(uploadedFile.size) || "";
+        const targetDiscordChannel = GROUP_MEDIA_CHANNEL_ID || logid;
+        const uploaderProfile = getDataCache()?.users?.[uid]?.profile || {};
+        const uploaderName = uploaderProfile.displayName || "User";
+        const uploadForm = new FormData();
+        uploadForm.append("payload_json", JSON.stringify({ content: `**${uploaderName}** Uploaded A File In Group "${group.name}" (#${group.id}):` }));
+        uploadForm.append("files[0]", uploadedFile.buffer, {
+            filename: fname,
+            contentType: uploadedFile.mimetype || "application/octet-stream",
+        });
+        const uploadResp = await discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages`,
+            data: uploadForm,
+            headers: uploadForm.getHeaders(),
+        });
+        const discordAttachment = uploadResp?.data?.attachments?.[0];
+        const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
+        const uploadedDiscordMsgId = uploadResp?.data?.id || null;
+        if (!cdnUrl) return res.status(502).json({ error: "Upload Failed" });
+        const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+        const attachHtml = groupAttachHtml(fname, proxied, fsize);
+        const msgObj = { s: uid, t: attachHtml, _attachmentUrl: cdnUrl };
+        const replyTo = req.body?.replyTo || null;
+        if (replyTo) msgObj.r = replyTo;
+        const result = Groups.addMessage(group.id, msgObj);
+        res.json({ success: true, id: result.id, message: result.message });
+        if (!GROUP_MEDIA_CHANNEL_ID && uploadedDiscordMsgId) {
+            try {
+                await discordRequestForce({
+                    method: "delete",
+                    url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages/${uploadedDiscordMsgId}`,
+                });
+            } catch {}
+        }
+    } catch (err) {
+        console.error("[Groups] upload error:", err);
+        res.status(500).json({ error: "Could Not Upload File" });
+    }
+});
+app.post("/groups/invite/:code", verifyFirebaseToken, async (req, res) => {
+    try {
+        const group = Groups.getGroupByInvite(req.params.code);
+        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
+        res.json({ success: true, id: group.id, name: group.name });
+    } catch (err) {
+        res.status(500).json({ error: "Lookup Failed" });
+    }
+});
+app.post("/groups/join", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = getDataCache()?.users?.[uid]?.profile || {};
+        if (!isVerifiedProfile(profile)) {
+            return res.status(403).json({ error: "You Must Be Verified To Join A Group" });
+        }
+        const inviteCode = (req.body?.inviteCode || "").trim();
+        if (!inviteCode) return res.status(400).json({ error: "Invite Code Is Required" });
+        const group = Groups.getGroupByInvite(inviteCode);
+        if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
+        if (Groups.isMember(group, uid)) {
+            return res.json({ success: true, group, alreadyMember: true });
+        }
+        const result = Groups.addMember(group.id, uid);
+        if (result.error) return res.status(400).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        console.error("[Groups] join error:", err);
+        res.status(500).json({ error: "Could Not Join Group" });
+    }
+});
+app.post("/groups/:id/kick", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const { targetUid } = req.body || {};
+        if (!targetUid) return res.status(400).json({ error: "Missing targetUid" });
+        const result = Groups.kickMember(req.params.id, req.user.uid, targetUid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Kick Member" });
+    }
+});
+app.post("/groups/:id/leave", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const result = Groups.leaveGroup(req.params.id, req.user.uid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Leave Group" });
+    }
+});
+app.post("/groups/:id/rename", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const { name } = req.body || {};
+        if (!name || !name.trim()) return res.status(400).json({ error: "Group Name Is Required" });
+        const result = Groups.renameGroup(req.params.id, req.user.uid, name.trim());
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Rename Group" });
+    }
+});
+app.post("/groups/:id/reset-invite", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const result = Groups.resetInvite(req.params.id, req.user.uid, groupHostUrl(req));
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Reset Invite" });
+    }
+});
+app.post("/groups/:id/transfer", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+    try {
+        const { targetUid } = req.body || {};
+        if (!targetUid) return res.status(400).json({ error: "Missing targetUid" });
+        const result = Groups.transferOwnership(req.params.id, req.user.uid, targetUid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true, group: result.group });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Transfer Ownership" });
+    }
+});
+app.post("/groups/mine", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const groups = Groups.getUserGroups(req.user.uid);
+        res.json({ success: true, groups });
+    } catch (err) {
+        console.error("[Groups] mine error:", err);
+        res.status(500).json({ error: "Could Not Load Groups" });
+    }
+});
 app.post("/limit-to-last", async (req, res) => {
     try {
         let uid = null;
@@ -2860,6 +3132,71 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 console.error("[FileUpload] Failed to upload file to Discord:", e.message);
             } finally {
                 try { fs.unlinkSync(uploadedFile.path); } catch {}
+            }
+        }
+        if (
+            uploadedFile &&
+            path.length === 4 &&
+            path[0] === "private" &&
+            newValue && typeof newValue === "object"
+        ) {
+            const uidA = path[1];
+            const uidB = path[2];
+            const msgTimestamp = String(path[3]);
+            try {
+                const fname = uploadedFile.originalname || "File";
+                const fsize = formatBytes(uploadedFile?.size) || "";
+                const fileBuffer = uploadedFile.buffer;
+                const targetDiscordChannel = PRIVATE_MEDIA_CHANNEL_ID || logid;
+                const uploadForm = new FormData();
+                const uploaderProfile = getDataCache()?.users?.[uid]?.profile || {};
+                const uploaderName = uploaderProfile.displayName || "User";
+                uploadForm.append("payload_json", JSON.stringify({ content: `**${uploaderName}** Uploaded A File In A Private Chat (${uidA}/${uidB}):` }));
+                uploadForm.append("files[0]", fileBuffer, {
+                    filename: fname,
+                    contentType: uploadedFile.mimetype || "application/octet-stream",
+                });
+                const uploadResp = await discordRequestForce({
+                    method: "post",
+                    url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages`,
+                    data: uploadForm,
+                    headers: uploadForm.getHeaders(),
+                });
+                const discordAttachment = uploadResp?.data?.attachments?.[0];
+                const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
+                const uploadedDiscordMsgId = uploadResp?.data?.id || null;
+                if (cdnUrl) {
+                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                    let attachHtml = "";
+                    if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
+                        attachHtml = `<img src="${proxied}" alt="${fname}" data-size="${fsize}">`;
+                    } else if (/\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(fname)) {
+                        attachHtml = `<video src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></video>`;
+                    } else if (/\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(fname)) {
+                        attachHtml = `<audio src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></audio>`;
+                    } else {
+                        attachHtml = `<file href="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></file>`;
+                    }
+                    const data = getDataCache();
+                    const existingEntry = data?.private?.[uidA]?.[uidB]?.[msgTimestamp];
+                    if (existingEntry) {
+                        const existingT = existingEntry.text || existingEntry.t || "";
+                        existingEntry.text = existingT ? existingT + "\n" + attachHtml : attachHtml;
+                        existingEntry._attachmentUrl = cdnUrl;
+                        saveData(data);
+                        broadcastUpdate(path, existingEntry);
+                    }
+                }
+                if (!PRIVATE_MEDIA_CHANNEL_ID && uploadedDiscordMsgId) {
+                    try {
+                        await discordRequestForce({
+                            method: "delete",
+                            url: `https://discord.com/api/v10/channels/${targetDiscordChannel}/messages/${uploadedDiscordMsgId}`,
+                        });
+                    } catch {}
+                }
+            } catch (e) {
+                console.error("[FileUpload] Failed to upload private chat file to Discord:", e.message);
             }
         }
         res.json({ success: true });
@@ -4797,6 +5134,20 @@ function getUsersCache() {
     }
     return _usersCache;
 }
+function groupAttachHtml(fname, proxied, fsize) {
+    if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
+        return `<img src="${proxied}" alt="${fname}" data-size="${fsize}">`;
+    } else if (/\.(mp4|webm|mov|avi|ts)(\?|$)/i.test(fname)) {
+        return `<video src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></video>`;
+    } else if (/\.(mp3|ogg|wav|flac|m4a)(\?|$)/i.test(fname)) {
+        return `<audio src="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></audio>`;
+    }
+    return `<file href="${proxied}" data-fname="${fname}" data-fsize="${fsize}"></file>`;
+}
+function groupHostUrl(req) {
+    const hostUrl = Groups.resolveHostUrl(req);
+    return hostUrl;
+}
 function invalidateDataCache() {
     _dataCache = null;
     _usersCache = null;
@@ -4806,6 +5157,14 @@ function invalidateRestrictedWordsCache() {
 }
 function invalidateUsersCache() {
     _usersCache = null;
+}
+function isStaffProfile(profile) {
+    if (!profile) return false;
+    return !!(profile.isOwner || profile.isTester || profile.isCoOwner || profile.isAdmin || profile.isHAdmin);
+}
+function isVerifiedProfile(profile) {
+    if (!profile) return false;
+    return !!(profile.verified || profile.isOwner || profile.isTester || profile.isCoOwner || profile.isAdmin || profile.isHAdmin || profile.isDev);
 }
 function listFilesLive() {
     if (_listFilesInterval) clearInterval(_listFilesInterval);

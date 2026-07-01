@@ -48,6 +48,10 @@ function isBlockedHost(host) {
     }
     return null;
 }
+function isPageRequest(url) {
+    const pathname = new URL(url).pathname.toLowerCase();
+    return !pathname.match(/\.(js|css|png|jpg|jpeg|gif|svg|ico|webp|mp4|mp3|woff|woff2|ttf)$/);
+}
 function applySafeSearch(urlObj) {
     const host = urlObj.hostname;
     if (host.includes("google.")) {
@@ -475,6 +479,10 @@ fastify.post("/scramjet/url", async (req, reply) => {
             reply.code(500).send({ error: err.message });
         }
     }
+});
+fastify.get("/join/:code", async (req, reply) => {
+    const code = encodeURIComponent(req.params.code || "");
+    return reply.redirect(`/InfiniteChatters.html?joinCode=${code}`);
 });
 fastify.setNotFoundHandler((req, reply) => {
     return reply.code(404).type("text/html").sendFile("404.html");
