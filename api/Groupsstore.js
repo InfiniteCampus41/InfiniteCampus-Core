@@ -6,6 +6,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const GROUPS_JSON_PATH = path.join(__dirname, "groups.json");
 export const MAX_GROUP_MEMBERS = 20;
+export const MAX_REACTIONS_PER_MSG = 5;
+export const MAX_REACTIONS_PER_USER_MSG = 20;
 const INVITE_CODE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_";
 const INVITE_CODE_LENGTH = 12;
 const DEFAULT_HOST_URL = "https://www.infinitecampus.xyz";
@@ -93,17 +95,22 @@ export function getUserGroups(uid) {
     const data = loadGroups();
     return Object.values(data.groups)
         .filter(g => isMember(g, uid))
-        .map(g => stripMessagesForList(g));
+        .map(g => stripMessagesForList(g, uid));
 }
-function stripMessagesForList(group) {
-    const { messages, ...rest } = group;
+function stripMessagesForList(group, uid) {
+    const { messages, lastRead, ...rest } = group;
     const msgKeys = messages ? Object.keys(messages) : [];
     let lastMessage = null;
     if (msgKeys.length) {
         const lastKey = msgKeys.sort((a, b) => Number(a) - Number(b)).pop();
         lastMessage = { ts: lastKey, ...messages[lastKey] };
     }
-    return { ...rest, lastMessage, messageCount: msgKeys.length };
+    let unread = false;
+    if (uid && lastMessage) {
+        const readAt = (lastRead && lastRead[uid]) || 0;
+        unread = Number(lastMessage.ts) > readAt;
+    }
+    return { ...rest, lastMessage, messageCount: msgKeys.length, unread };
 }
 export function createGroup(name, ownerUid, hostUrl) {
     const data = loadGroups();
@@ -120,6 +127,7 @@ export function createGroup(name, ownerUid, hostUrl) {
         inviteCode,
         inviteLink: `${hostUrl}/join/${inviteCode}`,
         createdAt,
+        lastRead: { [ownerUid]: createdAt },
         messages: {
             [welcomeMsgId]: {
                 t: welcomeMessageText(name, inviteCode, hostUrl),
@@ -176,8 +184,55 @@ export function addMember(groupId, uid) {
     if (group.members.includes(uid)) return { error: "Already A Member" };
     if (group.members.length >= MAX_GROUP_MEMBERS) return { error: `Group Is Full (Max ${MAX_GROUP_MEMBERS} Members)` };
     group.members.push(uid);
+    if (!group.lastRead) group.lastRead = {};
+    group.lastRead[uid] = Date.now();
     saveGroups(data);
     return { success: true, group };
+}
+export function markGroupRead(groupId, uid) {
+    const data = loadGroups();
+    const group = data.groups[String(groupId)];
+    if (!group) return { error: "Group Not Found" };
+    if (!isMember(group, uid)) return { error: "You Are Not A Member Of This Group" };
+    if (!group.lastRead) group.lastRead = {};
+    group.lastRead[uid] = Date.now();
+    saveGroups(data);
+    return { success: true };
+}
+export function toggleReaction(groupId, msgId, uid, emoji) {
+    const data = loadGroups();
+    const group = data.groups[String(groupId)];
+    if (!group) return { error: "Group Not Found" };
+    if (!isMember(group, uid)) return { error: "You Are Not A Member Of This Group" };
+    const msg = group.messages[msgId];
+    if (!msg) return { error: "Message Not Found" };
+    if (typeof emoji !== "string" || !emoji || emoji.length > 8) return { error: "Invalid Emoji" };
+    const reactions = msg.reactions ? { ...msg.reactions } : {};
+    const emojiReactors = reactions[emoji] ? { ...reactions[emoji] } : {};
+    const alreadyReacted = !!emojiReactors[uid];
+    if (alreadyReacted) {
+        delete emojiReactors[uid];
+        if (Object.keys(emojiReactors).length === 0) {
+            delete reactions[emoji];
+        } else {
+            reactions[emoji] = emojiReactors;
+        }
+    } else {
+        if (!reactions[emoji] && Object.keys(reactions).length >= MAX_REACTIONS_PER_MSG) {
+            return { error: `Max ${MAX_REACTIONS_PER_MSG} Different Reactions Per Message` };
+        }
+        let userReactionCount = 0;
+        for (const e of Object.keys(reactions)) {
+            if (reactions[e]?.[uid]) userReactionCount++;
+        }
+        if (userReactionCount >= MAX_REACTIONS_PER_USER_MSG) {
+            return { error: `Max ${MAX_REACTIONS_PER_USER_MSG} Reactions Per User Per Message` };
+        }
+        reactions[emoji] = { ...emojiReactors, [uid]: true };
+    }
+    msg.reactions = reactions;
+    saveGroups(data);
+    return { success: true, reactions };
 }
 export function kickMember(groupId, requesterUid, targetUid) {
     const data = loadGroups();

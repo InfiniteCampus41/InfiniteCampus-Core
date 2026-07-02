@@ -2028,6 +2028,34 @@ app.post("/groups/:id/edit-message", verifyFirebaseToken, rateLimit("write"), as
         res.status(500).json({ error: "Could Not Edit Message" });
     }
 });
+app.post("/groups/:id/react", verifyFirebaseToken, rateLimit("react"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        if (!Groups.isMember(group, uid)) return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+        const { msgId, emoji } = req.body || {};
+        if (!msgId || !emoji) return res.status(400).json({ error: "Missing msgId Or emoji" });
+        const result = Groups.toggleReaction(group.id, msgId, uid, emoji);
+        if (result.error) return res.status(400).json({ error: result.error });
+        res.json({ success: true, reactions: result.reactions });
+    } catch (err) {
+        console.error("[Groups] react error:", err);
+        res.status(500).json({ error: "Could Not React To Message" });
+    }
+});
+app.post("/groups/:id/read", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const group = Groups.getGroup(req.params.id);
+        if (!group) return res.status(404).json({ error: "Group Not Found" });
+        const result = Groups.markGroupRead(group.id, uid);
+        if (result.error) return res.status(403).json({ error: result.error });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Mark Group As Read" });
+    }
+});
 app.post("/groups/:id", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
     try {
         const uid = req.user.uid;
