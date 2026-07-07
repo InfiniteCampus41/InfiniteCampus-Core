@@ -33,6 +33,11 @@ const UPLOADS_TEMP_DIR = path.join(__dirname, "uploads_temp");
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const UNIQUE_SUFFIX = "x9a7b2";
 const UPLOAD_LIMIT_MB = 100;
+const USE_720P = true;
+const SCALE_WIDTH = USE_720P ? 1280 : 640;
+const SCALE_HEIGHT = USE_720P ? 720 : 360;
+const SCALE_SUFFIX = USE_720P ? "720" : "360";
+const SCALE_FILTER = `scale=${SCALE_WIDTH}:${SCALE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${SCALE_WIDTH}:${SCALE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
 const DISCORD_IDS_PATH = path.join(__dirname, "discordids.json");
 const acceptIntervals = new Map();
 const acceptStatus = new Map();
@@ -3364,10 +3369,22 @@ app.put("/api/movies-json", requireAdminPassword, (req, res) => {
         });
     }
     try {
-        if (typeof req.body !== "object") {
+        if (typeof req.body !== "object" || req.body === null || Array.isArray(req.body)) {
             return res.status(400).json({ error: "Invalid JSON Body" });
         }
-        saveMoviesJSON(req.body);
+        const existing = loadMoviesJSON();
+        const merged = { ...existing };
+        for (const [filename, incomingEntry] of Object.entries(req.body)) {
+            if (incomingEntry && typeof incomingEntry === "object" && !Array.isArray(incomingEntry)) {
+                merged[filename] = {
+                    ...(existing[filename] || {}),
+                    ...incomingEntry
+                };
+            } else {
+                merged[filename] = incomingEntry;
+            }
+        }
+        saveMoviesJSON(merged);
         res.json({ success: true });
     } catch (err) {
         res.status(500).json({ error: "Failed To Save movies.json" });
@@ -3835,6 +3852,7 @@ async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
         await nodewhisper(movieFilePath, {
             modelName: "medium",
             autoDownloadModelName: "medium",
+            removeWavFileAfterTranscription: true,
             whisperOptions: {
                 outputInVtt: true,
                 outputInSrt: false,
@@ -3845,6 +3863,15 @@ async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
                 language: "en",
             },
         });
+        try {
+            const leftoverWav = movieFilePath.replace(/\.[^./\\]+$/, "") + ".wav";
+            if (fs.existsSync(leftoverWav)) {
+                fs.unlinkSync(leftoverWav);
+                socket?.emit("jobLog", { filename: safeFile, text: "Removed leftover transcription .wav file" });
+            }
+        } catch (e) {
+            console.warn("[Whisper] Failed to clean up leftover .wav:", e.message);
+        }
         const vttSource = movieFilePath + ".vtt";
         if (!fs.existsSync(vttSource)) {
             console.warn(`[Whisper] VTT not found at expected path: ${vttSource}`);
@@ -4057,7 +4084,7 @@ async function resumeInProgressAccepts() {
                 }
                 const resolvedBaseTarget = baseTarget || sanitize(path.parse(movieName).name);
                 const resolvedCopyName = copyName || `${resolvedBaseTarget}_${Date.now()}_copy.mp4`;
-                const resolvedScaledName = scaledName || `${resolvedBaseTarget}_${Date.now()}_360.mp4`;
+                const resolvedScaledName = scaledName || `${resolvedBaseTarget}_${Date.now()}_${SCALE_SUFFIX}.mp4`;
                 const resolvedCopyPath = copyPath || path.join(APPLY_DIR, resolvedCopyName);
                 const resolvedScaledPathTemp = scaledPathTemp || path.join(APPLY_DIR, resolvedScaledName);
                 const workId = `${movieName}_resumed_${Date.now()}`;
@@ -4068,7 +4095,7 @@ async function resumeInProgressAccepts() {
                     await new Promise(r => setTimeout(r, 500));
                 }
                 acceptStatus.set(movieName, { status: "scaling", percent: 0, remainingSec: null, message: "Scaling", updated: Date.now() });
-                await runFfmpegWithProgress(fakeSocket, workId, movieName, resolvedCopyName, resolvedCopyPath, resolvedScaledPathTemp, duration, ["-y", "-i", resolvedCopyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", resolvedScaledPathTemp], "Scaling to 640x360");
+                await runFfmpegWithProgress(fakeSocket, workId, movieName, resolvedCopyName, resolvedCopyPath, resolvedScaledPathTemp, duration, ["-y", "-i", resolvedCopyPath, "-vf", SCALE_FILTER, "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", resolvedScaledPathTemp], `Scaling to ${SCALE_WIDTH}x${SCALE_HEIGHT}`);
                 try { fs.unlinkSync(resolvedCopyPath); } catch (e) {}
                 const finalFileName = `${resolvedBaseTarget}.mp4`;
                 const destination = path.join(MOVIES_DIR, finalFileName);
@@ -5764,7 +5791,7 @@ function setupSocketHandlers(ioInstance, label) {
                     socket.emit("jobLog", { filename: safeFile, text: `Duration: ${duration ? duration.toFixed(2) + "s" : "unknown"}` });
                     const baseTarget = sanitize((targetName && targetName.trim()) ? targetName.replace(/\s+/g, "_") : path.parse(safeFile).name);
                     const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
-                    const scaledName = `${baseTarget}_${Date.now()}_360.mp4`;
+                    const scaledName = `${baseTarget}_${Date.now()}_${SCALE_SUFFIX}.mp4`;
                     const copyPath = path.join(APPLY_DIR, copyName);
                     const scaledPathTemp = path.join(APPLY_DIR, scaledName);
                     acceptStatus.set(safeFile, {
@@ -5811,7 +5838,7 @@ function setupSocketHandlers(ioInstance, label) {
                         lastKnownEta: null,
                         savedAt: Date.now()
                     });
-                    await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2", "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], "Scaling to 640x360" );
+                    await runFfmpegWithProgress(socket, workId, safeFile, copyName, copyPath, scaledPathTemp, duration, ["-y", "-i", copyPath, "-vf", SCALE_FILTER, "-c:v", "libx264", "-crf", "23", "-preset", "veryfast", "-c:a", "copy", scaledPathTemp], `Scaling to ${SCALE_WIDTH}x${SCALE_HEIGHT}` );
                     try { fs.unlinkSync(copyPath); socket.emit("jobLog", { filename: safeFile, text: "Deleted Intermediate Copy." }); } catch (e) {}
                     const finalFileName = `${baseTarget}.mp4`;
                     const destination = path.join(MOVIES_DIR, finalFileName);
