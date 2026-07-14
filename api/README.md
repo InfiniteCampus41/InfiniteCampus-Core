@@ -1,23 +1,5 @@
 This Folder Is The Source Code For https://api.infinitecampus.xyz
 
-To Deploy The Code, You Need Node.js And NPM. I Believe You Also Need ffmpeg And Its Dependancies
+If you wish to deploy this, you will need all dependencies included in the package.json and ffmpeg, npm, and nodejs
 
-IMPORTANT --
-You Need To Have The Following In The .env File
-DISCORD_BOT_TOKEN
-CHANNEL_ID
-PORT
-ADMIN_PASSWORD
-ADMIN_PASSWORD_2
-DON_PASS_1
-YOYOMASTER
-NITRIX67
-GITHUB_TOKEN
-DISCORD_GUILD_ID
-HB_API_TEST_KEY
-HB_API_KEY
-SQUARE_ACCESS_TOKEN
-SQUARE_LOCATION_ID
-SQUARE_WEBHOOK_SIGNATURE_KEY
-TMDB_API_KEY
-CLEAR_LOG_DAY
+You Will Also Need Custom Configs For Each Value In The .env File
