@@ -102,30 +102,18 @@ async function fetchZonesFresh() {
     throw lastErr || new Error("Failed To Fetch Zones");
 }
 async function getZones() {
-    const now = Date.now();
-    if (zoneCache.data && now - zoneCache.fetchedAt < ZONE_CACHE_TTL_MS) {
-        log("getZones: serving cached zones, age", Math.round((now - zoneCache.fetchedAt) / 1000), "s, entries:", zoneCache.data.length);
+    if (zoneCache.data) {
+        log("getZones: serving in-memory zones (fetched at startup), entries:", zoneCache.data.length);
         return zoneCache.data;
     }
-    if (inFlightFetch) {
-        log("getZones: awaiting in-flight fetch");
-        return inFlightFetch;
-    }
-    log("getZones: cache stale/empty, refreshing");
-    inFlightFetch = (async () => {
-        try {
-            const data = await fetchZonesFresh();
-            zoneCache = { data, fetchedAt: Date.now() };
-            return data;
-        } catch (e) {
-            log("getZones: refresh failed -", e.message, zoneCache.data ? "(serving stale cache)" : "(no cache to fall back on)");
-            if (zoneCache.data) return zoneCache.data;
-            throw e;
-        } finally {
-            inFlightFetch = null;
-        }
-    })();
-    return inFlightFetch;
+    log("getZones: no zones in memory (startup fetch never succeeded)");
+    throw new Error("Zones Not Loaded");
+}
+async function refreshZonesFromNetwork() {
+    log("refreshZonesFromNetwork: forcing a fresh fetch from the zones feed");
+    const data = await fetchZonesFresh();
+    zoneCache = { data, fetchedAt: Date.now() };
+    return data;
 }
 function shuffle(arr) {
     const out = arr.slice();
@@ -198,67 +186,91 @@ function injectCustomCss(html) {
         </script>
     `);
 }
+function ensureGamesFile(GAMES_JSON) {
+    if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
+}
+function loadGamesJSON(GAMES_JSON) {
+    try {
+        return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));
+    } catch {
+        return {};
+    }
+}
+function saveGamesJSON(GAMES_JSON, games) {
+    const nonZone = {};
+    const zoneEntries = [];
+    for (const [key, val] of Object.entries(games)) {
+        if (key.startsWith(ZONE_KEY_PREFIX)) {
+            const idNum = Number(key.slice(ZONE_KEY_PREFIX.length));
+            zoneEntries.push([key, val, Number.isFinite(idNum) ? idNum : Infinity]);
+        } else {
+            nonZone[key] = val;
+        }
+    }
+    zoneEntries.sort((a, b) => a[2] - b[2]);
+    const merged = { ...nonZone };
+    for (const [key, val] of zoneEntries) merged[key] = val;
+    fs.writeFileSync(GAMES_JSON, JSON.stringify(merged, null, 2));
+}
+function getHiddenIdSet(games) {
+    const hidden = Array.isArray(games._hidden) ? games._hidden : [];
+    return new Set(hidden.map(String));
+}
+function buildListFromZones(zones, games) {
+    const valid = zones.filter(isValidZoneGame);
+    return valid.map((z) => {
+        const key = zoneKey(z.id);
+        if (!games[key]) {
+            games[key] = { popularity: 0, dateAdded: Date.now() };
+        }
+        const stored = games[key];
+        return {
+            id: z.id,
+            name: z.name,
+            author: z.author || null,
+            authorLink: typeof z.authorLink === "string" && z.authorLink ? z.authorLink : null,
+            hasThumbnail: true,
+            popularity: stored.popularity || 0,
+            dateAdded: stored.dateAdded || null,
+        };
+    });
+}
+async function mergeZonesIntoGamesJSON(GAMES_JSON) {
+    const zones = await refreshZonesFromNetwork();
+    const games = loadGamesJSON(GAMES_JSON);
+    const list = buildListFromZones(zones, games);
+    games._list = list;
+    saveGamesJSON(GAMES_JSON, games);
+    log("mergeZonesIntoGamesJSON: merged", list.length, "zone games into games.json");
+    return list;
+}
+export async function initZoneGames(deps) {
+    const { __dirname } = deps;
+    const GAMES_JSON = path.join(__dirname, "games.json");
+    ensureGamesFile(GAMES_JSON);
+    try {
+        await mergeZonesIntoGamesJSON(GAMES_JSON);
+        log("initZoneGames: startup zone fetch + merge succeeded");
+    } catch (e) {
+        log("initZoneGames: startup zone fetch FAILED -", e.message, "- serving existing games.json (if any) with no live zone validation");
+    }
+}
+function isAdminPass(req) {
+    const pass = req.headers["x-admin-password"];
+    return pass === process.env.ADMIN_PASSWORD || pass === process.env.ADMIN_PASSWORD_2;
+}
 export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
     const GAMES_JSON = path.join(__dirname, "games.json");
-    if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
-    function loadGamesJSON() {
-        try {
-            return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));
-        } catch {
-            return {};
-        }
-    }
-    function saveGamesJSON(games) {
-        const nonZone = {};
-        const zoneEntries = [];
-        for (const [key, val] of Object.entries(games)) {
-            if (key.startsWith(ZONE_KEY_PREFIX)) {
-                const idNum = Number(key.slice(ZONE_KEY_PREFIX.length));
-                zoneEntries.push([key, val, Number.isFinite(idNum) ? idNum : Infinity]);
-            } else {
-                nonZone[key] = val;
-            }
-        }
-        zoneEntries.sort((a, b) => a[2] - b[2]);
-        const merged = { ...nonZone };
-        for (const [key, val] of zoneEntries) merged[key] = val;
-        fs.writeFileSync(GAMES_JSON, JSON.stringify(merged, null, 2));
-    }
+    ensureGamesFile(GAMES_JSON);
     app.get("/api/zone-games", async (req, res) => {
         log("GET /api/zone-games from", req.ip);
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         try {
-            const cached = loadGamesJSON();
-            if (Array.isArray(cached._list) && cached._list.length) {
-                log("zone-games: serving cached list from games.json -", cached._list.length, "games");
-                return res.json({ ok: true, games: shuffle(cached._list) });
-            }
-            log("zone-games: no cached list yet, generating from zones feed");
-            const zones = await getZones();
-            const valid = zones.filter(isValidZoneGame);
-            log("zone-games: total zones", zones.length, "valid", valid.length);
-            const games = loadGamesJSON();
-            const list = valid.map((z) => {
-                const key = zoneKey(z.id);
-                if (!games[key]) {
-                    games[key] = { popularity: 0, dateAdded: Date.now() };
-                }
-                const stored = games[key];
-                return {
-                    id: z.id,
-                    name: z.name,
-                    author: z.author || null,
-                    authorLink: typeof z.authorLink === "string" && z.authorLink ? z.authorLink : null,
-                    hasThumbnail: true,
-                    popularity: stored.popularity || 0,
-                    dateAdded: stored.dateAdded || null,
-                };
-            });
-            games._list = list;
-            log("zone-games: persisting generated list of", list.length, "games to games.json");
-            saveGamesJSON(games);
-            log("zone-games: responding with", list.length, "games");
+            const games = loadGamesJSON(GAMES_JSON);
+            const hidden = getHiddenIdSet(games);
+            const list = Array.isArray(games._list) ? games._list.filter((g) => !hidden.has(String(g.id))) : [];
+            log("zone-games: serving list from games.json -", list.length, "games (", hidden.size, "hidden)");
             res.json({ ok: true, games: shuffle(list) });
         } catch (e) {
             console.error("Zone Games List Error:", e.message);
@@ -266,20 +278,77 @@ export function attachZoneGameRoutes(app, deps) {
             res.status(502).json({ ok: false, error: "Failed To Load Games" });
         }
     });
-    app.post("/admin/zone-games/regenerate", (req, res) => {
-        const pass = req.headers["x-admin-password"];
-        if (pass !== process.env.ADMIN_PASSWORD && pass !== process.env.ADMIN_PASSWORD_2) {
+    app.post("/admin/zone-games/regenerate", async (req, res) => {
+        if (!isAdminPass(req)) {
             return res.status(403).json({ ok: false, error: "Not Allowed" });
         }
         try {
-            const games = loadGamesJSON();
-            delete games._list;
-            saveGamesJSON(games);
-            log("zone-games: cached list cleared via /admin/zone-games/regenerate, will regenerate on next request");
-            res.json({ ok: true });
+            const list = await mergeZonesIntoGamesJSON(GAMES_JSON);
+            log("zone-games: /admin/zone-games/regenerate forced a fresh zones fetch, entries:", list.length);
+            res.json({ ok: true, count: list.length });
         } catch (e) {
             log("zone-games: regenerate FAILED -", e.stack || e.message);
-            res.status(500).json({ ok: false, error: "Failed To Clear Cache" });
+            res.status(500).json({ ok: false, error: "Failed To Refresh Zones" });
+        }
+    });
+    app.get("/admin/games-json", (req, res) => {
+        if (!isAdminPass(req)) {
+            return res.status(403).json({ ok: false, error: "Not Allowed" });
+        }
+        try {
+            res.json({ ok: true, games: loadGamesJSON(GAMES_JSON) });
+        } catch (e) {
+            log("games-json: GET FAILED -", e.stack || e.message);
+            res.status(500).json({ ok: false, error: "Failed To Load games.json" });
+        }
+    });
+    app.post("/admin/games-json", (req, res) => {
+        if (!isAdminPass(req)) {
+            return res.status(403).json({ ok: false, error: "Not Allowed" });
+        }
+        try {
+            const { games } = req.body || {};
+            if (!games || typeof games !== "object" || Array.isArray(games)) {
+                return res.status(400).json({ ok: false, error: "Invalid games.json Payload" });
+            }
+            saveGamesJSON(GAMES_JSON, games);
+            log("games-json: saved via admin edit -", Object.keys(games).length, "top-level keys");
+            res.json({ ok: true });
+        } catch (e) {
+            log("games-json: POST FAILED -", e.stack || e.message);
+            res.status(500).json({ ok: false, error: "Failed To Save games.json" });
+        }
+    });
+    app.get("/admin/hidden-games", (req, res) => {
+        if (!isAdminPass(req)) {
+            return res.status(403).json({ ok: false, error: "Not Allowed" });
+        }
+        try {
+            const games = loadGamesJSON(GAMES_JSON);
+            const hidden = Array.isArray(games._hidden) ? games._hidden.map(String) : [];
+            res.json({ ok: true, hidden });
+        } catch (e) {
+            log("hidden-games: GET FAILED -", e.stack || e.message);
+            res.status(500).json({ ok: false, error: "Failed To Load Hidden Games" });
+        }
+    });
+    app.post("/admin/hidden-games", (req, res) => {
+        if (!isAdminPass(req)) {
+            return res.status(403).json({ ok: false, error: "Not Allowed" });
+        }
+        try {
+            const { hidden } = req.body || {};
+            if (!Array.isArray(hidden)) {
+                return res.status(400).json({ ok: false, error: "Invalid Hidden List" });
+            }
+            const games = loadGamesJSON(GAMES_JSON);
+            games._hidden = hidden.map(String).filter(Boolean);
+            saveGamesJSON(GAMES_JSON, games);
+            log("hidden-games: saved -", games._hidden.length, "hidden id(s)");
+            res.json({ ok: true, hidden: games._hidden });
+        } catch (e) {
+            log("hidden-games: POST FAILED -", e.stack || e.message);
+            res.status(500).json({ ok: false, error: "Failed To Save Hidden Games" });
         }
     });
     const popularityDebounce = new Map();
@@ -297,7 +366,7 @@ export function attachZoneGameRoutes(app, deps) {
                 log("popularity: id", id, "not found in zones feed");
                 return res.status(404).json({ ok: false, error: "Not Found" });
             }
-            const games = loadGamesJSON();
+            const games = loadGamesJSON(GAMES_JSON);
             const key = zoneKey(id);
             if (!games[key]) games[key] = { popularity: 0, dateAdded: Date.now() };
             const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
@@ -311,7 +380,7 @@ export function attachZoneGameRoutes(app, deps) {
                     const entry = games._list.find((g) => String(g.id) === id);
                     if (entry) entry.popularity = games[key].popularity;
                 }
-                saveGamesJSON(games);
+                saveGamesJSON(GAMES_JSON, games);
                 log("popularity: bumped id", id, "to", games[key].popularity);
             } else {
                 log("popularity: debounced for id", id, "(", ip, ")");

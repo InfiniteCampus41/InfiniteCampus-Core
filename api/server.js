@@ -26,7 +26,7 @@ import { Resend } from "resend";
 import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmentTracker.js";
 import * as Groups from "./groupsStore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesStore.js";
-import { attachZoneGameRoutes } from "./zonesStore.js";
+import { attachZoneGameRoutes, initZoneGames } from "./zonesStore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -375,6 +375,7 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // attachGameAssetFallback(app, { __dirname });
 attachZoneGameRoutes(app, { __dirname });
+initZoneGames({ __dirname }).catch((e) => console.error("initZoneGames failed:", e));
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAdminPassword);
 attachGameRoutes(app, {
