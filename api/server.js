@@ -1,3 +1,4 @@
+import "dotenv/config";
 import admin from "firebase-admin";
 import axios from "axios";
 import child_process from "child_process";
@@ -5,7 +6,6 @@ import { Client, Environment, WebhooksHelper } from "square";
 import cors from "cors";
 import { createServer } from "http";
 import crypto from "crypto";
-import dotenv from "dotenv";
 import express from "express";
 import { fileURLToPath } from "url";
 import FormData from "form-data";
@@ -26,7 +26,7 @@ import { Resend } from "resend";
 import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmentTracker.js";
 import * as Groups from "./groupsStore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesStore.js";
-dotenv.config();
+import { attachZoneGameRoutes } from "./zonesStore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,7 +34,7 @@ const UPLOADS_TEMP_DIR = path.join(__dirname, "uploads_temp");
 const UPLOADS_DIR = path.join(__dirname, "uploads");
 const UNIQUE_SUFFIX = "x9a7b2";
 const UPLOAD_LIMIT_MB = 100;
-const USE_720P = true;
+const USE_720P = false;
 const SCALE_WIDTH = USE_720P ? 1280 : 640;
 const SCALE_HEIGHT = USE_720P ? 720 : 360;
 const SCALE_SUFFIX = USE_720P ? "720" : "360";
@@ -54,7 +54,7 @@ const applicantMessages = new Map();
 const APPLY_DIR = path.join(__dirname, "apply");
 const APPLY_JSON = path.join(__dirname, "apply.json");
 const ARCHIVE_DIR = path.join(__dirname, "archive");
-const AUTO_DELETE_MS = 5 * 60 * 1000;
+const AUTO_DELETE_MS = 10 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
 const botSentDiscordIds = loadBotSentDiscordIds();
 const client = new Client({
@@ -295,7 +295,7 @@ class DataSnapshot {
 if (!admin.apps.length) {
     admin.initializeApp({
         credential: admin.credential.cert(JSON.parse(fs.readFileSync("./admin.json"))),
-        databaseURL: "https://notes-27f22-default-rtdb.firebaseio.com"
+        databaseURL: process.env.DB_URL
     });
 }
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
@@ -373,7 +373,8 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
-attachGameAssetFallback(app, { __dirname });
+// attachGameAssetFallback(app, { __dirname });
+attachZoneGameRoutes(app, { __dirname });
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAdminPassword);
 attachGameRoutes(app, {
