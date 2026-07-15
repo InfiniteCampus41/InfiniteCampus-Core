@@ -41,23 +41,21 @@ const ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15000;
 const ZONE_KEY_PREFIX = "zone:";
 const CUSTOM_GAME_CSS = `
-html, body {
-    margin: 0;
-    padding: 0;
-    width: 100%;
-    height: 100%;
-    background: #0b0b0f;
-    overflow: hidden;
-}
-// ::-webkit-scrollbar { display: none; }
-#content {
-    max-height:100%;
-}
-.zone-header {
-    display:none;
-}
-`
-;
+    html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #0b0b0f;
+        overflow: hidden;
+    }
+    #content, #content canvas {
+        max-height: 100% !important;
+    }
+    .zone-header {
+        display:none;
+    }
+`;
 let zoneCache = { data: null, fetchedAt: 0 };
 let inFlightFetch = null;
 function isValidZoneGame(z) {
@@ -162,13 +160,48 @@ function log(...args) {
     console.log("[zoneStore]", ...args);
 }
 function injectCustomCss(html) {
-    return injectHead(html, `<style id="ic-zone-game-style">${CUSTOM_GAME_CSS}</style>`);
+    return injectHead(html, `
+        <style id="ic-zone-game-style">
+        ${CUSTOM_GAME_CSS}
+        </style>
+        <script>
+        (() => {
+            function applyMaxHeight() {
+                try {
+                    const content = document.getElementById("content");
+                    if (content) {
+                        content.style.maxHeight = "100%";
+                        return true;
+                    }
+                    const zoneFrame = document.getElementById("zoneFrame");
+                    if (zoneFrame && zoneFrame.contentDocument) {
+                        const innerContent = zoneFrame.contentDocument.getElementById("content");
+                        if (innerContent) {
+                            innerContent.style.maxHeight = "100%";
+                            return true;
+                        }
+                    }
+                } catch (e) {}
+                return false;
+            }
+            const timer = setInterval(() => {
+                if (applyMaxHeight()) {
+                    clearInterval(timer);
+                }
+            }, 100);
+            window.addEventListener("load", applyMaxHeight);
+            new MutationObserver(applyMaxHeight).observe(document.documentElement, {
+                childList: true,
+                subtree: true
+            });
+        })();
+        </script>
+    `);
 }
 export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
     const GAMES_JSON = path.join(__dirname, "games.json");
     if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
-
     function loadGamesJSON() {
         try {
             return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));
@@ -194,6 +227,7 @@ export function attachZoneGameRoutes(app, deps) {
     }
     app.get("/api/zone-games", async (req, res) => {
         log("GET /api/zone-games from", req.ip);
+        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         try {
             const cached = loadGamesJSON();
             if (Array.isArray(cached._list) && cached._list.length) {
@@ -318,7 +352,7 @@ export function attachZoneGameRoutes(app, deps) {
             const contentType = upstream.headers.get("content-type") || "image/png";
             res.setHeader("Content-Type", contentType.startsWith("image/") ? contentType : "image/png");
             res.setHeader("X-Content-Type-Options", "nosniff");
-            res.setHeader("Cache-Control", "public, max-age=3600");
+            res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=2592000, immutable");
             const buf = Buffer.from(await upstream.arrayBuffer());
             log("thumbnail: served id", id, "-", buf.length, "bytes,", contentType);
             res.send(buf);
