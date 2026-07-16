@@ -203,6 +203,8 @@ const ROUTES = {
     DOWNLOAD_VIDEO: `/download/${UNIQUE_SUFFIX}/:name`,
     DELETE_VIDEO: `/delete/${UNIQUE_SUFFIX}/:name`,
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
+    MARK_WATCHED: `/api/watch_${UNIQUE_SUFFIX}/:name`,
+    UPLOAD_SUBTITLE: `/api/upload_subtitle_${UNIQUE_SUFFIX}/:name`,
 };
 const RULES_PATH = path.join(__dirname, "rules.json");
 const SC_SEARCH_BASE = process.env.MUSIC_SEARCH_URL;
@@ -246,6 +248,17 @@ const uploadApply = multer({
     },
 }).single("file");
 const uploadChunk = multer({ storage: multer.memoryStorage() });
+const uploadSubtitle = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext !== ".vtt" && ext !== ".srt") {
+            return cb(new Error("Invalid File Type. Allowed: .vtt, .srt"));
+        }
+        cb(null, true);
+    },
+}).single("subtitle");
 const uploadLogs = [];
 const uploadPfp = multer({
     storage: pfpStorage,
@@ -599,9 +612,25 @@ app.delete("/groups/:id", verifyFirebaseToken, rateLimit("delete"), async (req, 
 });
 app.delete(ROUTES.DELETE_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
-    const file = path.join(MOVIES_DIR, name + ".mp4");
+    const key = name + ".mp4";
+    const file = path.join(MOVIES_DIR, key);
     if (!fs.existsSync(file)) return res.status(404).send("Not Found");
     fs.unlinkSync(file);
+    try {
+        const moviesJson = loadMoviesJSON();
+        const entry = moviesJson[key];
+        if (entry?.subtitleUrl) {
+            const subtitleName = path.basename(entry.subtitleUrl);
+            const subtitlePath = path.join(SUBTITLES_DIR, subtitleName);
+            if (fs.existsSync(subtitlePath)) {
+                try { fs.unlinkSync(subtitlePath); } catch {}
+            }
+        }
+        delete moviesJson[key];
+        saveMoviesJSON(moviesJson);
+    } catch (e) {
+        console.error("Failed To Clean Up movies.json After Delete:", e.message);
+    }
     res.json({ ok: true });
 });
 app.get("/", (req, res) => {
@@ -1192,6 +1221,50 @@ app.get(`/subtitles/${UNIQUE_SUFFIX}/:name`, (req, res) => {
     res.setHeader("Content-Type", "text/vtt");
     res.setHeader("Access-Control-Allow-Origin", "*");
     fs.createReadStream(filePath).pipe(res);
+});
+app.post(ROUTES.MARK_WATCHED, (req, res) => {
+    try {
+        const name = path.basename(req.params.name);
+        const key = name + ".mp4";
+        const file = path.join(MOVIES_DIR, key);
+        if (!fs.existsSync(file)) return res.status(404).json({ error: "Not Found" });
+        const moviesJson = loadMoviesJSON();
+        if (!moviesJson[key] || typeof moviesJson[key] !== "object") moviesJson[key] = {};
+        moviesJson[key].popularity = (moviesJson[key].popularity || 0) + 1;
+        saveMoviesJSON(moviesJson);
+        res.json({ ok: true, popularity: moviesJson[key].popularity });
+    } catch (err) {
+        console.error("Failed To Update Movie Popularity:", err.message);
+        res.status(500).json({ error: "Failed To Update Popularity" });
+    }
+});
+app.post(ROUTES.UPLOAD_SUBTITLE, (req, res) => {
+    uploadSubtitle(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ error: err.message || "Upload Failed" });
+        }
+        try {
+            const name = path.basename(req.params.name);
+            const key = name + ".mp4";
+            const movieFile = path.join(MOVIES_DIR, key);
+            if (!fs.existsSync(movieFile)) return res.status(404).json({ error: "Movie Not Found" });
+            if (!req.file) return res.status(400).json({ error: "No Subtitle File Uploaded" });
+            const ext = path.extname(req.file.originalname).toLowerCase();
+            const raw = req.file.buffer.toString("utf8");
+            const vttContent = ext === ".srt" ? srtToVtt(raw) : raw;
+            const vttFileName = `${name}.vtt`;
+            const vttDest = path.join(SUBTITLES_DIR, vttFileName);
+            fs.writeFileSync(vttDest, vttContent, "utf8");
+            const moviesJson = loadMoviesJSON();
+            if (!moviesJson[key] || typeof moviesJson[key] !== "object") moviesJson[key] = {};
+            moviesJson[key].subtitleUrl = vttFileName;
+            saveMoviesJSON(moviesJson);
+            res.json({ ok: true, subtitleUrl: vttFileName });
+        } catch (e) {
+            console.error("Subtitle Upload Failed:", e.message);
+            res.status(500).json({ error: "Failed To Upload Subtitle" });
+        }
+    });
 });
 app.get("/verify-user", verifyFirebaseToken, async (req, res) => {
     const { uid, token } = req.query;
@@ -3859,6 +3932,15 @@ async function finishReject(movieName) {
     }
     deleteApply(movieName);
 }
+function srtToVtt(srtText) {
+    let body = srtText.replace(/\r+/g, "").trim();
+    body = body.replace(
+        /(\d{2}:\d{2}:\d{2}),(\d{3})/g,
+        (_, time, ms) => `${time}.${ms}`
+    );
+    body = body.replace(/^\d+\s*\n(?=\d{2}:\d{2}:\d{2}\.\d{3} -->)/gm, "");
+    return `WEBVTT\n\n${body}\n`;
+}
 async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
     try {
         socket?.emit("jobLog", { filename: safeFile, text: "Starting Whisper transcription (this may take several minutes)..." });
@@ -5307,7 +5389,8 @@ function listMovies() {
             db_id: moviesJson[f]?.db_id || null,
             cover: moviesJson[f]?.cover || null,
             rating: moviesJson[f]?.rating || null,
-            subtitleUrl: moviesJson[f]?.subtitleUrl || null
+            subtitleUrl: moviesJson[f]?.subtitleUrl || null,
+            popularity: moviesJson[f]?.popularity ?? 0
         };
     });
     list.sort((a, b) => a.order - b.order);
@@ -5590,7 +5673,11 @@ function requireAdminPassword(req, res, next) {
         `/delete/${UNIQUE_SUFFIX}`,
         `/api/delete_apply_${UNIQUE_SUFFIX}`
     ];
-    const isAdminPrefix = req.path.startsWith("/admin");
+    const adminPrefixRoutes = [
+        `/delete/${UNIQUE_SUFFIX}/`,
+        `/api/upload_subtitle_${UNIQUE_SUFFIX}/`
+    ];
+    const isAdminPrefix = req.path.startsWith("/admin") || adminPrefixRoutes.some(p => req.path.startsWith(p));
     const isAdminExact = adminRoutes.includes(req.path);
     if (isAdminPrefix || isAdminExact) {
         const pass = req.headers["x-admin-password"];
