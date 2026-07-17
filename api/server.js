@@ -3109,6 +3109,13 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
         }
         if (!uid) return res.status(401).json({ error: "Unauthorized" });
         if (
+            value && typeof value === "object" && !Array.isArray(value) &&
+            (path[0] === "messages" || path[0] === "private")
+        ) {
+            if (Object.prototype.hasOwnProperty.call(value, "s")) value.s = uid;
+            if (Object.prototype.hasOwnProperty.call(value, "sender")) value.sender = uid;
+        }
+        if (
             path.length === 3 && path[0] === "messages" &&
             value && typeof value === "object" &&
             (value.t || value.text)
@@ -3941,9 +3948,27 @@ function srtToVtt(srtText) {
     body = body.replace(/^\d+\s*\n(?=\d{2}:\d{2}:\d{2}\.\d{3} -->)/gm, "");
     return `WEBVTT\n\n${body}\n`;
 }
+function checkWhisperBuildTools() {
+    const missing = [];
+    for (const bin of ["make", "cmake", "g++"]) {
+        try {
+            child_process.execSync(`command -v ${bin}`, { stdio: "ignore" });
+        } catch {
+            missing.push(bin);
+        }
+    }
+    return missing;
+}
 async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
     try {
         socket?.emit("jobLog", { filename: safeFile, text: "Starting Whisper transcription (this may take several minutes)..." });
+        const missingTools = checkWhisperBuildTools();
+        if (missingTools.length) {
+            const msg = `Whisper cannot compile its native binary because these build tools are missing on this machine: ${missingTools.join(", ")}. On Raspberry Pi / Debian, install them with: sudo apt-get update && sudo apt-get install -y build-essential cmake, then restart the server and try again.`;
+            console.error("[Whisper] " + msg);
+            socket?.emit("jobLog", { filename: safeFile, text: msg });
+            return null;
+        }
         const { nodewhisper } = await import("nodejs-whisper");
         await nodewhisper(movieFilePath, {
             modelName: "medium",
@@ -3979,8 +4004,13 @@ async function generateSubtitles(movieFilePath, baseName, socket, safeFile) {
         socket?.emit("jobLog", { filename: safeFile, text: `Subtitles generated: ${vttFileName}` });
         return `/subtitles/${UNIQUE_SUFFIX}/${vttFileName}`;
     } catch (err) {
-        console.error("[Whisper] Subtitle generation failed:", err.message || err);
-        socket?.emit("jobLog", { filename: safeFile, text: `Whisper failed (non-fatal): ${err.message}` });
+        const rawMsg = err.message || String(err);
+        let hint = "";
+        if (/enoent|not found|no such file|permission denied|exec format error/i.test(rawMsg)) {
+            hint = " This usually means the compiled whisper.cpp binary is missing or was built for the wrong CPU architecture. Delete node_modules/nodejs-whisper/cpp/whisper.cpp/build (or reinstall the nodejs-whisper package) so it rebuilds natively on this machine, and make sure build-essential/cmake are installed.";
+        }
+        console.error("[Whisper] Subtitle generation failed:", rawMsg);
+        socket?.emit("jobLog", { filename: safeFile, text: `Whisper failed (non-fatal): ${rawMsg}${hint}` });
         return null;
     }
 }
@@ -5834,6 +5864,7 @@ function serializeDiscordEmbed(embed) {
 }
 function setMirrorId(channelName, timestamp, discordMirrorId) {
     mirrorIdMap[`${channelName}:${timestamp}`] = String(discordMirrorId);
+    discordMsgIdToTimestamp[String(discordMirrorId)] = { channel: channelName, timestamp: String(timestamp) };
     try {
         const data = getDataCache();
         const entry = data?.messages?.[channelName]?.[String(timestamp)];
@@ -6472,6 +6503,7 @@ function updateDiscordUserAcrossMessages(discordUserId, newUsername, newAvatarPr
         console.log(`[DiscordBridge] Updated username/avatar for Discord user ${discordUserId} across ${totalUpdated} message(s)`);
     }
 }
+const DISCORD_MAX_RETRIES = 3;
 setInterval(async () => {
     let processed = 0;
     while (processed < DISCORD_RPS && discordQueue.length) {
@@ -6483,6 +6515,17 @@ setInterval(async () => {
             if (err.response?.status === 429) {
                 const info = `Discord 429 For ${item.axiosConfig.url} At ${new Date().toISOString()}`;
                 console.log(info);
+                const retries = item.retries || 0;
+                if (retries < DISCORD_MAX_RETRIES) {
+                    const retryAfterMs = Math.max(
+                        Math.ceil((err.response?.data?.retry_after || 1) * 1000),
+                        250
+                    );
+                    setTimeout(() => {
+                        discordQueue.push({ ...item, retries: retries + 1, createdAt: Date.now() });
+                    }, retryAfterMs);
+                    return;
+                }
             }
             item.reject(err);
         });
