@@ -144,7 +144,7 @@ let _listFilesInterval = null;
 let liveInterval = null;
 let liveMode = false;
 let LOCKDOWN = false;
-const logid = "1460410323369721868";
+const logid = process.env.LOG_ID;
 const MAX_APPLY_BYTES = 30 * 1024 * 1024 * 1024;
 const MAX_DISCORD_QUEUE = 5000;
 const MAX_FILE_BYTES = 1024 * 1024 * 1024 * 30;
@@ -713,6 +713,55 @@ app.get("/api/guest-channel-info", async (req, res) => {
         guestRead: !!(chData.guestRead),
         guestWrite: !!(chData.guestWrite),
     });
+});
+app.post("/api/mentionable-users", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const { type, channel, groupId, targetUid } = req.body || {};
+        const data = getDataCache();
+        const usersData = data?.users || {};
+        let candidateUids = [];
+        if (type === "channel") {
+            const ch = (channel || "").toString();
+            if (!ch) return res.status(400).json({ error: "Missing channel" });
+            const chData = data?.channels?.[ch];
+            const restricted = isRestrictedChannelName(ch);
+            candidateUids = Object.keys(usersData).filter(candidateUid => {
+                const profile = usersData[candidateUid]?.profile;
+                if (!profile) return false;
+                if (restricted && !canBypassRestrictedChannel(profile)) return false;
+                return canReadChannelServer(profile, chData);
+            });
+        } else if (type === "group") {
+            if (!groupId) return res.status(400).json({ error: "Missing groupId" });
+            const group = Groups.getGroup(groupId);
+            if (!group) return res.status(404).json({ error: "Group Not Found" });
+            if (!Groups.isMember(group, requesterUid)) {
+                return res.status(403).json({ error: "You Are Not A Member Of This Group" });
+            }
+            candidateUids = group.members || [];
+        } else if (type === "private") {
+            const otherUid = (targetUid || "").toString();
+            if (!otherUid) return res.status(400).json({ error: "Missing targetUid" });
+            candidateUids = [requesterUid, otherUid];
+        } else {
+            return res.status(400).json({ error: "Invalid Type" });
+        }
+        const seen = new Set();
+        const users = [];
+        for (const candidateUid of candidateUids) {
+            if (candidateUid === requesterUid) continue;
+            if (seen.has(candidateUid)) continue;
+            seen.add(candidateUid);
+            const profile = usersData[candidateUid]?.profile;
+            if (!profile || !profile.displayName) continue;
+            users.push({ uid: candidateUid, displayName: profile.displayName });
+        }
+        res.json({ success: true, users });
+    } catch (err) {
+        console.error("[Mentions] mentionable-users error:", err);
+        res.status(500).json({ error: "Could Not Load Mentionable Users" });
+    }
 });
 app.get("/api/movies-json", (req, res) => {
     const pass = req.headers["x-admin-password"];
@@ -5346,6 +5395,50 @@ function isStaffProfile(profile) {
 function isVerifiedProfile(profile) {
     if (!profile) return false;
     return !!(profile.verified || profile.isOwner || profile.isTester || profile.isCoOwner || profile.isAdmin || profile.isHAdmin || profile.isDev);
+}
+function isRestrictedChannelName(ch) {
+    return ch === "Admin-Chat" || ch === "Premium-Chat";
+}
+function computeProfileRoles(profile) {
+    const p = profile || {};
+    return {
+        isOwner: !!p.isOwner,
+        isTester: !!p.isTester,
+        isCoOwner: !!p.isCoOwner,
+        isHAdmin: !!p.isHAdmin,
+        isAdmin: !!p.isAdmin,
+        isDev: !!p.isDev,
+        isPartner: !!p.isPartner,
+        premium1: !!p.premium1,
+        premium2: !!p.premium2,
+        premium3: !!p.premium3,
+        isDonater: !!p.isDonater,
+        isSus: !!p.isSus,
+        mileStone: !!p.mileStone,
+        isGuesser: !!p.isGuesser,
+        isUploader: !!p.isUploader,
+        isLink: !!p.isLink,
+        secure: !!p.secure,
+        guardian: !!p.guardian,
+        lanschool: !!p.lanschool,
+        linewize: !!p.linewize,
+        blocksi: !!p.blocksi
+    };
+}
+function canReadChannelServer(profile, chData) {
+    if (!chData) return true;
+    const roles = computeProfileRoles(profile);
+    if (roles.isOwner || roles.isTester || roles.isCoOwner) return true;
+    const perms = chData.read || {};
+    if (perms.verified) return true;
+    for (const role in perms) {
+        if (perms[role] === true && roles[role]) return true;
+    }
+    return false;
+}
+function canBypassRestrictedChannel(profile) {
+    const roles = computeProfileRoles(profile);
+    return !!(roles.isAdmin || roles.isOwner || roles.isCoOwner || roles.isHAdmin || roles.isTester || roles.isDev || roles.premium2 || roles.premium3);
 }
 function listFilesLive() {
     if (_listFilesInterval) clearInterval(_listFilesInterval);
