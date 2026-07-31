@@ -3099,6 +3099,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         botSentDiscordIds.add(guestUploadDiscordMsgId);
                         saveBotSentDiscordIds();
                         setMirrorId(channelName, ts, guestUploadDiscordMsgId);
+                        if (uploadResp?.data?.attachments?.length) {
+                            trackDiscordAttachments(channelName, ts, guestUploadDiscordMsgId, uploadResp.data.attachments);
+                        }
                     }
                     if (cdnUrl) {
                         const _guestParsedCdn = (() => { try { const u = new URL(cdnUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2], filename: p[3].split("?")[0] } : null; } catch { return null; } })();
