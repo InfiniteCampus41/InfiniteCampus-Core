@@ -6827,6 +6827,24 @@ setInterval(async () => {
         }
     }
 }, WS_POLL_INTERVAL_TYPING);
+setInterval(() => {
+    try {
+        const files = fs.readdirSync(MOVIES_DIR);
+        for (const file of files) {
+            if (path.extname(file).toLowerCase() === ".wav") {
+                const filePath = path.join(MOVIES_DIR, file);
+                try {
+                    fs.unlinkSync(filePath);
+                    console.log("Deleted Stray WAV File:", filePath);
+                } catch (e) {
+                    console.error("Failed To Delete WAV File:", filePath, e.message);
+                }
+            }
+        }
+    } catch (e) {
+        console.error("WAV Cleanup Job Error:", e.message);
+    }
+}, 5 * 60 * 1000);
 setupSocketHandlers(ioLive, "LIVE");
 setupSocketHandlers(ioRealtime, "REALTIME");
 scheduleDailyClear();
