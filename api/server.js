@@ -1226,14 +1226,22 @@ app.get(ROUTES.STREAM_APPLY, (req, res) => {
         res.status(500).send("Server Error");
     }
 });
-app.get(ROUTES.STREAM_VIDEO, (req, res) => {
+app.get(ROUTES.STREAM_VIDEO, async (req, res) => {
+    let stream;
     try {
         const name = path.basename(req.params.name);
         const candidate = path.join(MOVIES_DIR, name + ".mp4");
-        if (!candidate.startsWith(MOVIES_DIR) || !fs.existsSync(candidate)) return res.status(404).send("Not Found");
-        const stat = fs.statSync(candidate);
+        if (!candidate.startsWith(MOVIES_DIR)) return res.status(404).send("Not Found");
+        let stat;
+        try {
+            stat = await fs.promises.stat(candidate);
+        } catch {
+            return res.status(404).send("Not Found");
+        }
         const total = stat.size;
         const range = req.headers.range;
+        const cleanup = () => { if (stream && !stream.destroyed) stream.destroy(); };
+        res.on("close", cleanup);
         if (range) {
             const parts = /bytes=(\d+)-(\d*)/.exec(range);
             if (!parts) return res.status(416).send("Invalid Range");
@@ -1248,7 +1256,7 @@ app.get(ROUTES.STREAM_VIDEO, (req, res) => {
                 "Content-Type": "video/mp4",
                 "Cache-Control": "public, max-age=3600",
             });
-            fs.createReadStream(candidate, { start, end }).pipe(res);
+            stream = fs.createReadStream(candidate, { start, end });
         } else {
             res.writeHead(200, {
                 "Content-Length": total,
@@ -1256,11 +1264,18 @@ app.get(ROUTES.STREAM_VIDEO, (req, res) => {
                 "Accept-Ranges": "bytes",
                 "Cache-Control": "public, max-age=3600",
             });
-            fs.createReadStream(candidate).pipe(res);
+            stream = fs.createReadStream(candidate);
         }
+        stream.on("error", (err) => {
+            console.error("Movie Stream Error:", err.message);
+            cleanup();
+            if (!res.headersSent) res.status(500).end();
+            else res.end();
+        });
+        stream.pipe(res);
     } catch (e) {
         console.error(e);
-        res.status(500).send("Server Error");
+        if (!res.headersSent) res.status(500).send("Server Error");
     }
 });
 app.get(`/subtitles/${UNIQUE_SUFFIX}/:name`, (req, res) => {
