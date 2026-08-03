@@ -205,6 +205,7 @@ const ROUTES = {
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
     MARK_WATCHED: `/api/watch_${UNIQUE_SUFFIX}/:name`,
     UPLOAD_SUBTITLE: `/api/upload_subtitle_${UNIQUE_SUFFIX}/:name`,
+    THUMB_PROXY: `/thumb/${UNIQUE_SUFFIX}/:name`,
 };
 const RULES_PATH = path.join(__dirname, "rules.json");
 const SC_SEARCH_BASE = process.env.MUSIC_SEARCH_URL;
@@ -1285,6 +1286,28 @@ app.get(`/subtitles/${UNIQUE_SUFFIX}/:name`, (req, res) => {
     res.setHeader("Content-Type", "text/vtt");
     res.setHeader("Access-Control-Allow-Origin", "*");
     fs.createReadStream(filePath).pipe(res);
+});
+app.get(ROUTES.THUMB_PROXY, async (req, res) => {
+    try {
+        const key = path.basename(req.params.name);
+        const movieFile = key + ".mp4";
+        const moviesJson = loadMoviesJSON();
+        const coverUrl = moviesJson[movieFile]?.cover;
+        if (!coverUrl) return res.status(404).send("Not Found");
+        const upstream = await fetch(coverUrl);
+        if (!upstream.ok || !upstream.body) return res.status(502).send("Bad Gateway");
+        res.setHeader("Content-Type", upstream.headers.get("content-type") || "image/jpeg");
+        res.setHeader("Cache-Control", "public, max-age=86400");
+        upstream.body.pipe(res);
+        upstream.body.on("error", (err) => {
+            console.error("Thumb Proxy Stream Error:", err.message);
+            if (!res.headersSent) res.status(500).end();
+            else res.end();
+        });
+    } catch (err) {
+        console.error("Thumb Proxy Error:", err.message);
+        if (!res.headersSent) res.status(500).send("Server Error");
+    }
 });
 app.post(ROUTES.MARK_WATCHED, (req, res) => {
     try {
@@ -4321,7 +4344,7 @@ async function resumeInProgressAccepts() {
                 const cleanName = idBasename.replace(/_\d+$/, "");
                 const tmdbData = await findMovieId(cleanName);
                 if (!moviesJson[baseName]) {
-                    moviesJson[baseName] = { order: getNextOrder(moviesJson), uploadedBy: uploaderUid, db_id: tmdbData.id || null, cover: tmdbData.cover || null, rating: tmdbData.rating || null };
+                    moviesJson[baseName] = { order: getNextOrder(moviesJson), uploadedBy: uploaderUid, db_id: tmdbData.id || null, cover: tmdbData.cover || null, proxiedthumb: tmdbData.cover ? buildProxiedThumbPath(baseName) : null, rating: tmdbData.rating || null };
                     saveMoviesJSON(moviesJson);
                 }
                 acceptStatus.set(movieName, { status: "completed", percent: 100, remainingSec: 0, message: "Completed", updated: Date.now() });
@@ -5354,6 +5377,10 @@ function getNextOrder(moviesJson) {
     if (orders.length === 0) return 1;
     return Math.max(...orders) + 1;
 }
+function buildProxiedThumbPath(baseName) {
+    const key = path.parse(baseName).name;
+    return `/thumb/${UNIQUE_SUFFIX}/${encodeURIComponent(key)}`;
+}
 function getRuleForOperation(rules, pathParts, type) {
     let current = rules;
     let lastRule = null;
@@ -5516,6 +5543,15 @@ function listMovies() {
     const files = fs.readdirSync(MOVIES_DIR).filter((f) => {
         return path.extname(f).toLowerCase() === ".mp4";
     });
+    let moviesJsonDirty = false;
+    for (const f of files) {
+        const entry = moviesJson[f];
+        if (entry && entry.cover && !entry.proxiedthumb) {
+            entry.proxiedthumb = buildProxiedThumbPath(f);
+            moviesJsonDirty = true;
+        }
+    }
+    if (moviesJsonDirty) saveMoviesJSON(moviesJson);
     let list = files.map((f) => {
         const stats = fs.statSync(path.join(MOVIES_DIR, f));
         const name = path.parse(f).name;
@@ -5529,6 +5565,7 @@ function listMovies() {
             uploadedBy: moviesJson[f]?.uploadedBy || "User",
             db_id: moviesJson[f]?.db_id || null,
             cover: moviesJson[f]?.cover || null,
+            proxiedthumb: moviesJson[f]?.proxiedthumb || null,
             rating: moviesJson[f]?.rating || null,
             subtitleUrl: moviesJson[f]?.subtitleUrl || null,
             popularity: moviesJson[f]?.popularity ?? 0
@@ -6128,6 +6165,7 @@ function setupSocketHandlers(ioInstance, label) {
                             uploadedBy: uploaderUid,
                             db_id: tmdbData.id || null,
                             cover: tmdbData.cover || null,
+                            proxiedthumb: tmdbData.cover ? buildProxiedThumbPath(baseName) : null,
                             rating: tmdbData.rating || null,
                             subtitleUrl: null
                         };
