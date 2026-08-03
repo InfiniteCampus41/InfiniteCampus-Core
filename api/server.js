@@ -2799,10 +2799,10 @@ app.post("/square-webhook",
                 return res.sendStatus(403);
             }
             const event = JSON.parse(req.body.toString());
-            if (event.type === "payment.created") {
+            if (event.type === "payment.updated" && event.data.object.payment.status === "COMPLETED") {
                 const payment = event.data.object.payment;
                 const uid = payment.note;
-                const amount = payment.amount_money.amount;
+                const amount = payment.approved_money.amount;
                 const amountDollars = amount / 100;
                 const donationData = getDataCache();
                 if (!donationData.donations) donationData.donations = {};
