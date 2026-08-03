@@ -140,29 +140,16 @@ async function syncRepoToPublic(src, dest) {
         }
     }
 }
-function getTarballUrl(repoUrl, branch) {
-    const match = repoUrl.match(/github\.com[:/]+([^/]+)\/([^/.]+?)(\.git)?\/?$/i);
-    if (!match) {
-        throw new Error(`REPO_URL "${repoUrl}" is not a recognizable GitHub URL; tarball download requires a github.com repo URL.`);
-    }
-    const [, owner, repo] = match;
-    return `https://codeload.github.com/${owner}/${repo}/tar.gz/refs/heads/${branch}`;
-}
 async function cloneOrPullRepo() {
-    console.log("Downloading Repo Archive (no .git stored)");
-    await fs.rm(REPO_CLONE_PATH, { recursive: true, force: true });
-    await fs.mkdir(REPO_CLONE_PATH, { recursive: true });
-    const tarballUrl = getTarballUrl(REPO_URL, BRANCH);
-    const tarPath = path.join(REPO_CLONE_PATH, "repo.tar.gz");
-    const res = await fetch(tarballUrl);
-    if (!res.ok) {
-        throw new Error(`Failed to download tarball (${res.status} ${res.statusText}) from ${tarballUrl}`);
+    try {
+        await fs.access(REPO_CLONE_PATH);
+        console.log("Fetching Repo");
+        await run(`git -C ${REPO_CLONE_PATH} fetch origin ${BRANCH}`);
+        await run(`git -C ${REPO_CLONE_PATH} reset --hard origin/${BRANCH}`);
+    } catch {
+        console.log("Cloning Repo");
+        await run(`git clone --branch ${BRANCH} ${REPO_URL} ${REPO_CLONE_PATH}`);
     }
-    const buffer = Buffer.from(await res.arrayBuffer());
-    await fs.writeFile(tarPath, buffer);
-    await run(`tar -xzf ${tarPath} -C ${REPO_CLONE_PATH} --strip-components=1`);
-    await fs.rm(tarPath, { force: true });
-    console.log("Extracted (no .git present)");
     console.log("Syncing Repo");
     await fs.mkdir(PUBLIC_DIR, { recursive: true });
     const repoPublicPath = path.join(REPO_CLONE_PATH, "public");
@@ -174,7 +161,6 @@ async function cloneOrPullRepo() {
     }
     console.log("Synced");
 }
-
 async function loadBlockedUrls() {
     try {
         const data = await fs.readFile(URLS_FILE, "utf-8");
