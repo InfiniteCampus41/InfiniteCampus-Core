@@ -93,6 +93,8 @@ let discordQueueProcessing = false;
 const DISCORD_QUEUE_TTL = 5 * 60 * 1000;
 const DISCORD_RPS = 48;
 const discordVerifications = new Map();
+const discordUserLookupCache = new Map();
+const DISCORD_USER_LOOKUP_TTL = 10 * 60 * 1000;
 const diskStorage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -791,6 +793,37 @@ app.get("/discord-avatar-proxy", async (req, res) => {
         r.body.pipe(res);
     } catch (e) {
         res.status(500).send("Proxy Error");
+    }
+});
+app.post("/discord-user-lookup", rateLimit("read"), async (req, res) => {
+    try {
+        let ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        if (req.body?.id) ids.push(req.body.id);
+        ids = [...new Set(ids.filter(id => typeof id === "string" && /^\d{5,25}$/.test(id)))].slice(0, 50);
+        if (!ids.length) return res.status(400).json({ error: "No Valid Discord User IDs Provided" });
+        const users = {};
+        await Promise.all(ids.map(async (id) => {
+            const cached = discordUserLookupCache.get(id);
+            if (cached && (Date.now() - cached.ts) < DISCORD_USER_LOOKUP_TTL) {
+                users[id] = cached.username;
+                return;
+            }
+            try {
+                const resp = await discordRequest({
+                    method: "get",
+                    url: `https://discord.com/api/v10/users/${id}`
+                });
+                const username = resp?.data?.global_name || resp?.data?.username || null;
+                discordUserLookupCache.set(id, { username, ts: Date.now() });
+                users[id] = username;
+            } catch (e) {
+                users[id] = null;
+            }
+        }));
+        res.json({ users });
+    } catch (err) {
+        console.error("Discord User Lookup Error:", err.message || err);
+        res.status(500).json({ error: "Server Error" });
     }
 });
 app.get("/discord-channel-map", verifyFirebaseToken, async (req, res) => {
