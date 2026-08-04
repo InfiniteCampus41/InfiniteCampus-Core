@@ -3221,6 +3221,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 userProfile.isAdmin || userProfile.isHAdmin ||
                 userProfile.isTester
             );
+            if (!isAdminUser && userProfile.isMuted) {
+                return res.status(403).json({ error: "You Are Muted And Cannot Send Messages.", muted: true });
+            }
             if (!isAdminUser) {
                 const filterResult = checkMessageForRestrictedWords(msgText, userProfile);
                 if (filterResult.blocked) {
@@ -3228,6 +3231,25 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                         error: filterResult.reason,
                         blocked: true,
                         blockedWord: filterResult.word
+                    });
+                }
+            }
+            if (!isAdminUser) {
+                const channelName = path[1];
+                const lastTwo = getLastMessages(channelName, 2);
+                const bothFromSender = lastTwo.length === 2 && lastTwo.every(
+                    m => (m?.s || m?.sender) === uid
+                );
+                if (
+                    bothFromSender &&
+                    isMostlySameText(msgText, lastTwo[0]?.t || lastTwo[0]?.text || "") &&
+                    isMostlySameText(msgText, lastTwo[1]?.t || lastTwo[1]?.text || "")
+                ) {
+                    updateDataPath(`users/${uid}/profile`, { isMuted: true });
+                    broadcastUpdate(["users", uid, "profile"], getDataCache()?.users?.[uid]?.profile || {});
+                    return res.status(403).json({
+                        error: "You Have Been Muted For Repeating The Same Message.",
+                        muted: true
                     });
                 }
             }
@@ -5077,6 +5099,50 @@ function broadcastUpdate(changedPath, newValue) {
             console.error("WS broadcastUpdate error:", e);
         }
     }
+}
+function getLastMessages(channelName, n) {
+    const dataJson = getDataCache();
+    const channelMsgs = dataJson?.messages?.[channelName];
+    if (!channelMsgs) return [];
+    const sortedKeys = Object.keys(channelMsgs).sort((a, b) => Number(a) - Number(b));
+    return sortedKeys.slice(-n).map(k => channelMsgs[k]);
+}
+function normalizeForDuplicateCheck(text) {
+    return String(text || "")
+        .toLowerCase()
+        .replace(/<[^>]*>/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+}
+function levenshteinDistance(a, b) {
+    const m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    let prev = new Array(n + 1);
+    let curr = new Array(n + 1);
+    for (let j = 0; j <= n; j++) prev[j] = j;
+    for (let i = 1; i <= m; i++) {
+        curr[0] = i;
+        for (let j = 1; j <= n; j++) {
+            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+            curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+        }
+        [prev, curr] = [curr, prev];
+    }
+    return prev[n];
+}
+function isMostlySameText(a, b) {
+    const na = normalizeForDuplicateCheck(a);
+    const nb = normalizeForDuplicateCheck(b);
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const longer = na.length >= nb.length ? na : nb;
+    const shorter = na.length >= nb.length ? nb : na;
+    if (longer.length === 0) return true;
+    if (shorter.length / longer.length < 0.5) return false;
+    const distance = levenshteinDistance(na, nb);
+    const similarity = 1 - distance / longer.length;
+    return similarity >= 0.85;
 }
 function checkMessageForRestrictedWords(text, userProfile) {
     if (!text) return { blocked: false };
