@@ -8,12 +8,14 @@ admin.initializeApp({
 });
 const db = admin.database();
 let running = false;
+const CHECK_INTERVAL_MS = 5 * 60 * 1000;
+const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 async function checkSites() {
     if (running) return;
     running = true;
     const now = new Date();
     const key = hourKeyUTC(now);
-    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const cutoff = Date.now() - RETENTION_MS;
     console.log("Checking Sites @", now.toISOString());
     const sitesSnap = await db.ref("sites").get();
     if (!sitesSnap.exists()) {
@@ -48,8 +50,8 @@ async function checkSites() {
             const maintSnap = await maintRef.get();
             if (maintSnap.exists()) {
                 const maint = maintSnap.val();
-                if (maint.end && maint.end * 1000 < Date.now()) {
-                    console.log("Cleaning Expired Maintenance:", num);
+                if (maint.end && maint.end * 1000 < cutoff) {
+                    console.log("Cleaning Expired Maintenance (past retention):", num);
                     maintRef.remove();
                 }
             }
@@ -93,8 +95,15 @@ async function safeFetch(url) {
 app.get("/", (req, res) => {
     res.send("Status Monitor Running");
 });
+function msUntilNextAlignedCheck() {
+    const now = Date.now();
+    return CHECK_INTERVAL_MS - (now % CHECK_INTERVAL_MS);
+}
 app.listen(3000, async () => {
     console.log("Server Started On Port 3000");
     await checkSites();
-    setInterval(checkSites, 5 * 60 * 1000);
+    setTimeout(() => {
+        checkSites();
+        setInterval(checkSites, CHECK_INTERVAL_MS);
+    }, msUntilNextAlignedCheck());
 });
