@@ -95,6 +95,10 @@ const DISCORD_RPS = 48;
 const discordVerifications = new Map();
 const discordUserLookupCache = new Map();
 const DISCORD_USER_LOOKUP_TTL = 10 * 60 * 1000;
+const discordChannelLookupCache = new Map();
+const DISCORD_CHANNEL_LOOKUP_TTL = 10 * 60 * 1000;
+const discordRoleListCache = { roles: null, ts: 0 };
+const DISCORD_ROLE_LIST_TTL = 10 * 60 * 1000;
 const diskStorage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -823,6 +827,68 @@ app.post("/discord-user-lookup", rateLimit("read"), async (req, res) => {
         res.json({ users });
     } catch (err) {
         console.error("Discord User Lookup Error:", err.message || err);
+        res.status(500).json({ error: "Server Error" });
+    }
+});
+app.post("/discord-channel-lookup", rateLimit("read"), async (req, res) => {
+    try {
+        let ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        if (req.body?.id) ids.push(req.body.id);
+        ids = [...new Set(ids.filter(id => typeof id === "string" && /^\d{5,25}$/.test(id)))].slice(0, 50);
+        if (!ids.length) return res.status(400).json({ error: "No Valid Discord Channel IDs Provided" });
+        const channels = {};
+        await Promise.all(ids.map(async (id) => {
+            const cached = discordChannelLookupCache.get(id);
+            if (cached && (Date.now() - cached.ts) < DISCORD_CHANNEL_LOOKUP_TTL) {
+                channels[id] = cached.data;
+                return;
+            }
+            try {
+                const resp = await discordRequest({
+                    method: "get",
+                    url: `https://discord.com/api/v10/channels/${id}`
+                });
+                const data = resp?.data ? { name: resp.data.name || null, type: resp.data.type } : null;
+                discordChannelLookupCache.set(id, { data, ts: Date.now() });
+                channels[id] = data;
+            } catch (e) {
+                channels[id] = null;
+            }
+        }));
+        res.json({ channels });
+    } catch (err) {
+        console.error("Discord Channel Lookup Error:", err.message || err);
+        res.status(500).json({ error: "Server Error" });
+    }
+});
+app.post("/discord-role-lookup", rateLimit("read"), async (req, res) => {
+    try {
+        let ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
+        if (req.body?.id) ids.push(req.body.id);
+        ids = [...new Set(ids.filter(id => typeof id === "string" && /^\d{5,25}$/.test(id)))].slice(0, 50);
+        if (!ids.length) return res.status(400).json({ error: "No Valid Discord Role IDs Provided" });
+        const GUILD_ID = process.env.DISCORD_GUILD_ID;
+        if (!GUILD_ID) return res.status(500).json({ error: "Discord Guild Not Configured" });
+        if (!discordRoleListCache.roles || (Date.now() - discordRoleListCache.ts) >= DISCORD_ROLE_LIST_TTL) {
+            const resp = await discordRequest({
+                method: "get",
+                url: `https://discord.com/api/v10/guilds/${GUILD_ID}/roles`
+            });
+            const list = Array.isArray(resp?.data) ? resp.data : [];
+            const byId = {};
+            for (const role of list) {
+                byId[role.id] = { name: role.name, color: role.color || 0 };
+            }
+            discordRoleListCache.roles = byId;
+            discordRoleListCache.ts = Date.now();
+        }
+        const roles = {};
+        for (const id of ids) {
+            roles[id] = discordRoleListCache.roles?.[id] || null;
+        }
+        res.json({ roles });
+    } catch (err) {
+        console.error("Discord Role Lookup Error:", err.message || err);
         res.status(500).json({ error: "Server Error" });
     }
 });
