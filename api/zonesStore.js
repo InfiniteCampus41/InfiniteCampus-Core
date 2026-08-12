@@ -58,6 +58,7 @@ const CUSTOM_GAME_CSS = `
 `;
 let zoneCache = { data: null, fetchedAt: 0 };
 let inFlightFetch = null;
+let zoneRefreshTimer = null;
 function isValidZoneGame(z) {
     return (
         z &&
@@ -79,6 +80,21 @@ async function fetchWithTimeout(url, opts = {}) {
     } finally {
         clearTimeout(timeout);
     }
+}
+async function fetchWithRetry(url, opts = {}, retries = 1) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fetchWithTimeout(url, opts);
+        } catch (e) {
+            lastErr = e;
+            if (attempt < retries) {
+                log("fetchWithRetry: attempt", attempt + 1, "failed for", url, "-", e.message, "- retrying");
+                await new Promise((r) => setTimeout(r, 500));
+            }
+        }
+    }
+    throw lastErr;
 }
 async function fetchZonesFresh() {
     let lastErr = null;
@@ -103,17 +119,42 @@ async function fetchZonesFresh() {
 }
 async function getZones() {
     if (zoneCache.data) {
-        log("getZones: serving in-memory zones (fetched at startup), entries:", zoneCache.data.length);
+        log("getZones: serving in-memory zones, entries:", zoneCache.data.length, "age(ms):", Date.now() - zoneCache.fetchedAt);
         return zoneCache.data;
     }
-    log("getZones: no zones in memory (startup fetch never succeeded)");
-    throw new Error("Zones Not Loaded");
+    log("getZones: no zones in memory - attempting on-demand fetch");
+    if (!inFlightFetch) {
+        inFlightFetch = fetchZonesFresh()
+            .then((data) => {
+                zoneCache = { data, fetchedAt: Date.now() };
+                return data;
+            })
+            .finally(() => { inFlightFetch = null; });
+    }
+    try {
+        return await inFlightFetch;
+    } catch (e) {
+        errlog("getZones: on-demand fetch also failed -", e.message);
+        throw new Error("Zones Not Loaded");
+    }
 }
 async function refreshZonesFromNetwork() {
     log("refreshZonesFromNetwork: forcing a fresh fetch from the zones feed");
     const data = await fetchZonesFresh();
     zoneCache = { data, fetchedAt: Date.now() };
     return data;
+}
+function startZoneRefreshLoop() {
+    if (zoneRefreshTimer) return;
+    zoneRefreshTimer = setInterval(async () => {
+        try {
+            await refreshZonesFromNetwork();
+            log("background refresh: zones updated, entries:", zoneCache.data.length);
+        } catch (e) {
+            errlog("background refresh: FAILED, continuing to serve stale/cached zones -", e.message);
+        }
+    }, ZONE_CACHE_TTL_MS);
+    if (zoneRefreshTimer.unref) zoneRefreshTimer.unref();
 }
 function shuffle(arr) {
     const out = arr.slice();
@@ -146,6 +187,9 @@ function injectBaseTag(html, baseHref) {
 }
 function log(...args) {
     console.log("[zoneStore]", ...args);
+}
+function errlog(...args) {
+    console.error("[zoneStore]", ...args);
 }
 function injectCustomCss(html) {
     return injectHead(html, `
@@ -252,8 +296,9 @@ export async function initZoneGames(deps) {
         await mergeZonesIntoGamesJSON(GAMES_JSON);
         log("initZoneGames: startup zone fetch + merge succeeded");
     } catch (e) {
-        log("initZoneGames: startup zone fetch FAILED -", e.message, "- serving existing games.json (if any) with no live zone validation");
+        errlog("initZoneGames: startup zone fetch FAILED -", e.message, "- serving existing games.json (if any) with no live zone validation until the next refresh succeeds");
     }
+    startZoneRefreshLoop();
 }
 function isAdminPass(req) {
     const pass = req.headers["x-admin-password"];
@@ -274,7 +319,7 @@ export function attachZoneGameRoutes(app, deps) {
             res.json({ ok: true, games: shuffle(list) });
         } catch (e) {
             console.error("Zone Games List Error:", e.message);
-            log("zone-games: FAILED -", e.stack || e.message);
+            errlog("zone-games: FAILED -", e.stack || e.message);
             res.status(502).json({ ok: false, error: "Failed To Load Games" });
         }
     });
@@ -287,7 +332,7 @@ export function attachZoneGameRoutes(app, deps) {
             log("zone-games: /admin/zone-games/regenerate forced a fresh zones fetch, entries:", list.length);
             res.json({ ok: true, count: list.length });
         } catch (e) {
-            log("zone-games: regenerate FAILED -", e.stack || e.message);
+            errlog("zone-games: regenerate FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Refresh Zones" });
         }
     });
@@ -298,7 +343,7 @@ export function attachZoneGameRoutes(app, deps) {
         try {
             res.json({ ok: true, games: loadGamesJSON(GAMES_JSON) });
         } catch (e) {
-            log("games-json: GET FAILED -", e.stack || e.message);
+            errlog("games-json: GET FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Load games.json" });
         }
     });
@@ -315,7 +360,7 @@ export function attachZoneGameRoutes(app, deps) {
             log("games-json: saved via admin edit -", Object.keys(games).length, "top-level keys");
             res.json({ ok: true });
         } catch (e) {
-            log("games-json: POST FAILED -", e.stack || e.message);
+            errlog("games-json: POST FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Save games.json" });
         }
     });
@@ -328,7 +373,7 @@ export function attachZoneGameRoutes(app, deps) {
             const hidden = Array.isArray(games._hidden) ? games._hidden.map(String) : [];
             res.json({ ok: true, hidden });
         } catch (e) {
-            log("hidden-games: GET FAILED -", e.stack || e.message);
+            errlog("hidden-games: GET FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Load Hidden Games" });
         }
     });
@@ -347,7 +392,7 @@ export function attachZoneGameRoutes(app, deps) {
             log("hidden-games: saved -", games._hidden.length, "hidden id(s)");
             res.json({ ok: true, hidden: games._hidden });
         } catch (e) {
-            log("hidden-games: POST FAILED -", e.stack || e.message);
+            errlog("hidden-games: POST FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Save Hidden Games" });
         }
     });
@@ -387,7 +432,7 @@ export function attachZoneGameRoutes(app, deps) {
             }
             res.json({ ok: true, popularity: games[key].popularity });
         } catch (e) {
-            log("popularity: FAILED for id", id, "-", e.stack || e.message);
+            errlog("popularity: FAILED for id", id, "-", e.stack || e.message);
             res.status(500).json({ ok: false });
         }
     });
@@ -413,7 +458,7 @@ export function attachZoneGameRoutes(app, deps) {
                     headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusThumbProxy/1.0)" },
                 });
             } catch (e) {
-                log("thumbnail: upstream fetch threw for id", id, "-", e.message);
+                errlog("thumbnail: upstream fetch threw for id", id, "-", e.message);
                 return res.status(502).send("Proxy Error");
             }
             log("thumbnail: upstream status for id", id, "=", upstream.status);
@@ -426,7 +471,7 @@ export function attachZoneGameRoutes(app, deps) {
             log("thumbnail: served id", id, "-", buf.length, "bytes,", contentType);
             res.send(buf);
         } catch (e) {
-            log("thumbnail: FAILED for id", id, "-", e.stack || e.message);
+            errlog("thumbnail: FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });
@@ -471,12 +516,12 @@ export function attachZoneGameRoutes(app, deps) {
             }
             let upstream;
             try {
-                upstream = await fetchWithTimeout(fetchUrl, {
+                upstream = await fetchWithRetry(fetchUrl, {
                     redirect: "follow",
                     headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
                 });
             } catch (e) {
-                log("games proxy: upstream fetch threw for", fetchUrl, "-", e.message);
+                errlog("games proxy: upstream fetch threw for", fetchUrl, "-", e.message);
                 return res.status(502).send("Proxy Error");
             }
             log("games proxy: upstream", fetchUrl, "-> status", upstream.status, "final url:", upstream.url);
@@ -501,7 +546,7 @@ export function attachZoneGameRoutes(app, deps) {
             res.send(buf);
         } catch (e) {
             console.error("Zone Game Proxy Error:", e.message);
-            log("games proxy: FAILED for id", id, "-", e.stack || e.message);
+            errlog("games proxy: FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });
@@ -533,7 +578,7 @@ export function attachZoneGameRoutes(app, deps) {
                     headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
                 });
             } catch (e) {
-                log("commits: upstream fetch threw -", e.message);
+                errlog("commits: upstream fetch threw -", e.message);
                 return res.status(502).send("Proxy Error");
             }
             log("commits: upstream status", upstream.status, "final url:", upstream.url);
@@ -560,7 +605,7 @@ export function attachZoneGameRoutes(app, deps) {
             log("commits: serving raw body -", buf.length, "bytes,", contentType);
             res.send(buf);
         } catch (e) {
-            log("commits: FAILED -", e.stack || e.message);
+            errlog("commits: FAILED -", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });

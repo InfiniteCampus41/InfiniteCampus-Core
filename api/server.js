@@ -3712,6 +3712,12 @@ process.on("SIGINT", () => {
     console.log("\nExiting");
     process.exit(0);
 });
+process.on("uncaughtException", (err) => {
+    console.error("[FATAL] Uncaught Exception:", err && err.stack || err);
+});
+process.on("unhandledRejection", (reason, promise) => {
+    console.error("[FATAL] Unhandled Rejection:", reason && reason.stack || reason);
+});
 rl.on("line", (input) => {
     const trimmed = input.trim();
     {
