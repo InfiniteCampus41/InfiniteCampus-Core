@@ -49,11 +49,15 @@ const CUSTOM_GAME_CSS = `
         background: #0b0b0f;
         overflow: hidden;
     }
-    #content, #content canvas {
-        max-height: 100% !important;
+    #zoneFrame {
+        height: 100% !important;
+        width: 100% !important;
     }
     .zone-header {
         display:none;
+    }
+    #sidebarad1, #sidebarad2 {
+        display:none !important;
     }
 `;
 let zoneCache = { data: null, fetchedAt: 0 };
