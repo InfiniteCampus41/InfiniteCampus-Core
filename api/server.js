@@ -5100,14 +5100,52 @@ async function syncDiscordHistory(channelName, discordChannelId) {
             .sort((a, b) => Number(a[0]) - Number(b[0]))
     );
     data.messages[channelName] = sorted;
+    await syncPinnedMessages(channelName, discordChannelId, data);
     _dataCache = data;
+    saveData(data);
     if (totalNew > 0) {
-        saveData(data);
         console.log(`Synced ${totalNew} New Messages For #${channelName}`);
     } else {
         console.log(`No New Messages For #${channelName}`);
     }
     discordBridgeState[channelName] = { synced: true };
+}
+async function syncPinnedMessages(channelName, discordChannelId, data) {
+    if (!discordChannelId) return;
+    let response;
+    try {
+        response = await discordRequestForce({
+            method: "get",
+            url: `https://discord.com/api/v10/channels/${discordChannelId}/pins`
+        });
+    } catch (e) {
+        console.error(`[DiscordBridge] Pinned Fetch Error For ${channelName}:`, e.message);
+        return;
+    }
+    const pinnedMessages = response.data || [];
+    if (!data.pinned) data.pinned = {};
+    const pinnedObj = {};
+    for (const discordMsg of pinnedMessages) {
+        const ts = discordMsgToTimestamp(discordMsg.id);
+        const user = discordMsg.author;
+        const userId = user?.id;
+        let avatarUrl;
+        if (user?.avatar) {
+            const ext = user.avatar.startsWith("a_") ? "gif" : "png";
+            avatarUrl = `https://cdn.discordapp.com/avatars/${userId}/${user.avatar}.${ext}?size=128`;
+        } else {
+            const defaultIndex = userId ? Number(BigInt(userId) >> 22n) % 6 : 0;
+            avatarUrl = `https://cdn.discordapp.com/embed/avatars/${defaultIndex}.png`;
+        }
+        pinnedObj[String(ts)] = {
+            u: user?.username || "Unknown",
+            a: `/discord-avatar-proxy?url=${encodeURIComponent(avatarUrl)}`,
+            t: discordMsg.content || "",
+            _discordId: discordMsg.id,
+        };
+    }
+    data.pinned[channelName] = pinnedObj;
+    console.log(`Synced ${pinnedMessages.length} Pinned Messages For #${channelName}`);
 }
 async function verifyFirebaseToken(req, res, next) {
     const header = req.headers.authorization || "";
