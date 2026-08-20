@@ -721,9 +721,9 @@ app.get("/api/guest-channel-info", async (req, res) => {
         guestWrite: !!(chData.guestWrite),
     });
 });
-app.post("/api/mentionable-users", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+app.post("/api/mentionable-users", verifyFirebaseTokenOrAnon, rateLimit("read"), async (req, res) => {
     try {
-        const requesterUid = req.user.uid;
+        const requesterUid = req.user?.uid || req.anonId;
         const { type, channel, groupId, targetUid } = req.body || {};
         const data = getDataCache();
         const usersData = data?.users || {};
@@ -740,6 +740,7 @@ app.post("/api/mentionable-users", verifyFirebaseToken, rateLimit("read"), async
                 return canReadChannelServer(profile, chData);
             });
         } else if (type === "group") {
+            if (!req.user) return res.status(401).json({ error: "You Must Be Logged In To View Group Members" });
             if (!groupId) return res.status(400).json({ error: "Missing groupId" });
             const group = Groups.getGroup(groupId);
             if (!group) return res.status(404).json({ error: "Group Not Found" });
@@ -748,6 +749,7 @@ app.post("/api/mentionable-users", verifyFirebaseToken, rateLimit("read"), async
             }
             candidateUids = group.members || [];
         } else if (type === "private") {
+            if (!req.user) return res.status(401).json({ error: "You Must Be Logged In To View This" });
             const otherUid = (targetUid || "").toString();
             if (!otherUid) return res.status(400).json({ error: "Missing targetUid" });
             candidateUids = [requesterUid, otherUid];
@@ -2728,6 +2730,11 @@ app.post("/read", rateLimit("read"), async (req, res) => {
         if (uid) {
             const userProfile = dataJson?.users?.[uid]?.profile || {};
             auth = { uid, ...userProfile };
+        } else {
+            const anonSessionToken = getAnonSessionToken(req);
+            if (anonSessionToken) {
+                auth = { anon: true, uid: `anon:${anonSessionToken}` };
+            }
         }
         let current = dataJson;
         for (const p of path) current = current?.[p];
@@ -6091,6 +6098,25 @@ function resolveAnonName(sessionToken) {
     if (!sessionToken) return "Anonymous";
     const s = anonSessions.get(sessionToken);
     return s?.name || "Anonymous";
+}
+function getAnonSessionToken(req) {
+    return req.headers["x-anon-session"] || req.body?.anonSession || null;
+}
+async function verifyFirebaseTokenOrAnon(req, res, next) {
+    const header = req.headers.authorization || "";
+    const token = header.split("Bearer ")[1];
+    if (token) {
+        try {
+            const decoded = await admin.auth().verifyIdToken(token);
+            req.user = decoded;
+            return next();
+        } catch (err) {
+            return res.status(401).json({ error: "Invalid Token" });
+        }
+    }
+    const anonSessionToken = getAnonSessionToken(req);
+    req.anonId = anonSessionToken ? `anon:${anonSessionToken}` : "anon:guest";
+    next();
 }
 function restoreApplicantMessages() {
     const data = loadApplyJSON();
