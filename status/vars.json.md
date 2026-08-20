@@ -1,0 +1,1 @@
+this is where the discord bot vars go
