@@ -1,6 +1,9 @@
 const express = require("express");
 const { initializeApp, cert } = require("firebase-admin/app");
 const { getDatabase } = require("firebase-admin/database");
+const path = require("path");
+const SERVER_FILENAME = __filename;
+const SERVER_DIRNAME = __dirname;
 const axios = require("axios");
 const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, MessageFlags, PermissionFlagsBits, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require("discord.js");
 const { Jimp } = require("jimp");
@@ -9,11 +12,20 @@ const fs = require("fs");
 dotenv.config();
 const LOCK_FILE = "./bot.lock";
 try {
-    const pid = fs.readFileSync(LOCK_FILE, "utf8").trim();
-    try { process.kill(Number(pid), 0); } catch { fs.unlinkSync(LOCK_FILE); }
-    if (fs.existsSync(LOCK_FILE)) {
+    const pid = Number(fs.readFileSync(LOCK_FILE, "utf8").trim());
+    const isSelf = pid === process.pid;
+    let stillRunning = false;
+    if (!isSelf && pid) {
+        try {
+            process.kill(pid, 0);
+            stillRunning = true;
+        } catch { /* not running */ }
+    }
+    if (stillRunning) {
         console.error(`[Bot] Another instance is already running (PID ${pid}). Exiting.`);
         process.exit(1);
+    } else {
+        fs.unlinkSync(LOCK_FILE);
     }
 } catch { /* no lock file yet */ }
 fs.writeFileSync(LOCK_FILE, String(process.pid));
@@ -142,7 +154,7 @@ async function safeFetch(url) {
     }
 }
 app.get("/", (req, res) => {
-    res.send("Status Monitor Running");
+    res.sendFile(path.join(SERVER_DIRNAME, "index.html"));
 });
 function msUntilNextAlignedCheck() {
     const now = Date.now();
@@ -1134,7 +1146,7 @@ client.once("clientReady", async () => {
     	monitorInterval = setInterval(monitorSites, CHECK_INTERVAL);
   	}
 });
-app.listen(3000, async () => {
+app.listen(14339, async () => {
     console.log("Server Started On Port 3000");
     await checkSites();
     setTimeout(() => {

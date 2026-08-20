@@ -125,7 +125,12 @@ function checkURL(url) {
                 let up = res.ok;
                 let text = "";
                 try { text = await res.text(); } catch {}
-                const blockReasons = ["removed by admin", "domain spelled right", "not found anywhere"];
+                const blockReasons = [
+                    "removed by admin",
+                    "domain spelled right",
+                    "not found anywhere",
+                    "web server isn't running"
+                ];
                 if (blockReasons.some(r => text.toLowerCase().includes(r))) {
                     up = false;
                 }
