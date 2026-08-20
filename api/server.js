@@ -2165,8 +2165,14 @@ app.post("/github-webhook", express.json({ type: "application/json" }),async (re
                 return res.sendStatus(200);
             }
             const commit = payload.commits[0];
-            embed.title = "New Commit";
-            embed.description = commit.message;
+            const numberMatch = commit.message.match(/^\s*(\d+)/);
+            if (numberMatch) {
+                embed.title = `New Commit (${numberMatch[1]})`;
+                embed.description = commit.message.slice(numberMatch[0].length).replace(/^[\s:.\-)]+/, "");
+            } else {
+                embed.title = "New Commit";
+                embed.description = commit.message;
+            }
             embed.author = {
                 name: `${payload.pusher.name} Committed`,
                 icon_url: payload.sender.avatar_url
