@@ -13,9 +13,21 @@ function readJSON(file, fallback) {
     }
     return fallback;
 }
+function stripNulls(value) {
+    if (Array.isArray(value)) return value.map(stripNulls);
+    if (value && typeof value === "object") {
+        const result = {};
+        for (const [k, v] of Object.entries(value)) {
+            if (v === null) continue;
+            result[k] = stripNulls(v);
+        }
+        return result;
+    }
+    return value;
+}
 function writeJSON(file, data) {
     ensureDir(path.dirname(file));
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+    fs.writeFileSync(file, JSON.stringify(stripNulls(data), null, 2), "utf8");
 }
 function userDir(uid) {
     return path.join(USERS_DIR, String(uid));
