@@ -1,9 +1,7 @@
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const TEMPLATES_DIR = path.join(__dirname, "templates");
+import { DATA_ROOT } from "./channelsstore.js";
+const TEMPLATES_DIR = path.join(DATA_ROOT, "templates");
 /**
  * @param {string} templateName
  * @param {Object} vars

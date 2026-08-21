@@ -24,6 +24,7 @@ import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailtemplates.js";
 import { Resend } from "resend";
 import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmenttracker.js";
+import { DATA_ROOT } from "./channelsstore.js";
 import * as Groups from "./groupsstore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
 import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
@@ -32,8 +33,8 @@ import { loadUsersShape, saveUsersShape } from "./usersstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const UPLOADS_TEMP_DIR = path.join(__dirname, "uploads_temp");
-const UPLOADS_DIR = path.join(__dirname, "uploads");
+const UPLOADS_TEMP_DIR = path.join(DATA_ROOT, "movies", "apply", "uploads_temp");
+const UPLOADS_DIR = path.join(DATA_ROOT, "uploads");
 const UNIQUE_SUFFIX = "x9a7b2";
 const UPLOAD_LIMIT_MB = 100;
 const USE_720P = false;
@@ -41,7 +42,13 @@ const SCALE_WIDTH = USE_720P ? 1280 : 640;
 const SCALE_HEIGHT = USE_720P ? 720 : 360;
 const SCALE_SUFFIX = USE_720P ? "720" : "360";
 const SCALE_FILTER = `scale=${SCALE_WIDTH}:${SCALE_HEIGHT}:force_original_aspect_ratio=decrease,pad=${SCALE_WIDTH}:${SCALE_HEIGHT}:(ow-iw)/2:(oh-ih)/2`;
-const DISCORD_IDS_PATH = path.join(__dirname, "discordids.json");
+const DISCORD_DIR = path.join(DATA_ROOT, "discord");
+const DISCORD_IDS_PATH = path.join(DISCORD_DIR, "discordids.json");
+if (!fs.existsSync(DISCORD_DIR)) fs.mkdirSync(DISCORD_DIR, { recursive: true });
+if (!fs.existsSync(DISCORD_IDS_PATH) && fs.existsSync(path.join(__dirname, "discordids.json"))) {
+    fs.renameSync(path.join(__dirname, "discordids.json"), DISCORD_IDS_PATH);
+    console.log(`[Migration] Moved "${path.join(__dirname, "discordids.json")}" -> "${DISCORD_IDS_PATH}"`);
+}
 const acceptIntervals = new Map();
 const acceptStatus = new Map();
 const ACCLOGS_PATH = path.join(__dirname, "data", "logs", "acclogs.json");
@@ -53,8 +60,10 @@ let alreadyCleared = false;
 const anonSessions = new Map();
 const ANON_SESSION_TTL = 24 * 60 * 60 * 1000;
 const applicantMessages = new Map();
-const APPLY_DIR = path.join(__dirname, "apply");
-const APPLY_JSON = path.join(__dirname, "apply.json");
+const APPLY_DIR = path.join(DATA_ROOT, "movies", "apply");
+const APPLY_JSON = path.join(APPLY_DIR, "apply.json");
+const APPLY_CHUNKS_DIR = path.join(APPLY_DIR, "applychunks");
+const APPLICANTS_DIR = path.join(APPLY_DIR, "applicants");
 const ARCHIVE_DIR = path.join(__dirname, "data", "logs", "archive");
 const AUTO_DELETE_MS = 10 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
@@ -177,10 +186,11 @@ let memoryUpload = multer({
     })
 });
 const mirrorIdMap = {}
-const MOVIE_ACCEPTS_DIR = path.join(__dirname, "movieaccepts");
-const MOVIES_DIR = path.join(__dirname, "movies");
-const MOVIES_JSON = path.join(__dirname, "movies.json");
-const SUBTITLES_DIR = path.join(__dirname, "subtitles");
+const MOVIE_ACCEPTS_DIR = path.join(APPLY_DIR, "movieaccepts");
+const ACCEPTED_MOVIES_DIR = path.join(DATA_ROOT, "movies", "accepted");
+const MOVIES_DIR = path.join(ACCEPTED_MOVIES_DIR, "movies");
+const MOVIES_JSON = path.join(ACCEPTED_MOVIES_DIR, "movies.json");
+const SUBTITLES_DIR = path.join(ACCEPTED_MOVIES_DIR, "subtitles");
 if (!fs.existsSync(SUBTITLES_DIR)) fs.mkdirSync(SUBTITLES_DIR, { recursive: true });
 const MSG_SLOWMODE_MS = 3000;
 const _msgSlowmodeStore = new Map();
@@ -330,9 +340,52 @@ if (!admin.apps.length) {
         databaseURL: process.env.DB_URL
     });
 }
+function migrateLegacyPath(oldPath, newPath) {
+    try {
+        if (!fs.existsSync(oldPath)) return;
+        if (!fs.existsSync(newPath)) {
+            fs.mkdirSync(path.dirname(newPath), { recursive: true });
+            fs.renameSync(oldPath, newPath);
+            console.log(`[Migration] Moved "${oldPath}" -> "${newPath}"`);
+            return;
+        }
+        const stat = fs.statSync(oldPath);
+        if (stat.isDirectory()) {
+            for (const entry of fs.readdirSync(oldPath)) {
+                const src = path.join(oldPath, entry);
+                const dest = path.join(newPath, entry);
+                if (!fs.existsSync(dest)) {
+                    fs.renameSync(src, dest);
+                } else {
+                    console.warn(`[Migration] Skipped "${src}" (already exists at "${dest}")`);
+                }
+            }
+            if (fs.readdirSync(oldPath).length === 0) fs.rmdirSync(oldPath);
+            else console.warn(`[Migration] "${oldPath}" not empty after merge, left in place`);
+        } else {
+            console.warn(`[Migration] Skipped "${oldPath}" (file already exists at "${newPath}")`);
+        }
+    } catch (e) {
+        console.error(`[Migration] Failed to migrate "${oldPath}" -> "${newPath}":`, e.message);
+    }
+}
+migrateLegacyPath(path.join(__dirname, "apply"), APPLY_DIR);
+migrateLegacyPath(path.join(__dirname, "apply.json"), APPLY_JSON);
+migrateLegacyPath(path.join(__dirname, "movieaccepts"), MOVIE_ACCEPTS_DIR);
+migrateLegacyPath(path.join(__dirname, "apply_chunks"), APPLY_CHUNKS_DIR);
+migrateLegacyPath(path.join(__dirname, "applychunks"), APPLY_CHUNKS_DIR);
+migrateLegacyPath(path.join(__dirname, "applicants"), APPLICANTS_DIR);
+migrateLegacyPath(path.join(__dirname, "uploads_temp"), UPLOADS_TEMP_DIR);
+migrateLegacyPath(path.join(__dirname, "movies"), MOVIES_DIR);
+migrateLegacyPath(path.join(__dirname, "movies.json"), MOVIES_JSON);
+migrateLegacyPath(path.join(__dirname, "subtitles"), SUBTITLES_DIR);
+migrateLegacyPath(path.join(__dirname, "uploads"), UPLOADS_DIR);
+migrateLegacyPath(path.join(__dirname, "templates"), path.join(DATA_ROOT, "templates"));
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 if (!fs.existsSync(APPLY_DIR)) fs.mkdirSync(APPLY_DIR, { recursive: true });
 if (!fs.existsSync(UPLOADS_TEMP_DIR)) fs.mkdirSync(UPLOADS_TEMP_DIR, { recursive: true });
+if (!fs.existsSync(APPLY_CHUNKS_DIR)) fs.mkdirSync(APPLY_CHUNKS_DIR, { recursive: true });
+if (!fs.existsSync(APPLICANTS_DIR)) fs.mkdirSync(APPLICANTS_DIR, { recursive: true });
 if (!fs.existsSync(MOVIES_DIR)) fs.mkdirSync(MOVIES_DIR, { recursive: true });
 if (!fs.existsSync(MOVIE_ACCEPTS_DIR)) fs.mkdirSync(MOVIE_ACCEPTS_DIR, { recursive: true });
 if (!fs.existsSync(READY_DIR)) fs.mkdirSync(READY_DIR, { recursive: true });
