@@ -299,11 +299,14 @@ export function attachGameRoutes(app, deps) {
     const GAMES_DIR = path.join(__dirname, "games");
     const PENDING_GAMES_DIR = path.join(__dirname, "pendinggames");
     const PENDING_UPDATES_DIR = path.join(__dirname, "pendingupdates");
-    const GAMES_JSON = path.join(__dirname, "games.json");
-    for (const dir of [GAMES_DIR, PENDING_GAMES_DIR, PENDING_UPDATES_DIR]) {
+    const GAMES_DATA_DIR = path.join(__dirname, "data", "games");
+    const GAMES_JSON = path.join(GAMES_DATA_DIR, "games.json");
+    const HIDDEN_JSON = path.join(GAMES_DATA_DIR, "hidden.json");
+    for (const dir of [GAMES_DIR, PENDING_GAMES_DIR, PENDING_UPDATES_DIR, GAMES_DATA_DIR]) {
         if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     }
     if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
+    if (!fs.existsSync(HIDDEN_JSON)) fs.writeFileSync(HIDDEN_JSON, JSON.stringify({}, null, 2));
     function loadGamesJSON() {
         try {
             return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));
@@ -847,7 +850,7 @@ export function attachGameAssetFallback(app, deps) {
     const GAMES_DIR = path.join(__dirname, "games");
     const PENDING_GAMES_DIR = path.join(__dirname, "pendinggames");
     const PENDING_UPDATES_DIR = path.join(__dirname, "pendingupdates");
-    const GAMES_JSON = path.join(__dirname, "games.json");
+    const GAMES_JSON = path.join(__dirname, "data", "games", "games.json");
     function loadGamesJSON() {
         try {
             return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));

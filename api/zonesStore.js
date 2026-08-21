@@ -235,7 +235,25 @@ function injectCustomCss(html) {
     `);
 }
 function ensureGamesFile(GAMES_JSON) {
+    const dir = path.dirname(GAMES_JSON);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
+}
+function ensureHiddenFile(HIDDEN_JSON) {
+    const dir = path.dirname(HIDDEN_JSON);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    if (!fs.existsSync(HIDDEN_JSON)) fs.writeFileSync(HIDDEN_JSON, JSON.stringify([], null, 2));
+}
+function loadHiddenJSON(HIDDEN_JSON) {
+    try {
+        const arr = JSON.parse(fs.readFileSync(HIDDEN_JSON, "utf8"));
+        return Array.isArray(arr) ? arr.map(String) : [];
+    } catch {
+        return [];
+    }
+}
+function saveHiddenJSON(HIDDEN_JSON, hidden) {
+    fs.writeFileSync(HIDDEN_JSON, JSON.stringify(hidden.map(String).filter(Boolean), null, 2));
 }
 function loadGamesJSON(GAMES_JSON) {
     try {
@@ -260,9 +278,13 @@ function saveGamesJSON(GAMES_JSON, games) {
     for (const [key, val] of zoneEntries) merged[key] = val;
     fs.writeFileSync(GAMES_JSON, JSON.stringify(merged, null, 2));
 }
-function getHiddenIdSet(games) {
-    const hidden = Array.isArray(games._hidden) ? games._hidden : [];
-    return new Set(hidden.map(String));
+function getHiddenIdSet(games, HIDDEN_JSON) {
+    let hidden = loadHiddenJSON(HIDDEN_JSON);
+    if (hidden.length === 0 && Array.isArray(games._hidden) && games._hidden.length > 0) {
+        hidden = games._hidden.map(String);
+        saveHiddenJSON(HIDDEN_JSON, hidden);
+    }
+    return new Set(hidden);
 }
 function buildListFromZones(zones, games) {
     const valid = zones.filter(isValidZoneGame);
@@ -294,7 +316,7 @@ async function mergeZonesIntoGamesJSON(GAMES_JSON) {
 }
 export async function initZoneGames(deps) {
     const { __dirname } = deps;
-    const GAMES_JSON = path.join(__dirname, "games.json");
+    const GAMES_JSON = path.join(__dirname, "data", "games", "games.json");
     ensureGamesFile(GAMES_JSON);
     try {
         await mergeZonesIntoGamesJSON(GAMES_JSON);
@@ -310,14 +332,16 @@ function isAdminPass(req) {
 }
 export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
-    const GAMES_JSON = path.join(__dirname, "games.json");
+    const GAMES_JSON = path.join(__dirname, "data", "games", "games.json");
+    const HIDDEN_JSON = path.join(__dirname, "data", "games", "hidden.json");
     ensureGamesFile(GAMES_JSON);
+    ensureHiddenFile(HIDDEN_JSON);
     app.get("/api/zone-games", async (req, res) => {
         log("GET /api/zone-games from", req.ip);
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         try {
             const games = loadGamesJSON(GAMES_JSON);
-            const hidden = getHiddenIdSet(games);
+            const hidden = getHiddenIdSet(games, HIDDEN_JSON);
             const list = Array.isArray(games._list) ? games._list.filter((g) => !hidden.has(String(g.id))) : [];
             log("zone-games: serving list from games.json -", list.length, "games (", hidden.size, "hidden)");
             res.json({ ok: true, games: shuffle(list) });
@@ -374,7 +398,7 @@ export function attachZoneGameRoutes(app, deps) {
         }
         try {
             const games = loadGamesJSON(GAMES_JSON);
-            const hidden = Array.isArray(games._hidden) ? games._hidden.map(String) : [];
+            const hidden = [...getHiddenIdSet(games, HIDDEN_JSON)];
             res.json({ ok: true, hidden });
         } catch (e) {
             errlog("hidden-games: GET FAILED -", e.stack || e.message);
@@ -390,11 +414,15 @@ export function attachZoneGameRoutes(app, deps) {
             if (!Array.isArray(hidden)) {
                 return res.status(400).json({ ok: false, error: "Invalid Hidden List" });
             }
+            const cleaned = hidden.map(String).filter(Boolean);
+            saveHiddenJSON(HIDDEN_JSON, cleaned);
             const games = loadGamesJSON(GAMES_JSON);
-            games._hidden = hidden.map(String).filter(Boolean);
-            saveGamesJSON(GAMES_JSON, games);
-            log("hidden-games: saved -", games._hidden.length, "hidden id(s)");
-            res.json({ ok: true, hidden: games._hidden });
+            if (games._hidden) {
+                delete games._hidden;
+                saveGamesJSON(GAMES_JSON, games);
+            }
+            log("hidden-games: saved -", cleaned.length, "hidden id(s)");
+            res.json({ ok: true, hidden: cleaned });
         } catch (e) {
             errlog("hidden-games: POST FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Save Hidden Games" });

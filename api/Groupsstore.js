@@ -2,9 +2,11 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { DATA_ROOT } from "./channelsstore.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-export const GROUPS_JSON_PATH = path.join(__dirname, "groups.json");
+export const GROUPS_DIR = path.join(DATA_ROOT, "groups");
+export const GROUPS_JSON_PATH = path.join(GROUPS_DIR, "data.json");
 export const MAX_GROUP_MEMBERS = 20;
 export const MAX_REACTIONS_PER_MSG = 5;
 export const MAX_REACTIONS_PER_USER_MSG = 20;
@@ -37,20 +39,51 @@ export function resolveHostUrl(req) {
     return match || DEFAULT_HOST_URL;
 }
 let _cache = null;
+function ensureDir(dir) {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+function groupDir(id) {
+    return path.join(GROUPS_DIR, String(id));
+}
+function readJSON(file, fallback) {
+    try {
+        if (fs.existsSync(file)) return JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch (e) {
+        console.error(`[Groups] Failed To Read ${file}:`, e.message);
+    }
+    return fallback;
+}
+function writeJSON(file, data) {
+    ensureDir(path.dirname(file));
+    fs.writeFileSync(file, JSON.stringify(data, null, 2), "utf8");
+}
 function defaultData() {
     return { nextId: 1, groups: {} };
 }
 export function loadGroups() {
     if (_cache) return _cache;
     try {
-        if (fs.existsSync(GROUPS_JSON_PATH)) {
-            _cache = JSON.parse(fs.readFileSync(GROUPS_JSON_PATH, "utf8"));
-            if (!_cache.groups) _cache.groups = {};
-            if (!_cache.nextId) _cache.nextId = 1;
-            return _cache;
+        ensureDir(GROUPS_DIR);
+        const meta = readJSON(GROUPS_JSON_PATH, null);
+        const ids = fs.readdirSync(GROUPS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name);
+        const groups = {};
+        for (const id of ids) {
+            const base = readJSON(path.join(groupDir(id), "data.json"), null);
+            if (!base) continue;
+            const messages = readJSON(path.join(groupDir(id), "messages.json"), {});
+            groups[String(id)] = { ...base, messages };
         }
+        let nextId = meta?.nextId;
+        if (!nextId) {
+            const maxId = Math.max(0, ...Object.keys(groups).map(Number).filter(n => !isNaN(n)));
+            nextId = maxId + 1;
+        }
+        _cache = { nextId, groups };
+        return _cache;
     } catch (e) {
-        console.error("[Groups] Failed To Load groups.json:", e.message);
+        console.error("[Groups] Failed To Load Groups:", e.message);
     }
     _cache = defaultData();
     return _cache;
@@ -58,10 +91,31 @@ export function loadGroups() {
 export function saveGroups(data) {
     _cache = data;
     try {
-        fs.writeFileSync(GROUPS_JSON_PATH, JSON.stringify(data, null, 2), "utf8");
+        ensureDir(GROUPS_DIR);
+        writeJSON(GROUPS_JSON_PATH, { nextId: data.nextId });
+        const keepIds = new Set(Object.keys(data.groups || {}));
+        const existingIds = fs.readdirSync(GROUPS_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => d.name);
+        for (const id of existingIds) {
+            if (!keepIds.has(id)) fs.rmSync(groupDir(id), { recursive: true, force: true });
+        }
+        for (const [id, group] of Object.entries(data.groups || {})) {
+            ensureDir(groupDir(id));
+            const { messages, ...rest } = group;
+            writeJSON(path.join(groupDir(id), "data.json"), rest);
+            writeJSON(path.join(groupDir(id), "messages.json"), messages || {});
+            const miscPath = path.join(groupDir(id), "misc.json");
+            if (!fs.existsSync(miscPath)) writeJSON(miscPath, {});
+        }
     } catch (e) {
-        console.error("[Groups] Failed To Save groups.json:", e.message);
+        console.error("[Groups] Failed To Save Groups:", e.message);
     }
+}
+export function migrateLegacyGroupsData(legacy) {
+    if (!legacy || typeof legacy !== "object") return;
+    _cache = null;
+    saveGroups({ nextId: legacy.nextId || 1, groups: legacy.groups || {} });
 }
 export function generateInviteCode() {
     let code = "";

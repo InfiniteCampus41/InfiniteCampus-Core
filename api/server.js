@@ -21,12 +21,14 @@ import { spawn } from "child_process";
 import util from "util";
 import { WebSocketServer } from "ws";
 import fetch from "node-fetch";
-import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailTemplates.js";
+import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailtemplates.js";
 import { Resend } from "resend";
-import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmentTracker.js";
-import * as Groups from "./groupsStore.js";
-import { attachGameRoutes, attachGameAssetFallback } from "./gamesStore.js";
-import { attachZoneGameRoutes, initZoneGames } from "./zonesStore.js";
+import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmenttracker.js";
+import * as Groups from "./groupsstore.js";
+import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
+import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
+import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMap as persistDiscordChannelMap } from "./datastore.js";
+import { loadUsersShape, saveUsersShape } from "./usersstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -42,7 +44,7 @@ const SCALE_FILTER = `scale=${SCALE_WIDTH}:${SCALE_HEIGHT}:force_original_aspect
 const DISCORD_IDS_PATH = path.join(__dirname, "discordids.json");
 const acceptIntervals = new Map();
 const acceptStatus = new Map();
-const ACCLOGS_PATH = path.join(__dirname, "acclogs.json");
+const ACCLOGS_PATH = path.join(__dirname, "data", "logs", "acclogs.json");
 let activeLinks = [];
 const ALLOWED_EXTS = new Set([".mp4", ".mov", ".mkv", ".ts", ".webm", ".avi", ".flv", ".mpeg", ".mpg", ".m4v",]);
 const ALLOWED_PFP_EXTS = new Set([".png", ".jpeg", ".jpg", ".webp", ".ico"]);
@@ -53,7 +55,7 @@ const ANON_SESSION_TTL = 24 * 60 * 60 * 1000;
 const applicantMessages = new Map();
 const APPLY_DIR = path.join(__dirname, "apply");
 const APPLY_JSON = path.join(__dirname, "apply.json");
-const ARCHIVE_DIR = path.join(__dirname, "archive");
+const ARCHIVE_DIR = path.join(__dirname, "data", "logs", "archive");
 const AUTO_DELETE_MS = 10 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
 const botSentDiscordIds = loadBotSentDiscordIds();
@@ -71,12 +73,10 @@ const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const PRIVATE_MEDIA_CHANNEL_ID = process.env.PRIVATE_MEDIA_CHANNEL_ID || null;
 const GROUP_MEDIA_CHANNEL_ID = process.env.GROUP_MEDIA_CHANNEL_ID || null;
 const discordBridgeState = {};
-const DISCORD_CHANNEL_MAP_PATH = path.join(__dirname, "discord_channel_map.json");
 let DISCORD_CHANNEL_MAP = (() => {
     try {
-        if (fs.existsSync(DISCORD_CHANNEL_MAP_PATH)) {
-            return JSON.parse(fs.readFileSync(DISCORD_CHANNEL_MAP_PATH, "utf-8"));
-        }
+        const map = loadDiscordChannelMap();
+        if (map && Object.keys(map).length > 0) return map;
     } catch (e) { console.warn("Failed To Load Channel Map:", e.message); }
     try {
         return JSON.parse(process.env.DISCORD_CHANNEL_MAP || "{}");
@@ -150,6 +150,18 @@ let _listFilesInterval = null;
 let liveInterval = null;
 let liveMode = false;
 let LOCKDOWN = false;
+let MOVIE_LOCKDOWN = false;
+const movieLockdownStreamClients = new Set();
+function broadcastMovieLockdown() {
+    const payload = `data: ${JSON.stringify({ disabled: MOVIE_LOCKDOWN })}\n\n`;
+    for (const client of movieLockdownStreamClients) {
+        try {
+            client.write(payload);
+        } catch {
+            movieLockdownStreamClients.delete(client);
+        }
+    }
+}
 const logid = process.env.LOG_ID;
 const MAX_APPLY_BYTES = 30 * 1024 * 1024 * 1024;
 const MAX_DISCORD_QUEUE = 5000;
@@ -194,11 +206,11 @@ const RATE_LIMITS = {
 };
 const _rateLimitStore = new Map();
 const READY_DIR = path.join(__dirname, "ready");
-const REPORT_JSON = path.join(__dirname, "report.json");
+const REPORT_JSON = path.join(__dirname, "data", "logs", "report.json");
 const resend = new Resend(process.env.RESEND_API_KEY);
 const { resolveHostUrl } = Groups;
 let _restrictedWordsCache = null;
-const RESTRICTED_WORDS_PATH = path.join(__dirname, "restrictedwords.json");
+const RESTRICTED_WORDS_PATH = path.join(__dirname, "data", "restrictedwords", "data.json");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ROUTES = {
     UPLOAD: `/api/upload_apply_${UNIQUE_SUFFIX}`,
@@ -425,11 +437,7 @@ app.all("/admin/modify-data", verifyFirebaseToken, async (req, res) => {
             return res.status(403).json({ error: "Not Authorized: Owner Only" });
         }
         if (req.method === "GET") {
-            if (!fs.existsSync(DATA_PATH)) {
-                return res.status(404).json({ error: "data.json Not Found" });
-            }
-            const raw = fs.readFileSync(DATA_PATH, "utf8");
-            return res.json({ data: JSON.parse(raw) });
+            return res.json({ data: getDataCache() });
         }
         if (req.method === "POST") {
             const { data } = req.body;
@@ -1213,6 +1221,27 @@ app.get("/ping", (req, res) => {
         serverTime: now
     });
 });
+app.get("/api/movies_status_x9a7b2", (req, res) => {
+    res.json({ disabled: MOVIE_LOCKDOWN });
+});
+app.get("/api/movies_lockdown_stream_x9a7b2", (req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+        "X-Accel-Buffering": "no"
+    });
+    res.write(`data: ${JSON.stringify({ disabled: MOVIE_LOCKDOWN })}\n\n`);
+    movieLockdownStreamClients.add(res);
+    const keepAlive = setInterval(() => {
+        try { res.write(": keep-alive\n\n"); } catch { clearInterval(keepAlive); }
+    }, 25_000);
+    req.on("close", () => {
+        clearInterval(keepAlive);
+        movieLockdownStreamClients.delete(res);
+    });
+});
 app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
     const file = path.join(MOVIES_DIR, name + ".mp4");
@@ -1331,6 +1360,7 @@ app.get(ROUTES.STREAM_APPLY, (req, res) => {
 app.get(ROUTES.STREAM_VIDEO, async (req, res) => {
     let stream;
     try {
+        if (MOVIE_LOCKDOWN) return res.status(423).send("Movies Locked Down");
         const name = path.basename(req.params.name);
         const candidate = path.join(MOVIES_DIR, name + ".mp4");
         if (!candidate.startsWith(MOVIES_DIR)) return res.status(404).send("Not Found");
@@ -1663,6 +1693,31 @@ app.post("/admin/lockdown", (req, res) => {
     }
     console.log(`LOCKDOWN Is Now ${LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
     res.json({ lockdown: LOCKDOWN });
+});
+app.post("/admin/movies_toggle", (req, res) => {
+    MOVIE_LOCKDOWN = !MOVIE_LOCKDOWN;
+    broadcastMovieLockdown();
+    if (MOVIE_LOCKDOWN) {
+        discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${logid}/messages`,
+            data: {
+                content: "**Movies Have Been Locked Down — All Viewers Have Been Disconnected**"
+            },
+            headers: { "Content-Type": "application/json" }
+        }).catch(() => {});
+    } else {
+        discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${logid}/messages`,
+            data: {
+                content: "**Movie Lockdown Has Been Lifted**"
+            },
+            headers: { "Content-Type": "application/json" }
+        }).catch(() => {});
+    }
+    console.log(`MOVIE_LOCKDOWN Is Now ${MOVIE_LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
+    res.json({ moviesDisabled: MOVIE_LOCKDOWN });
 });
 app.post("/admin/restart", verifyFirebaseToken, async (req, res) => {
     try {
@@ -4342,8 +4397,7 @@ async function grantPremium(uid, amount) {
     }
 }
 async function loadData() {
-    const data = await fs.promises.readFile("./data.json", "utf-8");
-    return JSON.parse(data);
+    return loadFullData();
 }
 async function loadRules() {
     const data = await fs.promises.readFile("./rules.json", "utf-8");
@@ -5570,7 +5624,7 @@ function formatTimes(date) {
 }
 function getDataCache() {
     if (_dataCache === null) {
-        _dataCache = JSON.parse(fs.readFileSync("./data.json", "utf-8"));
+        _dataCache = loadFullData();
         const users = getUsersCache();
         if (users && typeof users === "object" && Object.keys(users).length > 0) {
             _dataCache.users = users;
@@ -5623,11 +5677,7 @@ function getRuleForOperation(rules, pathParts, type) {
 }
 function getUsersCache() {
     if (_usersCache === null) {
-        if (fs.existsSync(USERS_PATH)) {
-            _usersCache = JSON.parse(fs.readFileSync(USERS_PATH, "utf-8"));
-        } else {
-            _usersCache = {};
-        }
+        _usersCache = loadUsersShape();
     }
     return _usersCache;
 }
@@ -6158,11 +6208,11 @@ function saveData(data) {
     const dataWithoutUsers = { ...data };
     delete dataWithoutUsers.users;
     _dataCache = data;
-    fs.writeFileSync("./data.json", JSON.stringify(dataWithoutUsers, null, 2));
+    saveFullData(dataWithoutUsers);
 }
 function saveDiscordChannelMap() {
     try {
-        fs.writeFileSync(DISCORD_CHANNEL_MAP_PATH, JSON.stringify(DISCORD_CHANNEL_MAP, null, 2));
+        persistDiscordChannelMap(DISCORD_CHANNEL_MAP);
     } catch (e) { console.error("Failed To Save Channel Map:", e.message); }
 }
 function saveMoviesJSON(data) {
@@ -6173,7 +6223,7 @@ function saveReportJSON(data) {
 }
 function saveUsers(usersData) {
     _usersCache = usersData;
-    fs.writeFileSync(USERS_PATH, JSON.stringify(usersData, null, 2));
+    saveUsersShape(usersData);
 }
 function scheduleDailyClear() {
     const now = new Date();

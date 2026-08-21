@@ -1,27 +1,25 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { loadAllAttachmentsFlat, saveAllAttachmentsFlat } from "./channelsstore.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const ATTACHMENTS_PATH = path.join(__dirname, "attachments.json");
 const REFRESH_BEFORE_EXPIRY_MS = 10 * 60 * 1000;
 const CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const HEALTH_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 function loadAttachments() {
     try {
-        if (fs.existsSync(ATTACHMENTS_PATH)) {
-            return JSON.parse(fs.readFileSync(ATTACHMENTS_PATH, "utf8"));
-        }
+        return loadAllAttachmentsFlat();
     } catch (e) {
-        console.error("[AttachmentTracker] Failed to load attachments.json:", e.message);
+        console.error("[AttachmentTracker] Failed to load attachments:", e.message);
     }
     return {};
 }
 function saveAttachments(data) {
     try {
-        fs.writeFileSync(ATTACHMENTS_PATH, JSON.stringify(data, null, 2), "utf8");
+        saveAllAttachmentsFlat(data);
     } catch (e) {
-        console.error("[AttachmentTracker] Failed to save attachments.json:", e.message);
+        console.error("[AttachmentTracker] Failed to save attachments:", e.message);
     }
 }
 export function makeStableKey(channelId, messageId, filename) {
