@@ -160,6 +160,7 @@ let liveInterval = null;
 let liveMode = false;
 let LOCKDOWN = false;
 let MOVIE_LOCKDOWN = false;
+let DISCORD_CHAT_LOCKDOWN = false;
 const movieLockdownStreamClients = new Set();
 function broadcastMovieLockdown() {
     const payload = `data: ${JSON.stringify({ disabled: MOVIE_LOCKDOWN })}\n\n`;
@@ -168,6 +169,17 @@ function broadcastMovieLockdown() {
             client.write(payload);
         } catch {
             movieLockdownStreamClients.delete(client);
+        }
+    }
+}
+const discordChatLockdownStreamClients = new Set();
+function broadcastDiscordChatLockdown() {
+    const payload = `data: ${JSON.stringify({ locked: DISCORD_CHAT_LOCKDOWN })}\n\n`;
+    for (const client of discordChatLockdownStreamClients) {
+        try {
+            client.write(payload);
+        } catch {
+            discordChatLockdownStreamClients.delete(client);
         }
     }
 }
@@ -1295,6 +1307,27 @@ app.get("/api/movies_lockdown_stream_x9a7b2", (req, res) => {
         movieLockdownStreamClients.delete(res);
     });
 });
+app.get("/api/discord_chat_lockdown_status_x9a7b2", (req, res) => {
+    res.json({ locked: DISCORD_CHAT_LOCKDOWN });
+});
+app.get("/api/discord_chat_lockdown_stream_x9a7b2", (req, res) => {
+    res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "Access-Control-Allow-Origin": "*",
+        "X-Accel-Buffering": "no"
+    });
+    res.write(`data: ${JSON.stringify({ locked: DISCORD_CHAT_LOCKDOWN })}\n\n`);
+    discordChatLockdownStreamClients.add(res);
+    const keepAlive = setInterval(() => {
+        try { res.write(": keep-alive\n\n"); } catch { clearInterval(keepAlive); }
+    }, 25_000);
+    req.on("close", () => {
+        clearInterval(keepAlive);
+        discordChatLockdownStreamClients.delete(res);
+    });
+});
 app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
     const name = path.basename(req.params.name);
     const file = path.join(MOVIES_DIR, name + ".mp4");
@@ -1771,6 +1804,31 @@ app.post("/admin/movies_toggle", (req, res) => {
     }
     console.log(`MOVIE_LOCKDOWN Is Now ${MOVIE_LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
     res.json({ moviesDisabled: MOVIE_LOCKDOWN });
+});
+app.post("/admin/discord_chat_lockdown_toggle", (req, res) => {
+    DISCORD_CHAT_LOCKDOWN = !DISCORD_CHAT_LOCKDOWN;
+    broadcastDiscordChatLockdown();
+    if (DISCORD_CHAT_LOCKDOWN) {
+        discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${logid}/messages`,
+            data: {
+                content: "**The Chat Has Been Locked Down — No New Messages Can Be Sent And Discord Syncing Is Paused**"
+            },
+            headers: { "Content-Type": "application/json" }
+        }).catch(() => {});
+    } else {
+        discordRequestForce({
+            method: "post",
+            url: `https://discord.com/api/v10/channels/${logid}/messages`,
+            data: {
+                content: "**Chat Lockdown Has Been Lifted — Messages And Discord Syncing Have Resumed**"
+            },
+            headers: { "Content-Type": "application/json" }
+        }).catch(() => {});
+    }
+    console.log(`DISCORD_CHAT_LOCKDOWN Is Now ${DISCORD_CHAT_LOCKDOWN ? "ON" : "OFF"} Via Remote Toggle`);
+    res.json({ chatLocked: DISCORD_CHAT_LOCKDOWN });
 });
 app.post("/admin/restart", verifyFirebaseToken, async (req, res) => {
     try {
@@ -2963,6 +3021,9 @@ app.post("/send", blockDiscordIfDisabled, memoryUpload.single("file"), async (re
         '1334377158789042226'
     ]);
     if (!requireAdminForChannel(req, res, ALLOWED_CHANNELS, targetChannel)) return;
+    if (DISCORD_CHAT_LOCKDOWN) {
+        return res.status(423).json({ error: "The Chat Is Currently Locked Down. No New Messages Can Be Sent.", chatLocked: true });
+    }
     try {
         if (file) {
             const formData = new FormData();
@@ -3296,6 +3357,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             if (!isNewMessage) {
                 return res.status(403).json({ error: "Unauthorized" });
             }
+            if (DISCORD_CHAT_LOCKDOWN) {
+                return res.status(423).json({ error: "The Chat Is Currently Locked Down. No New Messages Can Be Sent.", chatLocked: true });
+            }
             const channelName = path[1];
             const dataJsonG = getDataCache();
             const chDataG = dataJsonG?.channels?.[channelName];
@@ -3431,6 +3495,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             (value.t || value.text)
         ) {
             const msgText = value.t || value.text || "";
+            if (DISCORD_CHAT_LOCKDOWN) {
+                return res.status(423).json({ error: "The Chat Is Currently Locked Down. No New Messages Can Be Sent.", chatLocked: true });
+            }
             if (/@everyone\b/i.test(msgText) || /@here\b/i.test(msgText)) {
                 return res.status(403).json({ error: "@everyone And @here Are Not Allowed." });
             }
@@ -3979,6 +4046,7 @@ async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
     }
 }
 async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTimestamp) {
+    if (DISCORD_CHAT_LOCKDOWN) return null;
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
     if (!discordChannelId) return null;
     const data = getDataCache();
@@ -6662,6 +6730,7 @@ function startDiscordGateway() {
                 gatewayReconnectAttempts = 0;
                 console.log("[DiscordGateway] Session successfully resumed");
             } else if (op === 0 && t === "MESSAGE_CREATE") {
+                if (DISCORD_CHAT_LOCKDOWN) return;
                 if (!watchedChannelIds.has(d.channel_id)) return;
                 const ALLOWED_BOT_ID = process.env.ALLOWED_BOT_ID || "YOUR_BOT_ID_HERE";
                 const ALLOWED_BOT_CHANNEL_IDS = new Set(
