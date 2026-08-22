@@ -251,6 +251,8 @@ const ROUTES = {
 const RULES_PATH = path.join(__dirname, "rules.json");
 const SC_SEARCH_BASE = process.env.MUSIC_SEARCH_URL;
 const seenUsers = new Set();
+const pendingDisplayNameAssignment = new Map();
+const DEFAULT_DISPLAYNAME_DELAY_MS = 5 * 60 * 1000;
 const server = httpServer.listen(PORT, () => {
     console.log(`Infinite Campus Server Running At http://localhost:${PORT}`);
     httpServer.setTimeout(0);
@@ -5536,6 +5538,40 @@ async function verifyToken(reqOrToken) {
     const decoded = await admin.auth().verifyIdToken(token);
     return decoded.uid;
 }
+function generateDefaultDisplayName(data) {
+    const users = data?.users || {};
+    const taken = new Set();
+    for (const userData of Object.values(users)) {
+        const dn = userData?.profile?.displayName;
+        if (dn) taken.add(String(dn).toLowerCase());
+    }
+    let n = Object.keys(users).length || 1;
+    let candidate;
+    do {
+        candidate = `User${n}`;
+        n++;
+    } while (taken.has(candidate.toLowerCase()));
+    return candidate;
+}
+async function assignDefaultDisplayNamesIfDue() {
+    if (pendingDisplayNameAssignment.size === 0) return;
+    const now = Date.now();
+    for (const [uid, firstSeenAt] of pendingDisplayNameAssignment.entries()) {
+        if (now - firstSeenAt < DEFAULT_DISPLAYNAME_DELAY_MS) continue;
+        pendingDisplayNameAssignment.delete(uid);
+        try {
+            invalidateDataCache();
+            const data = getDataCache();
+            const profile = data?.users?.[uid]?.profile || {};
+            if (profile.displayName) continue;
+            const defaultName = generateDefaultDisplayName(data);
+            updateDataPath(`users/${uid}/profile`, { displayName: defaultName });
+            console.log(`Assigned Default Display Name To ${uid}: ${defaultName}`);
+        } catch (e) {
+            console.error("Failed To Assign Default Display Name For", uid, e.message);
+        }
+    }
+}
 async function watchForNewUsers() {
     const _initData = getDataCache();
     for (const userId of Object.keys(_initData.users || {})) {
@@ -5550,12 +5586,16 @@ async function watchForNewUsers() {
                 const profile = userData?.profile || {};
                 const displayName = profile?.displayName || "Unknown";
                 const verified = profile?.verified || false;
+                if (!profile?.displayName) {
+                    pendingDisplayNameAssignment.set(child, Date.now());
+                }
                 if (!verified) {
                     console.log(`New Unverified User Detected: ${displayName}`);
                     await sendVerificationNotification(child, displayName);
                 }
             }
         }
+        await assignDefaultDisplayNamesIfDue();
     }, 5000);
 }
 function archiveReport() {
