@@ -267,7 +267,7 @@ const STALE_CLEANUP_DIRS = [
 ];
 const STALE_CLEANUP_MS = 3 * 60 * 60 * 1000;
 const storageApply = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, APPLY_DIR),
+    destination: (req, file, cb) => cb(null, APPLICANTS_DIR),
     filename: (req, file, cb) => cb(null, safeName(file.originalname)),
 });
 const tempUploadActivity = new Map();
@@ -282,7 +282,7 @@ const uploadApply = multer({
         if (!ALLOWED_EXTS.has(ext)) {
             return cb(new Error("Invalid File Type. Allowed: " + Array.from(ALLOWED_EXTS).join(", ")));
         }
-        const current = folderSizeBytes(APPLY_DIR);
+        const current = folderSizeBytes(APPLICANTS_DIR);
         if (current >= MAX_APPLY_BYTES) {
             return cb(new Error("Capacity Reached (30 GB). Please Wait For Movies To Be Accepted Before Applying"));
         }
@@ -1456,7 +1456,7 @@ app.get(ROUTES.DOWNLOAD_VIDEO, (req, res) => {
 app.get(ROUTES.LIST_APPLY, (req, res) => {
     try {
         const diskFiles = new Set(
-            fs.readdirSync(APPLY_DIR).filter(f => !f.endsWith(".json"))
+            fs.readdirSync(APPLICANTS_DIR).filter(f => !f.endsWith(".json"))
         );
         let applyDataRaw = {};
         try {
@@ -1479,7 +1479,7 @@ app.get(ROUTES.LIST_APPLY, (req, res) => {
             ...acceptStatus.keys()
         ]);
         const list = Array.from(allFiles).map(file => {
-            const full = path.join(APPLY_DIR, file);
+            const full = path.join(APPLICANTS_DIR, file);
             let stats = null;
             if (fs.existsSync(full)) {
                 try {
@@ -1528,8 +1528,8 @@ app.get(ROUTES.LIST_VIDEOS, (req, res) => {
 app.get(ROUTES.STREAM_APPLY, (req, res) => {
     try {
         const name = path.basename(req.params.name);
-        const candidate = path.join(APPLY_DIR, name);
-        if (!candidate.startsWith(APPLY_DIR) || !fs.existsSync(candidate)) return res.status(404).send("Not Found");
+        const candidate = path.join(APPLICANTS_DIR, name);
+        if (!candidate.startsWith(APPLICANTS_DIR) || !fs.existsSync(candidate)) return res.status(404).send("Not Found");
         const stat = fs.statSync(candidate);
         const total = stat.size;
         const range = req.headers.range;
@@ -2039,7 +2039,7 @@ app.post("/api/anon-name", (req, res) => {
 app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
     const { filename } = req.body;
     if (!filename) return res.json({ ok: false, message: "No Filename Provided" });
-    const full = path.join(APPLY_DIR, filename);
+    const full = path.join(APPLICANTS_DIR, filename);
     if (!fs.existsSync(full)) return res.json({ ok: false, message: "Not Found" });
     try {
         fs.unlinkSync(full);
@@ -3066,7 +3066,7 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
                 percent: Math.round((received / totalChunks) * 100)
             });
         }
-        const finalPath = path.join(APPLY_DIR, safeFile);
+        const finalPath = path.join(APPLICANTS_DIR, safeFile);
         const writeStream = fs.createWriteStream(finalPath);
         (async () => {
             try {
@@ -3082,7 +3082,7 @@ app.post(ROUTES.UPLOAD, express.raw({ limit: "5mb", type: "*/*" }), (req, res) =
                 writeStream.end();
                 writeStream.on("close", () => {
                     fs.rmSync(chunkDir, { recursive: true, force: true });
-                    const metaPath = path.join(APPLY_DIR, safeFile + ".json");
+                    const metaPath = path.join(APPLICANTS_DIR, safeFile + ".json");
                     fs.writeFileSync(metaPath, JSON.stringify({
                         uploadedBy,
                         uid
@@ -4702,9 +4702,9 @@ async function resumeInProgressAccepts() {
     for (const resume of resumes) {
         const { movieName, discordMessageId, percent, status, lastKnownEta, stage, baseTarget, copyName, scaledName, duration: savedDuration } = resume;
         if (!movieName) continue;
-        const srcPath = path.join(APPLY_DIR, movieName);
-        const copyPath = copyName ? path.join(APPLY_DIR, copyName) : null;
-        const scaledPathTemp = scaledName ? path.join(APPLY_DIR, scaledName) : null;
+        const srcPath = path.join(APPLICANTS_DIR, movieName);
+        const copyPath = copyName ? path.join(APPLICANTS_DIR, copyName) : null;
+        const scaledPathTemp = scaledName ? path.join(APPLICANTS_DIR, scaledName) : null;
         const srcExists = fs.existsSync(srcPath);
         const copyExists = copyPath && fs.existsSync(copyPath);
         const scaledExists = scaledPathTemp && fs.existsSync(scaledPathTemp);
@@ -4787,8 +4787,8 @@ async function resumeInProgressAccepts() {
                 const resolvedBaseTarget = baseTarget || sanitize(path.parse(movieName).name);
                 const resolvedCopyName = copyName || `${resolvedBaseTarget}_${Date.now()}_copy.mp4`;
                 const resolvedScaledName = scaledName || `${resolvedBaseTarget}_${Date.now()}_${SCALE_SUFFIX}.mp4`;
-                const resolvedCopyPath = copyPath || path.join(APPLY_DIR, resolvedCopyName);
-                const resolvedScaledPathTemp = scaledPathTemp || path.join(APPLY_DIR, resolvedScaledName);
+                const resolvedCopyPath = copyPath || path.join(APPLICANTS_DIR, resolvedCopyName);
+                const resolvedScaledPathTemp = scaledPathTemp || path.join(APPLICANTS_DIR, resolvedScaledName);
                 const workId = `${movieName}_resumed_${Date.now()}`;
                 if (resumeStage === "copy") {
                     acceptStatus.set(movieName, { status: "copying", percent: 0, remainingSec: null, message: "Copying Container", updated: Date.now() });
@@ -4812,7 +4812,7 @@ async function resumeInProgressAccepts() {
                 const baseName = path.basename(finalDest);
                 let uploaderUid = null;
                 try {
-                    const metaPath = path.join(APPLY_DIR, movieName + ".json");
+                    const metaPath = path.join(APPLICANTS_DIR, movieName + ".json");
                     if (fs.existsSync(metaPath)) {
                         const meta = JSON.parse(fs.readFileSync(metaPath));
                         uploaderUid = meta.uid || meta.uploadedBy || null;
@@ -6203,7 +6203,7 @@ function loadApplyJSON() {
         }
     }
     const files = new Set(
-        fs.readdirSync(APPLY_DIR).filter(f => !f.endsWith(".json"))
+        fs.readdirSync(APPLICANTS_DIR).filter(f => !f.endsWith(".json"))
     );
     let changed = false;
     for (const movieName of Object.keys(data)) {
@@ -6649,7 +6649,7 @@ function setupSocketHandlers(ioInstance, label) {
         socket.on("acceptApplicant", (payload) => {
             const { filename, targetName } = payload;
             const safeFile = path.basename(filename);
-            const srcPath = path.join(APPLY_DIR, safeFile);
+            const srcPath = path.join(APPLICANTS_DIR, safeFile);
             if (!fs.existsSync(srcPath)) {
                 return socket.emit("jobError", { filename: safeFile, message: "Source File Not Found" });
             }
@@ -6690,8 +6690,8 @@ function setupSocketHandlers(ioInstance, label) {
                     const baseTarget = sanitize((targetName && targetName.trim()) ? targetName.replace(/\s+/g, "_") : path.parse(safeFile).name);
                     const copyName = `${baseTarget}_${Date.now()}_copy.mp4`;
                     const scaledName = `${baseTarget}_${Date.now()}_${SCALE_SUFFIX}.mp4`;
-                    const copyPath = path.join(APPLY_DIR, copyName);
-                    const scaledPathTemp = path.join(APPLY_DIR, scaledName);
+                    const copyPath = path.join(APPLICANTS_DIR, copyName);
+                    const scaledPathTemp = path.join(APPLICANTS_DIR, scaledName);
                     acceptStatus.set(safeFile, {
                         status: "copying",
                         percent: 0,
@@ -6751,7 +6751,7 @@ function setupSocketHandlers(ioInstance, label) {
                     const baseName = path.basename(finalDest);
                     let uploaderUid = null;
                     try {
-                        const metaPath = path.join(APPLY_DIR, safeFile + ".json");
+                        const metaPath = path.join(APPLICANTS_DIR, safeFile + ".json");
                         if (fs.existsSync(metaPath)) {
                             const meta = JSON.parse(fs.readFileSync(metaPath));
                             uploaderUid = meta.uid || meta.uploadedBy || null;
