@@ -30,6 +30,7 @@ import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
 import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
 import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMap as persistDiscordChannelMap } from "./datastore.js";
 import { loadUsersShape, saveUsersShape } from "./usersstore.js";
+import * as Bans from "./bansstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -666,6 +667,124 @@ app.all("/admin/modify-users", verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
+app.get("/api/ban-status", async (req, res) => {
+    try {
+        const header = req.headers.authorization || "";
+        const token = header.split("Bearer ")[1];
+        let uid = null;
+        if (token) {
+            try {
+                uid = (await admin.auth().verifyIdToken(token)).uid;
+            } catch {
+                uid = null;
+            }
+        }
+        let ban = null;
+        if (uid) {
+            ban = Bans.getBan(uid);
+        } else {
+            const anonToken = req.headers["x-anon-session"] || req.query?.anonSession || null;
+            ban = Bans.getBan(`anon:${anonToken || "guest"}`);
+        }
+        if (!ban) return res.json({ banned: false });
+        res.json({
+            banned: true,
+            reason: ban.reason,
+            bannedAt: ban.bannedAt,
+            expiresAt: ban.expiresAt
+        });
+    } catch (err) {
+        console.error("ban-status error:", err);
+        res.status(500).json({ error: "Could Not Check Ban Status" });
+    }
+});
+app.get("/api/moderation/ban-status/:id", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
+        if (!isPrivilegedAdminProfile(requesterProfile)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        const ban = Bans.getBan(req.params.id);
+        res.json({ banned: !!ban, ban: ban || null });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not Check Ban Status" });
+    }
+});
+app.post("/api/moderation/ban", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const requesterProfile = readDataPath(`users/${requesterUid}/profile`);
+        if (!isPrivilegedAdminProfile(requesterProfile)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        const { targetUid, anonSessionToken: anonTarget, reason } = req.body || {};
+        if (!targetUid && !anonTarget) {
+            return res.status(400).json({ error: "Missing targetUid Or anonSessionToken" });
+        }
+        if (!reason || !String(reason).trim()) {
+            return res.status(400).json({ error: "A Ban Reason Is Required" });
+        }
+        if (targetUid) {
+            const targetProfile = readDataPath(`users/${targetUid}/profile`) || {};
+            const ban = Bans.banUser(targetUid, {
+                reason: String(reason).trim(),
+                bannedBy: requesterUid,
+                expiresAt: null,
+                recentMessages: getRecentSentMessagesForUser(targetUid, 10),
+                type: "user",
+                displayName: targetProfile.displayName || null
+            });
+            broadcastUpdate(["users", targetUid, "profile"], getDataCache()?.users?.[targetUid]?.profile || {});
+            return res.json({ success: true, ban });
+        } else {
+            const banId = `anon:${anonTarget}`;
+            const ban = Bans.banUser(banId, {
+                reason: String(reason).trim(),
+                bannedBy: requesterUid,
+                expiresAt: Date.now() + 12 * 60 * 60 * 1000,
+                recentMessages: [],
+                type: "anon",
+                displayName: resolveAnonName(anonTarget)
+            });
+            return res.json({ success: true, ban });
+        }
+    } catch (err) {
+        console.error("admin/ban error:", err);
+        res.status(500).json({ error: "Could Not Ban User" });
+    }
+});
+app.post("/api/moderation/unban", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
+        if (!isPrivilegedAdminProfile(requesterProfile)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        const { targetUid, anonSessionToken: anonTarget } = req.body || {};
+        if (!targetUid && !anonTarget) {
+            return res.status(400).json({ error: "Missing targetUid Or anonSessionToken" });
+        }
+        const id = targetUid || `anon:${anonTarget}`;
+        Bans.unbanUser(id);
+        if (targetUid) {
+            broadcastUpdate(["users", targetUid, "profile"], getDataCache()?.users?.[targetUid]?.profile || {});
+        }
+        res.json({ success: true });
+    } catch (err) {
+        console.error("admin/unban error:", err);
+        res.status(500).json({ error: "Could Not Unban User" });
+    }
+});
+app.get("/api/moderation/bans", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
+        if (!isPrivilegedAdminProfile(requesterProfile)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        res.json({ bans: Bans.listBans() });
+    } catch (err) {
+        res.status(500).json({ error: "Could Not List Bans" });
+    }
+});
 app.delete("/admin/files/:filename", (req, res) => {
     const pass = req.headers["x-admin-password"];
     if (pass === process.env.DON_PASS_1) {
@@ -681,7 +800,7 @@ app.delete("/admin/files/:filename", (req, res) => {
     }
     res.status(404).json({ error: "File Not Found" });
 });
-app.delete("/groups/:id", verifyFirebaseToken, rateLimit("delete"), async (req, res) => {
+app.delete("/groups/:id", verifyFirebaseToken, requireNotBanned, rateLimit("delete"), async (req, res) => {
     try {
         const result = Groups.deleteGroup(req.params.id, req.user.uid);
         if (result.error) return res.status(403).json({ error: result.error });
@@ -1910,10 +2029,11 @@ app.post("/api/anon-name", (req, res) => {
     if (forbidden.test(name) && name.toLowerCase() !== "anonymous") {
         return res.status(400).json({ error: "That Name Is Reserved" });
     }
-    if (!sessionToken || !anonSessions.has(sessionToken)) {
+    if (!sessionToken || typeof sessionToken !== "string" || sessionToken.length < 8 || sessionToken.length > 128) {
         sessionToken = crypto.randomBytes(24).toString("hex");
     }
-    anonSessions.set(sessionToken, { name, createdAt: Date.now() });
+    const existing = anonSessions.get(sessionToken);
+    anonSessions.set(sessionToken, { name, createdAt: existing?.createdAt || Date.now() });
     res.json({ sessionToken, name });
 });
 app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
@@ -2399,7 +2519,7 @@ app.post("/github-webhook", express.json({ type: "application/json" }),async (re
         res.sendStatus(500);
     }
 });
-app.post("/groups/create", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/create", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const profile = getDataCache()?.users?.[uid]?.profile || {};
@@ -2416,7 +2536,7 @@ app.post("/groups/create", verifyFirebaseToken, rateLimit("write"), async (req, 
         res.status(500).json({ error: "Could Not Create Group" });
     }
 });
-app.post("/groups/invite/:code", verifyFirebaseToken, async (req, res) => {
+app.post("/groups/invite/:code", verifyFirebaseToken, requireNotBanned, async (req, res) => {
     try {
         const group = Groups.getGroupByInvite(req.params.code);
         if (!group) return res.status(404).json({ error: "Invalid Or Expired Invite Code" });
@@ -2425,7 +2545,7 @@ app.post("/groups/invite/:code", verifyFirebaseToken, async (req, res) => {
         res.status(500).json({ error: "Lookup Failed" });
     }
 });
-app.post("/groups/join", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/join", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const profile = getDataCache()?.users?.[uid]?.profile || {};
@@ -2447,7 +2567,7 @@ app.post("/groups/join", verifyFirebaseToken, rateLimit("write"), async (req, re
         res.status(500).json({ error: "Could Not Join Group" });
     }
 });
-app.post("/groups/mine", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+app.post("/groups/mine", verifyFirebaseToken, requireNotBanned, rateLimit("read"), async (req, res) => {
     try {
         const groups = Groups.getUserGroups(req.user.uid);
         res.json({ success: true, groups });
@@ -2456,7 +2576,7 @@ app.post("/groups/mine", verifyFirebaseToken, rateLimit("read"), async (req, res
         res.status(500).json({ error: "Could Not Load Groups" });
     }
 });
-app.post("/groups/:id/delete-message", verifyFirebaseToken, rateLimit("delete"), async (req, res) => {
+app.post("/groups/:id/delete-message", verifyFirebaseToken, requireNotBanned, rateLimit("delete"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { msgId } = req.body || {};
@@ -2468,7 +2588,7 @@ app.post("/groups/:id/delete-message", verifyFirebaseToken, rateLimit("delete"),
         res.status(500).json({ error: "Could Not Delete Message" });
     }
 });
-app.post("/groups/:id/edit-message", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/edit-message", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const { msgId, text } = req.body || {};
@@ -2480,7 +2600,7 @@ app.post("/groups/:id/edit-message", verifyFirebaseToken, rateLimit("write"), as
         res.status(500).json({ error: "Could Not Edit Message" });
     }
 });
-app.post("/groups/:id/react", verifyFirebaseToken, rateLimit("react"), async (req, res) => {
+app.post("/groups/:id/react", verifyFirebaseToken, requireNotBanned, rateLimit("react"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const group = Groups.getGroup(req.params.id);
@@ -2496,7 +2616,7 @@ app.post("/groups/:id/react", verifyFirebaseToken, rateLimit("react"), async (re
         res.status(500).json({ error: "Could Not React To Message" });
     }
 });
-app.post("/groups/:id/read", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+app.post("/groups/:id/read", verifyFirebaseToken, requireNotBanned, rateLimit("read"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const group = Groups.getGroup(req.params.id);
@@ -2508,7 +2628,7 @@ app.post("/groups/:id/read", verifyFirebaseToken, rateLimit("read"), async (req,
         res.status(500).json({ error: "Could Not Mark Group As Read" });
     }
 });
-app.post("/groups/:id", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+app.post("/groups/:id", verifyFirebaseToken, requireNotBanned, rateLimit("read"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const group = Groups.getGroup(req.params.id);
@@ -2520,7 +2640,7 @@ app.post("/groups/:id", verifyFirebaseToken, rateLimit("read"), async (req, res)
         res.status(500).json({ error: "Could Not Load Group" });
     }
 });
-app.post("/groups/:id/members", verifyFirebaseToken, rateLimit("read"), async (req, res) => {
+app.post("/groups/:id/members", verifyFirebaseToken, requireNotBanned, rateLimit("read"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const group = Groups.getGroup(req.params.id);
@@ -2536,7 +2656,7 @@ app.post("/groups/:id/members", verifyFirebaseToken, rateLimit("read"), async (r
         res.status(500).json({ error: "Could Not Load Members" });
     }
 });
-app.post("/groups/:id/message", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/message", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const uid = req.user.uid;
         const group = Groups.getGroup(req.params.id);
@@ -2555,7 +2675,7 @@ app.post("/groups/:id/message", verifyFirebaseToken, rateLimit("write"), async (
         res.status(500).json({ error: "Could Not Send Message" });
     }
 });
-app.post("/groups/:id/upload", verifyFirebaseToken, rateLimit("upload"), (req, res, next) => {
+app.post("/groups/:id/upload", verifyFirebaseToken, requireNotBanned, rateLimit("upload"), (req, res, next) => {
     const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
     upload.single("file")(req, res, (err) => {
         if (err) {
@@ -2615,7 +2735,7 @@ app.post("/groups/:id/upload", verifyFirebaseToken, rateLimit("upload"), (req, r
         res.status(500).json({ error: "Could Not Upload File" });
     }
 });
-app.post("/groups/:id/kick", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/kick", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const { targetUid } = req.body || {};
         if (!targetUid) return res.status(400).json({ error: "Missing targetUid" });
@@ -2626,7 +2746,7 @@ app.post("/groups/:id/kick", verifyFirebaseToken, rateLimit("write"), async (req
         res.status(500).json({ error: "Could Not Kick Member" });
     }
 });
-app.post("/groups/:id/leave", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/leave", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const result = Groups.leaveGroup(req.params.id, req.user.uid);
         if (result.error) return res.status(403).json({ error: result.error });
@@ -2635,7 +2755,7 @@ app.post("/groups/:id/leave", verifyFirebaseToken, rateLimit("write"), async (re
         res.status(500).json({ error: "Could Not Leave Group" });
     }
 });
-app.post("/groups/:id/rename", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/rename", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const { name } = req.body || {};
         if (!name || !name.trim()) return res.status(400).json({ error: "Group Name Is Required" });
@@ -2646,7 +2766,7 @@ app.post("/groups/:id/rename", verifyFirebaseToken, rateLimit("write"), async (r
         res.status(500).json({ error: "Could Not Rename Group" });
     }
 });
-app.post("/groups/:id/reset-invite", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/reset-invite", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const result = Groups.resetInvite(req.params.id, req.user.uid, groupHostUrl(req));
         if (result.error) return res.status(403).json({ error: result.error });
@@ -2655,7 +2775,7 @@ app.post("/groups/:id/reset-invite", verifyFirebaseToken, rateLimit("write"), as
         res.status(500).json({ error: "Could Not Reset Invite" });
     }
 });
-app.post("/groups/:id/transfer", verifyFirebaseToken, rateLimit("write"), async (req, res) => {
+app.post("/groups/:id/transfer", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
     try {
         const { targetUid } = req.body || {};
         if (!targetUid) return res.status(400).json({ error: "Missing targetUid" });
@@ -3337,6 +3457,30 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
         try {
         let uid = null;
         try { uid = await verifyToken(req); } catch { uid = null; }
+        if (uid) {
+            const uBan = Bans.getBan(uid);
+            if (uBan) {
+                return res.status(403).json({
+                    error: "You Have Been Banned.",
+                    banned: true,
+                    reason: uBan.reason,
+                    bannedAt: uBan.bannedAt,
+                    expiresAt: uBan.expiresAt
+                });
+            }
+        } else {
+            const anonTokPreCheck = req.headers["x-anon-session"] || req.body?.anonSession || null;
+            const aBan = Bans.getBan(`anon:${anonTokPreCheck || "guest"}`);
+            if (aBan) {
+                return res.status(403).json({
+                    error: "You Have Been Banned.",
+                    banned: true,
+                    reason: aBan.reason,
+                    bannedAt: aBan.bannedAt,
+                    expiresAt: aBan.expiresAt
+                });
+            }
+        }
         let path = req.body?.path;
         let value = req.body?.value;
         if (typeof path === "string") {
@@ -3367,6 +3511,16 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 return res.status(403).json({ error: "This Channel Does Not Allow Guest Messages." });
             }
             const anonSessionToken = req.headers["x-anon-session"] || req.body?.anonSession || null;
+            const anonBanCheck = Bans.getBan(`anon:${anonSessionToken || "guest"}`);
+            if (anonBanCheck) {
+                return res.status(403).json({
+                    error: "You Have Been Banned.",
+                    banned: true,
+                    reason: anonBanCheck.reason,
+                    bannedAt: anonBanCheck.bannedAt,
+                    expiresAt: anonBanCheck.expiresAt
+                });
+            }
             const anonName = resolveAnonName(anonSessionToken);
             const msgText = (value?.t || value?.text || "").trim();
             if (!msgText && !uploadedFile) return res.status(400).json({ error: "Empty Message" });
@@ -3385,7 +3539,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 });
             }
             const ts = Date.now();
-            const guestMsg = { u: anonName, t: msgText, sender: "anon" };
+            const guestMsg = { u: anonName, t: msgText, sender: "anon", anonId: anonSessionToken || null };
             if (value?.r) guestMsg.r = value.r;
             const dataJsonW = getDataCache();
             if (!dataJsonW.messages) dataJsonW.messages = {};
@@ -3508,6 +3662,16 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 userProfile.isAdmin || userProfile.isHAdmin ||
                 userProfile.isTester
             );
+            const userBanCheck = Bans.getBan(uid);
+            if (userBanCheck) {
+                return res.status(403).json({
+                    error: "You Have Been Banned.",
+                    banned: true,
+                    reason: userBanCheck.reason,
+                    bannedAt: userBanCheck.bannedAt,
+                    expiresAt: userBanCheck.expiresAt
+                });
+            }
             if (!isAdminUser && userProfile.isMuted) {
                 return res.status(403).json({ error: "You Are Muted And Cannot Send Messages.", muted: true });
             }
@@ -3945,6 +4109,13 @@ wss.on("connection", async (ws, req) => {
             } catch {
                 uid = null;
             }
+        }
+        if (uid && Bans.isBanned(uid)) {
+            return ws.close();
+        }
+        const wsAnonSession = url.searchParams.get("anonSession");
+        if (!uid && wsAnonSession && Bans.isBanned(`anon:${wsAnonSession}`)) {
+            return ws.close();
         }
         const dataJson = getDataCache();
         const rules = await loadRules();
@@ -5437,6 +5608,41 @@ function getLastMessages(channelName, n) {
     if (!channelMsgs) return [];
     const sortedKeys = Object.keys(channelMsgs).sort((a, b) => Number(a) - Number(b));
     return sortedKeys.slice(-n).map(k => channelMsgs[k]);
+}
+function getRecentSentMessagesForUser(uid, limit = 10) {
+    if (!uid) return [];
+    const dataJson = getDataCache();
+    const all = [];
+    for (const [channelName, msgs] of Object.entries(dataJson?.messages || {})) {
+        for (const [ts, msg] of Object.entries(msgs || {})) {
+            if ((msg?.s || msg?.sender) === uid) {
+                all.push({ channel: channelName, ts: Number(ts), text: msg?.t || msg?.text || "" });
+            }
+        }
+    }
+    all.sort((a, b) => a.ts - b.ts);
+    return all.slice(-limit);
+}
+function isPrivilegedAdminProfile(profile) {
+    return !!(profile && (
+        profile.isOwner || profile.isCoOwner || profile.isHAdmin ||
+        profile.isTester || profile.isDev
+    ));
+}
+function requireNotBanned(req, res, next) {
+    const uid = req.user?.uid;
+    if (!uid) return next();
+    const ban = Bans.getBan(uid);
+    if (ban) {
+        return res.status(403).json({
+            error: "You Have Been Banned.",
+            banned: true,
+            reason: ban.reason,
+            bannedAt: ban.bannedAt,
+            expiresAt: ban.expiresAt
+        });
+    }
+    next();
 }
 function normalizeForDuplicateCheck(text) {
     return String(text || "")
