@@ -2214,7 +2214,7 @@ app.post("/delete", rateLimit("delete"), async (req, res) => {
         const userProfile = dataJson?.users?.[uid]?.profile || {};
         const auth = { uid, ...userProfile };
         const isHighAdmin = !!(userProfile.isOwner || userProfile.isCoOwner || userProfile.isTester || userProfile.isHAdmin);
-        const isAnonMessage = oldValue && (oldValue.sender === "anon" || (oldValue.anon === true && !oldValue.s));
+        const isAnonMessage = isAnonMessageEntry(oldValue);
         const { rule, wildcards } = getRuleForOperation(rules, path, "write");
         if (
             !(isHighAdmin && isAnonMessage) &&
@@ -3731,12 +3731,29 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
         const newDataSnap = new DataSnapshot(newValue);
         const userProfile = dataJson?.users?.[uid]?.profile || {};
         const auth = { uid, ...userProfile };
+        const isHighAdminWriter = !!(userProfile.isOwner || userProfile.isCoOwner || userProfile.isTester || userProfile.isHAdmin);
+        const isEditingAnonMessage = (
+            isHighAdminWriter &&
+            path.length === 4 &&
+            path[0] === "messages" &&
+            (path[3] === "t" || path[3] === "text") &&
+            isAnonMessageEntry(dataJson?.messages?.[path[1]]?.[path[2]])
+        );
         const { rule, wildcards } = getRuleForOperation(rules, path, "write");
-        if (!rule || !evaluate(rule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards }))
+        if (
+            !isEditingAnonMessage &&
+            (!rule || !evaluate(rule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards }))
+        ) {
             return res.status(403).json({ error: "Write denied" });
+        }
         const validateRule = getRuleForOperation(rules, path, "validate").rule;
-        if (validateRule && !evaluate(validateRule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards }))
+        if (
+            !isEditingAnonMessage &&
+            validateRule &&
+            !evaluate(validateRule, { auth, root, data: dataSnap, newData: newDataSnap, wildcards })
+        ) {
             return res.status(403).json({ error: "Validation failed" });
+        }
         parent[key] = newValue;
         saveData(dataJson);
         if (path.length >= 2 && path[0] === "pushTokens") {
@@ -4185,7 +4202,12 @@ async function bridgeDeleteToDiscordWithEntry(channelName, timestamp, entry) {
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
     if (!discordChannelId) return;
     if (!entry) return;
-    const mirrorId = getMirrorId(channelName, timestamp);
+    // The entry has already been removed from the data store by the time this
+    // runs, so getMirrorId's data-store fallback can no longer find it (it only
+    // works via the in-memory mirrorIdMap cache). Fall back to the mirror id
+    // captured on the entry itself before deletion so this still works after a
+    // server restart / cold cache.
+    const mirrorId = getMirrorId(channelName, timestamp) || (entry._discordMirrorId ? String(entry._discordMirrorId) : null);
     if (!mirrorId) return;
     try {
         await discordRequestForce({
@@ -4202,16 +4224,20 @@ async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
     const data = getDataCache();
     const entry = data?.messages?.[channelName]?.[timestamp];
     if (!entry) return;
-    if (entry.u) return;
-    const mirrorId = getMirrorId(channelName, timestamp);
+    const mirrorId = getMirrorId(channelName, timestamp) || (entry._discordMirrorId ? String(entry._discordMirrorId) : null);
     if (!mirrorId) return;
     try {
-        const profile = data?.users?.[senderUid]?.profile || {};
-        const displayName = profile.displayName || "User";
+        const isAnon = isAnonMessageEntry(entry);
+        const displayName = isAnon
+            ? (entry.u || "Anonymous")
+            : (data?.users?.[senderUid]?.profile?.displayName || "User");
+        const content = isAnon
+            ? `**${displayName}**: ${newText}\n-# This User Is Not Logged In`
+            : `**${displayName}**: ${newText}`;
         await discordRequestForce({
             method: "patch",
             url: `https://discord.com/api/v10/channels/${discordChannelId}/messages/${mirrorId}`,
-            data: { content: `**${displayName}**: ${newText}` },
+            data: { content },
             headers: { "Content-Type": "application/json" },
         });
     } catch (e) {
@@ -6014,6 +6040,9 @@ function getMirrorId(channelName, timestamp) {
         return mirrorIdMap[key];
     }
     return null;
+}
+function isAnonMessageEntry(entry) {
+    return !!(entry && (entry.sender === "anon" || (entry.anon === true && !entry.s)));
 }
 function getNextOrder(moviesJson) {
     const orders = Object.values(moviesJson).map(m => m.order);
