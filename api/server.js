@@ -29,7 +29,8 @@ import * as Groups from "./groupsstore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
 import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
 import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMap as persistDiscordChannelMap } from "./datastore.js";
-import { loadUsersShape, saveUsersShape } from "./usersstore.js";
+import { getOrCreatePartnerId, findPartnerImageFile, deletePartnerImageFiles, partnerDir } from "./partnersstore.js";
+import { loadUsersShape, saveUsersShape, USERS_DIR } from "./usersstore.js";
 import * as Bans from "./bansstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -56,6 +57,31 @@ const ACCLOGS_PATH = path.join(__dirname, "data", "logs", "acclogs.json");
 let activeLinks = [];
 const ALLOWED_EXTS = new Set([".mp4", ".mov", ".mkv", ".ts", ".webm", ".avi", ".flv", ".mpeg", ".mpg", ".m4v",]);
 const ALLOWED_PFP_EXTS = new Set([".png", ".jpeg", ".jpg", ".webp", ".ico"]);
+const PFP_MIME_TYPES = {
+    ".png": "image/png",
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".webp": "image/webp",
+    ".ico": "image/x-icon"
+};
+function pfpDirForUser(uid) {
+    return path.join(USERS_DIR, String(uid), "profile");
+}
+function findUserPfpFile(uid) {
+    const dir = pfpDirForUser(uid);
+    if (!fs.existsSync(dir)) return null;
+    const match = fs.readdirSync(dir).find(name => /^pic\.[a-z0-9]+$/i.test(name));
+    return match ? path.join(dir, match) : null;
+}
+function deleteUserPfpFiles(uid) {
+    const dir = pfpDirForUser(uid);
+    if (!fs.existsSync(dir)) return;
+    for (const name of fs.readdirSync(dir)) {
+        if (/^pic\.[a-z0-9]+$/i.test(name)) {
+            fs.rmSync(path.join(dir, name), { force: true });
+        }
+    }
+}
 let alreadyArchived = false;
 let alreadyCleared = false;
 const anonSessions = new Map();
@@ -209,6 +235,7 @@ const MSG_SLOWMODE_MS = 3000;
 const _msgSlowmodeStore = new Map();
 const MUSIC_API_3 = process.env.MUSIC_API_3;
 const onlineLastSeen = new Map();
+const SELECTABLE_STATUSES = ["online", "idle", "dnd", "invisible"];
 const PFP_COOLDOWN_MS = 3 * 60 * 1000;
 const pfpStorage = multer.memoryStorage();
 const pfpUploadCooldown = new Map();
@@ -224,6 +251,7 @@ const RATE_LIMITS = {
     delete:  { max: 15,  window: 10_000 },  // 15 deletes/ 10 s
     react:   { max: 20,  window: 10_000 },  // 20 reacts / 10 s
     online:  { max: 20,   window: 30_000 },  // 20  pings  / 30 s  (client calls every 20 s)
+    status:  { max: 30,   window: 30_000 },  // 30  status changes / 30 s
     upload:  { max: 10,  window: 60_000 },  // 10 uploads/ 60 s
     default: { max: 40,  window: 10_000 },
 };
@@ -306,6 +334,18 @@ const uploadSubtitle = multer({
 const uploadLogs = [];
 const uploadPfp = multer({
     storage: pfpStorage,
+    limits: { fileSize: 5 * 1024 * 1024 },
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (!ALLOWED_PFP_EXTS.has(ext)) {
+            return cb(new Error("Invalid File Type"));
+        }
+        cb(null, true);
+    }
+});
+const partnerPhotoStorage = multer.memoryStorage();
+const uploadPartnerPhoto = multer({
+    storage: partnerPhotoStorage,
     limits: { fileSize: 5 * 1024 * 1024 },
     fileFilter: (req, file, cb) => {
         const ext = path.extname(file.originalname).toLowerCase();
@@ -1026,30 +1066,39 @@ app.post("/discord-user-lookup", rateLimit("read"), async (req, res) => {
         res.status(500).json({ error: "Server Error" });
     }
 });
+function reverseDiscordChannelMap() {
+    const reverse = {};
+    for (const [websiteChannel, discordId] of Object.entries(DISCORD_CHANNEL_MAP || {})) {
+        if (discordId) reverse[String(discordId)] = websiteChannel;
+    }
+    return reverse;
+}
 app.post("/discord-channel-lookup", rateLimit("read"), async (req, res) => {
     try {
         let ids = Array.isArray(req.body?.ids) ? req.body.ids : [];
         if (req.body?.id) ids.push(req.body.id);
         ids = [...new Set(ids.filter(id => typeof id === "string" && /^\d{5,25}$/.test(id)))].slice(0, 50);
         if (!ids.length) return res.status(400).json({ error: "No Valid Discord Channel IDs Provided" });
+        const reverseMap = reverseDiscordChannelMap();
         const channels = {};
         await Promise.all(ids.map(async (id) => {
             const cached = discordChannelLookupCache.get(id);
+            let data;
             if (cached && (Date.now() - cached.ts) < DISCORD_CHANNEL_LOOKUP_TTL) {
-                channels[id] = cached.data;
-                return;
+                data = cached.data;
+            } else {
+                try {
+                    const resp = await discordRequest({
+                        method: "get",
+                        url: `https://discord.com/api/v10/channels/${id}`
+                    });
+                    data = resp?.data ? { name: resp.data.name || null, type: resp.data.type } : null;
+                    discordChannelLookupCache.set(id, { data, ts: Date.now() });
+                } catch (e) {
+                    data = null;
+                }
             }
-            try {
-                const resp = await discordRequest({
-                    method: "get",
-                    url: `https://discord.com/api/v10/channels/${id}`
-                });
-                const data = resp?.data ? { name: resp.data.name || null, type: resp.data.type } : null;
-                discordChannelLookupCache.set(id, { data, ts: Date.now() });
-                channels[id] = data;
-            } catch (e) {
-                channels[id] = null;
-            }
+            channels[id] = data ? { ...data, websiteChannel: reverseMap[id] || null } : null;
         }));
         res.json({ channels });
     } catch (err) {
@@ -2889,12 +2938,31 @@ app.post("/load-more-messages", async (req, res) => {
 app.post("/online", verifyFirebaseToken, rateLimit("online"), async (req, res) => {
     try {
         const uid = req.user.uid;
-        updateDataPath(`users/${uid}/profile`, { online: true });
         onlineLastSeen.set(uid, Date.now());
+        const currentStatus = getDataCache()?.users?.[uid]?.profile?.status;
+        if (!currentStatus || currentStatus === "offline") {
+            updateDataPath(`users/${uid}/profile`, { status: "online" });
+            broadcastUpdate(["users", uid, "profile"], getDataCache()?.users?.[uid]?.profile || {});
+        }
         res.json({
             success: true
         });
     } catch{}
+});
+app.post("/status", verifyFirebaseToken, rateLimit("status"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const { status } = req.body || {};
+        if (!SELECTABLE_STATUSES.includes(status)) {
+            return res.status(400).json({ error: "Invalid Status" });
+        }
+        onlineLastSeen.set(uid, Date.now());
+        updateDataPath(`users/${uid}/profile`, { status });
+        broadcastUpdate(["users", uid, "profile"], getDataCache()?.users?.[uid]?.profile || {});
+        res.json({ success: true, status });
+    } catch {
+        res.status(500).json({ error: "Server Error" });
+    }
 });
 app.post("/pay", verifyFirebaseToken, async (req, res) => {
     try {
@@ -3262,75 +3330,143 @@ app.post("/upload-pfp", verifyFirebaseToken, uploadPfp.single("file"), async (re
         if (!ALLOWED_PFP_EXTS.has(ext)) {
             return res.status(400).json({ error: "Invalid File Type" });
         }
-        const indexRes = await fetch("https://www.infinitecampus.xyz/pfps/index.json");
-        if (!indexRes.ok) {
-            return res.status(500).json({ error: "Failed To Fetch index.json" });
-        }
-        const indexJson = await indexRes.json();
-        const numbers = indexJson.map(name =>
-            parseInt(name.split(".")[0], 10)
-        ).filter(n => !isNaN(n));
-        const nextNumber = (numbers.length > 0 ? numbers.reduce((a, b) => Math.max(a, b), 0) : 0) + 1;
-        const newFileName = `${nextNumber}${ext}`;
-        const newPicIndex = indexJson.length;
-        indexJson.push(newFileName);
-        const updatedIndexContent = Buffer.from(
-            JSON.stringify(indexJson, null, 2)
-        ).toString("base64");
-        const githubToken = process.env.GITHUB_TOKEN;
-        const owner = "InfiniteCampus41";
-        const repo = "InfiniteCampus";
-        const branch = "main";
-        const shaRes = await axios.get(
-            `https://api.github.com/repos/${owner}/${repo}/contents/pfps/index.json`,
-            {
-                headers: {
-                    Authorization: `token ${githubToken}`,
-                    "X-GitHub-Event": "ignore"
-                }
-            }
-        );
-        const currentSha = shaRes.data.sha;
-        await axios.put(
-            `https://api.github.com/repos/${owner}/${repo}/contents/pfps/index.json`,
-            {
-                message: "Auto Add PFP",
-                content: updatedIndexContent,
-                sha: currentSha,
-                branch
-            },
-            {
-                headers: {
-                    Authorization: `token ${githubToken}`,
-                    "X-GitHub-Event": "ignore"
-                }
-            }
-        );
-        const fileContent = file.buffer.toString("base64");
-        await axios.put(
-            `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${newFileName}`,
-            {
-                message: "Auto Upload PFP",
-                content: fileContent,
-                branch
-            },
-            {
-                headers: {
-                    Authorization: `token ${githubToken}`,
-                    "X-GitHub-Event": "ignore"
-                }
-            }
-        );
-        updateDataPath(`users/${uid}/profile`, { pic: newPicIndex });
+        const dir = pfpDirForUser(uid);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        deleteUserPfpFiles(uid);
+        const newFileName = `pic${ext}`;
+        fs.writeFileSync(path.join(dir, newFileName), file.buffer);
+        const updatedAt = Date.now();
+        updateDataPath(`users/${uid}/profile`, { pic: updatedAt });
         res.json({
             success: true,
             file: newFileName,
-            picIndex: newPicIndex
+            pic: updatedAt,
+            url: `/pfps/${uid}?t=${updatedAt}`
         });
-        await cleanupAndReindexPfps();
     } catch (err) {
         console.error("PFP Upload Error:", err.response?.data || err.message);
         res.status(500).json({ error: "Upload Failed" });
+    }
+});
+app.post("/remove-pfp", verifyFirebaseToken, async (req, res) => {
+    try {
+        const { uid } = req.body;
+        if (!uid) {
+            return res.status(400).json({ error: "Missing Firebase UID" });
+        }
+        deleteUserPfpFiles(uid);
+        updateDataPath(`users/${uid}/profile`, { pic: 0 });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("PFP Remove Error:", err.message);
+        res.status(500).json({ error: "Remove Failed" });
+    }
+});
+app.get("/pfps/:uid", (req, res) => {
+    try {
+        const { uid } = req.params;
+        if (!uid || !/^[a-zA-Z0-9_-]+$/.test(uid)) {
+            return res.status(400).end();
+        }
+        const filePath = findUserPfpFile(uid);
+        if (!filePath) {
+            const fallback = path.join(__dirname, "public", "pfps", "1.jpeg");
+            if (fs.existsSync(fallback)) return res.sendFile(fallback);
+            return res.status(404).end();
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        res.set("Content-Type", PFP_MIME_TYPES[ext] || "application/octet-stream");
+        res.set("Cache-Control", "no-cache");
+        res.sendFile(filePath);
+    } catch (err) {
+        console.error("PFP Serve Error:", err.message);
+        res.status(500).end();
+    }
+});
+app.post("/partners/create", verifyFirebaseToken, async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const requesterProfile = readDataPath(`users/${requesterUid}/profile`) || {};
+        if (requesterProfile.isOwner !== true) {
+            return res.status(403).json({ error: "Not Authorized: Admin Only" });
+        }
+        const targetUid = typeof req.body?.uid === "string" ? req.body.uid.trim() : "";
+        const partnerName = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+        const link = typeof req.body?.link === "string" ? req.body.link.trim() : "";
+        const desc = typeof req.body?.desc === "string" ? req.body.desc.trim() : "";
+        if (!targetUid || !partnerName) {
+            return res.status(400).json({ error: "Missing Partner UID Or Name" });
+        }
+        updateDataPath(`partners/${targetUid}`, {
+            [partnerName]: { link, photo: "", desc }
+        });
+        updateDataPath(`users/${targetUid}/profile`, { isPartner: true });
+        res.json({ success: true });
+    } catch (err) {
+        console.error("Partner Create Error:", err.message);
+        res.status(500).json({ error: "Failed To Create Partner" });
+    }
+});
+app.post("/upload-partner-photo", verifyFirebaseToken, uploadPartnerPhoto.single("file"), async (req, res) => {
+    try {
+        const requesterUid = req.user.uid;
+        const targetUid = req.body.uid;
+        const partnerName = req.body.name;
+        const file = req.file;
+        if (!file) {
+            return res.status(400).json({ error: "No File Uploaded" });
+        }
+        if (!targetUid || !partnerName) {
+            return res.status(400).json({ error: "Missing Partner UID Or Name" });
+        }
+        const requesterProfile = readDataPath(`users/${requesterUid}/profile`) || {};
+        const canUpload = requesterProfile.isOwner === true
+            || requesterProfile.isTester === true
+            || (requesterProfile.isPartner === true && requesterUid === targetUid);
+        if (!canUpload) {
+            return res.status(403).json({ error: "Not Authorized To Upload This Photo" });
+        }
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (!ALLOWED_PFP_EXTS.has(ext)) {
+            return res.status(400).json({ error: "Invalid File Type" });
+        }
+        const id = getOrCreatePartnerId(targetUid, partnerName);
+        const dir = partnerDir(id);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        deletePartnerImageFiles(id);
+        fs.writeFileSync(path.join(dir, `image${ext}`), file.buffer);
+        const updatedAt = Date.now();
+        const url = `/partner-photos/${id}?t=${updatedAt}`;
+        updateDataPath(`partners/${targetUid}/${partnerName}`, { photo: url });
+        res.json({
+            success: true,
+            id,
+            url
+        });
+    } catch (err) {
+        console.error("Partner Photo Upload Error:", err.response?.data || err.message);
+        res.status(500).json({ error: "Upload Failed" });
+    }
+});
+app.get("/partner-photos/:id", (req, res) => {
+    try {
+        const { id } = req.params;
+        if (!id || !/^[a-zA-Z0-9_-]+$/.test(id)) {
+            return res.status(400).end();
+        }
+        const filePath = findPartnerImageFile(id);
+        if (!filePath) {
+            const fallback = path.join(__dirname, "public", "pfps", "1.jpeg");
+            if (fs.existsSync(fallback)) return res.sendFile(fallback);
+            return res.status(404).end();
+        }
+        const ext = path.extname(filePath).toLowerCase();
+        res.set("Content-Type", PFP_MIME_TYPES[ext] || "application/octet-stream");
+        res.set("Cache-Control", "no-cache");
+        res.sendFile(filePath);
+    } catch (err) {
+        console.error("Partner Photo Serve Error:", err.message);
+        res.status(500).end();
     }
 });
 app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (req, res) => {
@@ -4275,119 +4411,6 @@ async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTime
         return null;
     }
 }
-async function cleanupAndReindexPfps() {
-    const githubToken = process.env.GITHUB_TOKEN;
-    const owner = "InfiniteCampus41";
-    const repo = "InfiniteCampus";
-    const branch = "main";
-    const indexRes = await axios.get(
-        `https://api.github.com/repos/${owner}/${repo}/contents/pfps/index.json`,
-        { headers: { Authorization: `token ${githubToken}` } }
-    );
-    const indexSha = indexRes.data.sha;
-    const indexJson = JSON.parse(
-        Buffer.from(indexRes.data.content, "base64").toString()
-    );
-    const _pfpData = getDataCache();
-    const _pfpUsers = _pfpData.users || {};
-    const usedIndexes = new Set();
-    for (const userData of Object.values(_pfpUsers)) {
-        const pic = userData?.profile?.pic;
-        if (typeof pic === "number") {
-            usedIndexes.add(pic);
-        }
-    }
-    const usedFiles = indexJson.filter((_, i) => usedIndexes.has(i));
-    const oldToNew = {};
-    let newIndex = 0;
-    for (let i = 0; i < indexJson.length; i++) {
-        if (usedIndexes.has(i)) {
-            oldToNew[i] = newIndex;
-            newIndex++;
-        }
-    }
-    for (let i = 0; i < indexJson.length; i++) {
-        if (!usedIndexes.has(i)) {
-            const fileName = indexJson[i];
-            const fileRes = await axios.get(
-                `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${fileName}`,
-                { headers: { Authorization: `token ${githubToken}` } }
-            );
-            await axios.delete(
-                `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${fileName}`,
-                {
-                    headers: { Authorization: `token ${githubToken}` },
-                    data: {
-                        message: "Auto Remove Unused PFPs",
-                        sha: fileRes.data.sha,
-                        branch
-                    }
-                }
-            );
-        }
-    }
-    const newIndexJson = [];
-    for (let i = 0; i < usedFiles.length; i++) {
-        const oldFile = usedFiles[i];
-        const ext = path.extname(oldFile);
-        const newFileName = `${i + 1}${ext}`;
-        newIndexJson.push(newFileName);
-        if (oldFile !== newFileName) {
-            const fileRes = await axios.get(
-                `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${oldFile}`,
-                { headers: { Authorization: `token ${githubToken}` } }
-            );
-            await axios.put(
-                `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${newFileName}`,
-                {
-                    message: "Auto Rename PFPs",
-                    content: fileRes.data.content,
-                    branch
-                },
-                { headers: { Authorization: `token ${githubToken}` } }
-            );
-            await axios.delete(
-                `https://api.github.com/repos/${owner}/${repo}/contents/pfps/${oldFile}`,
-                {
-                    headers: { Authorization: `token ${githubToken}` },
-                    data: {
-                        message: "Auto Remove Unused PFPs",
-                        sha: fileRes.data.sha,
-                        branch
-                    }
-                }
-            );
-        }
-    }
-    const updatedIndexContent = Buffer.from(
-        JSON.stringify(newIndexJson, null, 2)
-    ).toString("base64");
-    await axios.put(
-        `https://api.github.com/repos/${owner}/${repo}/contents/pfps/index.json`,
-        {
-            message: "Auto Reindex PFPs",
-            content: updatedIndexContent,
-            sha: indexSha,
-            branch
-        },
-        { headers: { Authorization: `token ${githubToken}` } }
-    );
-    const _pfpUpdateData = getDataCache();
-    let _pfpChanged = false;
-    for (const [_userId, _userData] of Object.entries(_pfpUpdateData.users || {})) {
-        const oldPic = _userData?.profile?.pic;
-        if (typeof oldPic === "number") {
-            if (oldToNew.hasOwnProperty(oldPic)) {
-                _pfpUpdateData.users[_userId].profile.pic = oldToNew[oldPic];
-                _pfpChanged = true;
-            } else {
-                delete _pfpUpdateData.users[_userId].profile.pic;
-                _pfpChanged = true;
-            }
-        }
-    }
-    if (_pfpChanged) saveData(_pfpUpdateData);
-}
 async function createVM(apiKey) {
     const now = Date.now();
     if (now - lastCreateTime < CREATE_COOLDOWN) {
@@ -5031,9 +5054,11 @@ async function sendDiscordEmbedPre(embed) {
 }
 async function sendDMNotification(targetUid, senderUid, text) {
     try {
+        const data0 = getDataCache();
+        if (data0?.users?.[targetUid]?.profile?.status === "dnd") return;
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
-        const data = getDataCache();
+        const data = data0;
         const senderProfile = data?.users?.[senderUid]?.profile || {};
         const senderIsOwner = !!(senderProfile.isOwner || senderProfile.isCoOwner);
         const settings = data?.notifications?.[targetUid]?.settings || {};
@@ -5060,9 +5085,11 @@ async function sendDMNotification(targetUid, senderUid, text) {
 }
 async function sendMentionNotification(targetUid, senderUid, channel, msgId, text) {
     try {
+        const data0 = getDataCache();
+        if (data0?.users?.[targetUid]?.profile?.status === "dnd") return;
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
-        const data = getDataCache();
+        const data = data0;
         const senderProfile = data?.users?.[senderUid]?.profile || {};
         const senderIsOwner = !!(senderProfile.isOwner || senderProfile.isCoOwner);
         const settings = data?.notifications?.[targetUid]?.settings || {};
@@ -5089,9 +5116,11 @@ async function sendMentionNotification(targetUid, senderUid, channel, msgId, tex
 }
 async function sendReactionNotification(targetUid, reactorUid, emoji, channel, msgId) {
     try {
+        const data0 = getDataCache();
+        if (data0?.users?.[targetUid]?.profile?.status === "dnd") return;
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
-        const data = getDataCache();
+        const data = data0;
         const reactorProfile = data?.users?.[reactorUid]?.profile || {};
         const senderIsOwner = !!(reactorProfile.isOwner || reactorProfile.isCoOwner);
         const settings = data?.notifications?.[targetUid]?.settings || {};
@@ -5118,9 +5147,11 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
 async function sendReplyNotification(targetUid, senderUid, senderDisplayName, channel, msgId, text) {
     try {
         if (targetUid && targetUid === senderUid) return;
+        const data0 = getDataCache();
+        if (data0?.users?.[targetUid]?.profile?.status === "dnd") return;
         const tokens = await _getPushTokensForUser(targetUid);
         if (!tokens.length) return;
-        const data = getDataCache();
+        const data = data0;
         const settings = data?.notifications?.[targetUid]?.settings || {};
         if (settings.replies === false) return;
         const preview = (text || "").substring(0, 80);
@@ -7433,7 +7464,8 @@ setInterval(() => {
     const ONLINE_TIMEOUT = 2 * 60 * 1000;
     for (const [uid, lastSeen] of onlineLastSeen.entries()) {
         if (now - lastSeen > ONLINE_TIMEOUT) {
-            updateDataPath(`users/${uid}/profile`, { online: null });
+            updateDataPath(`users/${uid}/profile`, { status: "offline" });
+            broadcastUpdate(["users", uid, "profile"], getDataCache()?.users?.[uid]?.profile || {});
             onlineLastSeen.delete(uid);
         }
     }

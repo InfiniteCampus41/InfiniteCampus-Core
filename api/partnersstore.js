@@ -41,10 +41,10 @@ function loadIndex() {
 function saveIndex() {
     writeJSON(INDEX_PATH, _index);
 }
-function partnerDir(id) {
+export function partnerDir(id) {
     return path.join(PARTNERS_DIR, String(id));
 }
-function getOrCreatePartnerId(uid, name) {
+export function getOrCreatePartnerId(uid, name) {
     const idx = loadIndex();
     for (const [id, p] of Object.entries(idx.partners)) {
         if (p.uid === uid && p.name === name) return id;
@@ -54,6 +54,21 @@ function getOrCreatePartnerId(uid, name) {
     ensureDir(partnerDir(id));
     saveIndex();
     return id;
+}
+export function findPartnerImageFile(id) {
+    const dir = partnerDir(id);
+    if (!fs.existsSync(dir)) return null;
+    const match = fs.readdirSync(dir).find(name => /^image\.[a-z0-9]+$/i.test(name));
+    return match ? path.join(dir, match) : null;
+}
+export function deletePartnerImageFiles(id) {
+    const dir = partnerDir(id);
+    if (!fs.existsSync(dir)) return;
+    for (const name of fs.readdirSync(dir)) {
+        if (/^image\.[a-z0-9]+$/i.test(name)) {
+            fs.rmSync(path.join(dir, name), { force: true });
+        }
+    }
 }
 export function loadPartnersShape() {
     const idx = loadIndex();
