@@ -6,9 +6,9 @@ const DEFAULT_ZONE_URLS = [
     ""
 ];
 const DEFAULT_COVER_BASE = "";
-const DEFAULT_GAME_HOST = "";
-const DEFAULT_GAME_BASE = "";
+const DEFAULT_GAME_BASES = ["", "", ""];
 let warnedMissingEnv = false;
+let warnedMissingGameBaseEnv = false;
 function getZoneUrls() {
     const fromEnv = [process.env.ZONE1, process.env.ZONE2, process.env.ZONE3].filter(Boolean);
     if (fromEnv.length) return fromEnv;
@@ -21,21 +21,23 @@ function getZoneUrls() {
 function getCoverBase() {
     return process.env.COVER_BASE || DEFAULT_COVER_BASE;
 }
-function getGameHost() {
-    const envHost = process.env.GAME_HOST;
-    if (!envHost) return DEFAULT_GAME_HOST;
-    if (envHost.includes("://")) {
-        try {
-            return new URL(envHost).hostname;
-        } catch {
-            log("getGameHost: GAME_HOST env var looks like a URL but failed to parse:", envHost);
-            return DEFAULT_GAME_HOST;
-        }
+function getGameBases() {
+    const fromEnv = [process.env.GAME_BASE1, process.env.GAME_BASE2, process.env.GAME_BASE3].filter(Boolean);
+    if (fromEnv.length) return fromEnv;
+    if (process.env.GAME_BASE) return [process.env.GAME_BASE];
+    if (!warnedMissingGameBaseEnv) {
+        console.warn("zoneStore: GAME_BASE1/GAME_BASE2/GAME_BASE3 not set in env, falling back to built-in defaults");
+        warnedMissingGameBaseEnv = true;
     }
-    return envHost;
+    return DEFAULT_GAME_BASES.filter(Boolean);
 }
-function getGameBase() {
-    return process.env.GAME_BASE || DEFAULT_GAME_BASE;
+function getGameHostForBase(base) {
+    try {
+        return new URL(base).hostname;
+    } catch {
+        log("getGameHostForBase: GAME_BASE looks malformed, could not derive hostname from:", base);
+        return "";
+    }
 }
 const ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15000;
@@ -99,6 +101,57 @@ async function fetchWithRetry(url, opts = {}, retries = 1) {
         }
     }
     throw lastErr;
+}
+let activeGameBaseIndex = 0;
+async function fetchFromGameBases(buildTarget, { retries = 1 } = {}) {
+    const bases = getGameBases();
+    if (!bases.length) {
+        throw Object.assign(new Error("No Game Bases Configured"), { status: 500 });
+    }
+    let lastErr = null;
+    for (let i = 0; i < bases.length; i++) {
+        const idx = (activeGameBaseIndex + i) % bases.length;
+        const base = bases[idx];
+        let target, fetchUrl;
+        try {
+            ({ target, fetchUrl } = buildTarget(base));
+        } catch (e) {
+            log("games proxy: bad path for base", base, "-", e.message);
+            lastErr = Object.assign(new Error("Bad Path"), { status: 400 });
+            continue;
+        }
+        const host = getGameHostForBase(base);
+        if (!host || target.hostname !== host) {
+            log("games proxy: BLOCKED, hostname", target.hostname, "!=", host, "for base", base);
+            lastErr = Object.assign(new Error("Blocked"), { status: 403 });
+            continue;
+        }
+        if (target.protocol !== "https:" && target.protocol !== "http:") {
+            log("games proxy: bad protocol", target.protocol, "for base", base);
+            lastErr = Object.assign(new Error("Bad Path"), { status: 400 });
+            continue;
+        }
+        try {
+            const upstream = await fetchWithRetry(fetchUrl, {
+                redirect: "follow",
+                headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
+            }, retries);
+            if (!upstream.ok && upstream.status !== 304) {
+                log("games proxy: base", base, "returned status", upstream.status, "for", fetchUrl, "- trying next base");
+                lastErr = Object.assign(new Error("Upstream Error"), { status: upstream.status });
+                continue;
+            }
+            if (idx !== activeGameBaseIndex) {
+                log("games proxy: switching active game base from", bases[activeGameBaseIndex], "to", base);
+                activeGameBaseIndex = idx;
+            }
+            return { upstream, base, fetchUrl };
+        } catch (e) {
+            errlog("games proxy: upstream fetch threw for base", base, "-", e.message, "- trying next base");
+            lastErr = Object.assign(new Error(e.message || "Proxy Error"), { status: 502 });
+        }
+    }
+    throw lastErr || Object.assign(new Error("All Game Bases Failed"), { status: 502 });
 }
 async function fetchZonesFresh() {
     let lastErr = null;
@@ -522,45 +575,23 @@ export function attachZoneGameRoutes(app, deps) {
                 log("games proxy: id", id, "not found in zones feed");
                 return res.status(404).send("Not Found");
             }
-            const gameBase = getGameBase();
-            let target;
-            let fetchUrl;
+            let upstream, fetchUrl;
             try {
-                if (rest) {
-                    target = new URL(rest, gameBase + "/");
-                    fetchUrl = target.toString();
-                } else {
-                    fetchUrl = `${gameBase}?id=${encodeURIComponent(id)}`;
-                    target = new URL(fetchUrl);
-                }
+                ({ upstream, fetchUrl } = await fetchFromGameBases((base) => {
+                    if (rest) {
+                        const target = new URL(rest, base + "/");
+                        return { target, fetchUrl: target.toString() };
+                    }
+                    const url = `${base}?id=${encodeURIComponent(id)}`;
+                    return { target: new URL(url), fetchUrl: url };
+                }));
             } catch (e) {
-                log("games proxy: bad path for id", id, "rest:", rest, "-", e.message);
-                return res.status(400).send("Bad Path");
-            }
-            log("games proxy: resolved target ->", fetchUrl, "(hostname:", target.hostname + ")");
-            if (target.hostname !== getGameHost()) {
-                log("games proxy: BLOCKED, hostname", target.hostname, "!=", getGameHost());
-                return res.status(403).send("Blocked");
-            }
-            if (target.protocol !== "https:" && target.protocol !== "http:") {
-                log("games proxy: bad protocol", target.protocol);
-                return res.status(400).send("Bad Path");
-            }
-            let upstream;
-            try {
-                upstream = await fetchWithRetry(fetchUrl, {
-                    redirect: "follow",
-                    headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
-                });
-            } catch (e) {
-                errlog("games proxy: upstream fetch threw for", fetchUrl, "-", e.message);
-                return res.status(502).send("Proxy Error");
+                errlog("games proxy: all game bases FAILED for id", id, "-", e.message);
+                const status = e.status || 502;
+                const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                return res.status(status).send(msg);
             }
             log("games proxy: upstream", fetchUrl, "-> status", upstream.status, "final url:", upstream.url);
-            if (!upstream.ok && upstream.status !== 304) {
-                log("games proxy: upstream non-OK status", upstream.status, "for", fetchUrl);
-                return res.status(upstream.status).send("Upstream Error");
-            }
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             log("games proxy: content-type", contentType, "for", fetchUrl);
             res.setHeader("X-Content-Type-Options", "nosniff");
@@ -585,38 +616,19 @@ export function attachZoneGameRoutes(app, deps) {
     app.get("/commits", async (req, res) => {
         log("GET /commits from", req.ip);
         try {
-            const gameBase = getGameBase();
-            const fetchUrl = `${gameBase}/commits`;
-            let target;
+            let upstream, fetchUrl;
             try {
-                target = new URL(fetchUrl);
+                ({ upstream, fetchUrl } = await fetchFromGameBases((base) => {
+                    const url = `${base}/commits`;
+                    return { target: new URL(url), fetchUrl: url };
+                }));
             } catch (e) {
-                log("commits: bad url", fetchUrl, "-", e.message);
-                return res.status(500).send("Bad Config");
+                errlog("commits: all game bases FAILED -", e.message);
+                const status = e.status || 502;
+                const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                return res.status(status).send(msg);
             }
-            if (target.hostname !== getGameHost()) {
-                log("commits: BLOCKED, hostname", target.hostname, "!=", getGameHost());
-                return res.status(403).send("Blocked");
-            }
-            if (target.protocol !== "https:" && target.protocol !== "http:") {
-                log("commits: bad protocol", target.protocol);
-                return res.status(400).send("Bad Path");
-            }
-            log("commits: fetching upstream ->", fetchUrl);
-            let upstream;
-            try {
-                upstream = await fetchWithTimeout(fetchUrl, {
-                    redirect: "follow",
-                    headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
-                });
-            } catch (e) {
-                errlog("commits: upstream fetch threw -", e.message);
-                return res.status(502).send("Proxy Error");
-            }
-            log("commits: upstream status", upstream.status, "final url:", upstream.url);
-            if (!upstream.ok && upstream.status !== 304) {
-                return res.status(upstream.status).send("Upstream Error");
-            }
+            log("commits: upstream", fetchUrl, "-> status", upstream.status, "final url:", upstream.url);
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=60");
