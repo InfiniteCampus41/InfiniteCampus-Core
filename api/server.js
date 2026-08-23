@@ -5544,6 +5544,12 @@ async function syncPinnedMessages(channelName, discordChannelId, data) {
     if (!data.pinned) data.pinned = {};
     const pinnedObj = {};
     for (const discordMsg of pinnedMessages) {
+        const websiteCounterpart = findWebsiteMirrorEntry(channelName, discordMsg.id, data);
+        if (websiteCounterpart) {
+            const [wts, wEntry] = websiteCounterpart;
+            pinnedObj[String(wts)] = buildWebsitePinnedEntry(wEntry, discordMsg.id, data);
+            continue;
+        }
         const ts = discordMsgToTimestamp(discordMsg.id);
         const user = discordMsg.author;
         const userId = user?.id;
@@ -5564,6 +5570,33 @@ async function syncPinnedMessages(channelName, discordChannelId, data) {
     }
     data.pinned[channelName] = pinnedObj;
     console.log(`Synced ${pinnedMessages.length} Pinned Messages For #${channelName}`);
+}
+function findWebsiteMirrorEntry(channelName, discordMsgId, data) {
+    const msgs = data?.messages?.[channelName] || {};
+    for (const [wts, wEntry] of Object.entries(msgs)) {
+        if (wEntry?._discordId) continue;
+        const mirrorId = getMirrorId(channelName, wts) || (wEntry?._discordMirrorId ? String(wEntry._discordMirrorId) : null);
+        if (mirrorId === String(discordMsgId)) return [wts, wEntry];
+    }
+    return null;
+}
+function buildWebsitePinnedEntry(wEntry, discordMsgId, data) {
+    if (isAnonMessageEntry(wEntry)) {
+        return {
+            u: wEntry.u || "Anonymous",
+            a: null,
+            t: wEntry.t || "",
+            _discordId: discordMsgId,
+        };
+    }
+    const uid = wEntry.s || wEntry.sender;
+    const profile = data?.users?.[uid]?.profile || {};
+    return {
+        u: profile.displayName || "User",
+        a: profile.pic ? `/pfps/${uid}?t=${profile.pic}` : null,
+        t: wEntry.t || "",
+        _discordId: discordMsgId,
+    };
 }
 async function verifyFirebaseToken(req, res, next) {
     const header = req.headers.authorization || "";
