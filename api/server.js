@@ -7232,6 +7232,16 @@ function startDiscordGateway() {
                 }
                 delete discordMsgIdToTimestamp[d.id];
                 untrackAttachmentsForMessage(channelName, ref.timestamp);
+            } else if (op === 0 && t === "CHANNEL_PINS_UPDATE") {
+                if (!watchedChannelIds.has(d.channel_id)) return;
+                const channelName = discordIdToChannelName[d.channel_id];
+                if (!channelName) return;
+                syncPinnedMessages(channelName, d.channel_id, getDataCache())
+                    .then(() => {
+                        saveData(getDataCache());
+                        broadcastUpdate(["pinned", channelName], getDataCache()?.pinned?.[channelName] || {});
+                    })
+                    .catch(e => console.error("[DiscordGateway] Pin Sync Error:", e.message));
             } else if (op === 0 && t === "GUILD_MEMBER_UPDATE") {
                 const userId = d.user?.id;
                 if (!userId) return;
