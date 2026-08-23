@@ -24,7 +24,7 @@ import fetch from "node-fetch";
 import { renderTemplate, formatExpire, getPremiumTierLabel } from "./emailtemplates.js";
 import { Resend } from "resend";
 import { trackAttachmentsForMessage, trackDiscordAttachments, untrackAttachmentsForMessage, startAttachmentRefreshLoop, scanAndRefreshExistingAttachments, makeStableKey, lookupCurrentUrl } from "./attachmenttracker.js";
-import { DATA_ROOT } from "./channelsstore.js";
+import { DATA_ROOT, getChannelMessages, saveChannelMessages } from "./channelsstore.js";
 import * as Groups from "./groupsstore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
 import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
@@ -6762,18 +6762,25 @@ function serializeDiscordEmbed(embed) {
     return `<discord-embed-b64 data="${b64}"></discord-embed-b64>`;
 }
 function setMirrorId(channelName, timestamp, discordMirrorId) {
-    mirrorIdMap[`${channelName}:${timestamp}`] = String(discordMirrorId);
-    discordMsgIdToTimestamp[String(discordMirrorId)] = { channel: channelName, timestamp: String(timestamp) };
+    const tsKey = String(timestamp);
+    const idStr = String(discordMirrorId);
+    mirrorIdMap[`${channelName}:${tsKey}`] = idStr;
+    discordMsgIdToTimestamp[idStr] = { channel: channelName, timestamp: tsKey };
     try {
-        const data = getDataCache();
-        const entry = data?.messages?.[channelName]?.[String(timestamp)];
-        if (entry) {
-            entry._discordMirrorId = String(discordMirrorId);
-            data.messages[channelName][String(timestamp)] = entry;
-            saveData(data);
+        const cachedEntry = _dataCache?.messages?.[channelName]?.[tsKey];
+        if (cachedEntry) cachedEntry._discordMirrorId = idStr;
+    } catch {}
+    try {
+        const channelMessages = getChannelMessages(channelName);
+        const entry = channelMessages[tsKey];
+        if (!entry) {
+            console.error(`[setMirrorId] No message found at ${channelName}:${tsKey} — Discord id ${idStr} was NOT saved.`);
+            return;
         }
+        entry._discordMirrorId = idStr;
+        saveChannelMessages(channelName, channelMessages);
     } catch (e) {
-        console.error("[setMirrorId] Failed to persist _discordMirrorId to data.json:", e.message);
+        console.error("[setMirrorId] Failed to persist _discordMirrorId:", e.message);
     }
 }
 function setupSocketHandlers(ioInstance, label) {
