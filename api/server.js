@@ -3935,6 +3935,9 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 const discordAttachment = uploadResp?.data?.attachments?.[0];
                 const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
                 const uploadedDiscordMsgId = uploadResp?.data?.id || null;
+                if (uploadedDiscordMsgId && uploadResp?.data?.attachments?.length) {
+                    trackDiscordAttachments(channel, msgTimestamp, uploadedDiscordMsgId, uploadResp.data.attachments);
+                }
                 if (cdnUrl) {
                     const _upParsedCdn = (() => { try { const u = new URL(cdnUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2], filename: p[3].split("?")[0] } : null; } catch { return null; } })();
                     const _upStableKey = _upParsedCdn ? makeStableKey(_upParsedCdn.channelId, _upParsedCdn.messageId, _upParsedCdn.filename) : null;
@@ -4010,8 +4013,14 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 const discordAttachment = uploadResp?.data?.attachments?.[0];
                 const cdnUrl = discordAttachment?.url || discordAttachment?.proxy_url || null;
                 const uploadedDiscordMsgId = uploadResp?.data?.id || null;
+                if (uploadedDiscordMsgId && uploadResp?.data?.attachments?.length) {
+                    const privateWebsiteChannel = `private:${[uidA, uidB].sort().join("_")}`;
+                    trackDiscordAttachments(privateWebsiteChannel, msgTimestamp, uploadedDiscordMsgId, uploadResp.data.attachments);
+                }
                 if (cdnUrl) {
-                    const proxied = `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
+                    const _privParsedCdn = (() => { try { const u = new URL(cdnUrl); const p = u.pathname.split("/").filter(Boolean); return p.length >= 4 ? { channelId: p[1], messageId: p[2], filename: p[3].split("?")[0] } : null; } catch { return null; } })();
+                    const _privStableKey = _privParsedCdn ? makeStableKey(_privParsedCdn.channelId, _privParsedCdn.messageId, _privParsedCdn.filename) : null;
+                    const proxied = _privStableKey ? `/discord-media-proxy?key=${encodeURIComponent(_privStableKey)}` : `/discord-media-proxy?url=${encodeURIComponent(cdnUrl)}`;
                     let attachHtml = "";
                     if (/\.(png|jpg|jpeg|gif|webp)(\?|$)/i.test(fname)) {
                         attachHtml = `<img src="${proxied}" alt="${fname}" data-size="${fsize}">`;
