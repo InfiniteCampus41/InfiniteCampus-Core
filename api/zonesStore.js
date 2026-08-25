@@ -1,47 +1,8 @@
 import fs from "fs";
 import path from "path";
-const DEFAULT_ZONE_URLS = [
-    "",
-    "",
-    ""
-];
-const DEFAULT_COVER_BASE = "";
-const DEFAULT_GAME_BASES = ["", "", ""];
-let warnedMissingEnv = false;
-let warnedMissingGameBaseEnv = false;
-function getZoneUrls() {
-    const fromEnv = [process.env.ZONE1, process.env.ZONE2, process.env.ZONE3].filter(Boolean);
-    if (fromEnv.length) return fromEnv;
-    if (!warnedMissingEnv) {
-        console.warn("zoneStore: ZONE1/ZONE2/ZONE3 not set in env, falling back to built-in defaults");
-        warnedMissingEnv = true;
-    }
-    return DEFAULT_ZONE_URLS;
-}
-function getCoverBase() {
-    return process.env.COVER_BASE || DEFAULT_COVER_BASE;
-}
-function getGameBases() {
-    const fromEnv = [process.env.GAME_BASE1, process.env.GAME_BASE2, process.env.GAME_BASE3].filter(Boolean);
-    if (fromEnv.length) return fromEnv;
-    if (process.env.GAME_BASE) return [process.env.GAME_BASE];
-    if (!warnedMissingGameBaseEnv) {
-        console.warn("zoneStore: GAME_BASE1/GAME_BASE2/GAME_BASE3 not set in env, falling back to built-in defaults");
-        warnedMissingGameBaseEnv = true;
-    }
-    return DEFAULT_GAME_BASES.filter(Boolean);
-}
-function getGameHostForBase(base) {
-    try {
-        return new URL(base).hostname;
-    } catch {
-        log("getGameHostForBase: GAME_BASE looks malformed, could not derive hostname from:", base);
-        return "";
-    }
-}
-const ZONE_CACHE_TTL_MS = 10 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 15000;
 const ZONE_KEY_PREFIX = "zone:";
+const SOURCE_CACHE_TTL_MS = 10 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 15000;
 const CUSTOM_GAME_CSS = `
     html, body {
         margin: 0;
@@ -62,21 +23,83 @@ const CUSTOM_GAME_CSS = `
         display:none !important;
     }
 `;
-let zoneCache = { data: null, fetchedAt: 0 };
-let inFlightFetch = null;
-let zoneRefreshTimer = null;
-function isValidZoneGame(z) {
-    return (
-        z &&
-        typeof z === "object" &&
-        typeof z.id === "number" &&
-        Number.isFinite(z.id) &&
-        z.id >= 0 &&
-        typeof z.name === "string" &&
-        z.name.trim().length > 0 &&
-        typeof z.author === "string" &&
-        z.author.trim().length > 0
-    );
+function log(sourceId, ...args) {
+    console.log(`[gameSource:${sourceId || "-"}]`, ...args);
+}
+function errlog(sourceId, ...args) {
+    console.error(`[gameSource:${sourceId || "-"}]`, ...args);
+}
+let cachedSources = null;
+function splitEnvList(...vals) {
+    return vals.filter(Boolean);
+}
+function buildZoneSource() {
+    const id = process.env.GAME_SOURCE_ZONE_ID || "zone";
+    const name = process.env.GAMES_1_NAME || process.env.GAME_SOURCE_ZONE_NAME || "Zone";
+    const manifestUrls = splitEnvList(process.env.ZONE1, process.env.ZONE2, process.env.ZONE3);
+    let gameBases = splitEnvList(process.env.GAME_BASE1, process.env.GAME_BASE2, process.env.GAME_BASE3);
+    if (!gameBases.length && process.env.GAME_BASE) gameBases = [process.env.GAME_BASE];
+    const coverBase = process.env.COVER_BASE || "";
+    if (!manifestUrls.length) {
+        console.warn("gameSources: ZONE1/ZONE2/ZONE3 not set in env - the zone source will be empty");
+    }
+    if (!gameBases.length) {
+        console.warn("gameSources: GAME_BASE1/GAME_BASE2/GAME_BASE3 (or GAME_BASE) not set in env - zone game proxying will fail");
+    }
+    return { id, name, kind: "zone", manifestUrls, gameBases, coverBase };
+}
+function buildManifestSources() {
+    const sources = [];
+    for (let n = 2; n <= 8; n++) {
+        const legacyPrefix = `GAME_SOURCE${n}_`;
+        let bases = splitEnvList(
+            process.env[`GAME_SOURCE${n}`],
+            process.env[`GAME_SOURCE${n}_2`],
+            process.env[`GAME_SOURCE${n}_3`]
+        );
+        if (!bases.length) {
+            bases = splitEnvList(
+                process.env[`${legacyPrefix}BASE1`],
+                process.env[`${legacyPrefix}BASE2`],
+                process.env[`${legacyPrefix}BASE3`]
+            );
+            if (!bases.length && process.env[`${legacyPrefix}BASE`]) bases = [process.env[`${legacyPrefix}BASE`]];
+        }
+        let manifestUrls = splitEnvList(
+            process.env[`GAME${n}_ZONE`],
+            process.env[`GAME${n}_ZONE2`],
+            process.env[`GAME${n}_ZONE3`]
+        );
+        if (!manifestUrls.length) {
+            manifestUrls = splitEnvList(
+                process.env[`${legacyPrefix}MANIFEST1`],
+                process.env[`${legacyPrefix}MANIFEST2`],
+                process.env[`${legacyPrefix}MANIFEST3`]
+            );
+        }
+        if (!bases.length && manifestUrls.length === 0) continue; // this slot isn't configured, skip
+        const id = process.env[`${legacyPrefix}ID`] || `source${n}`;
+        const name = process.env[`GAMES_${n}_NAME`] || process.env[`${legacyPrefix}NAME`] || `Source ${n}`;
+        if (!bases.length) {
+            console.warn(`gameSources: GAME_SOURCE${n} (or ${legacyPrefix}BASE1/2/3) not set - source "${id}" cannot resolve game/thumbnail urls`);
+        }
+        if (!manifestUrls.length) {
+            console.warn(`gameSources: GAME${n}_ZONE (or ${legacyPrefix}MANIFEST1 etc) not set - source "${id}" will be empty`);
+        }
+        sources.push({ id, name, kind: "manifest", manifestUrls, bases });
+    }
+    return sources;
+}
+function getSourcesConfig() {
+    if (cachedSources) return cachedSources;
+    cachedSources = [buildZoneSource(), ...buildManifestSources()];
+    return cachedSources;
+}
+function getSource(sourceId) {
+    return getSourcesConfig().find((s) => s.id === sourceId) || null;
+}
+function getZoneSource() {
+    return getSourcesConfig().find((s) => s.kind === "zone") || null;
 }
 async function fetchWithTimeout(url, opts = {}) {
     const controller = new AbortController();
@@ -95,39 +118,45 @@ async function fetchWithRetry(url, opts = {}, retries = 1) {
         } catch (e) {
             lastErr = e;
             if (attempt < retries) {
-                log("fetchWithRetry: attempt", attempt + 1, "failed for", url, "-", e.message, "- retrying");
                 await new Promise((r) => setTimeout(r, 500));
             }
         }
     }
     throw lastErr;
 }
-let activeGameBaseIndex = 0;
-async function fetchFromGameBases(buildTarget, { retries = 1 } = {}) {
-    const bases = getGameBases();
+function getHostForBase(base) {
+    try {
+        return new URL(base).hostname;
+    } catch {
+        return "";
+    }
+}
+let activeBaseIndexBySource = new Map();
+async function fetchFromBases(source, bases, buildTarget, { retries = 1 } = {}) {
     if (!bases.length) {
         throw Object.assign(new Error("No Game Bases Configured"), { status: 500 });
     }
+    let activeIdx = activeBaseIndexBySource.get(source.id) || 0;
     let lastErr = null;
     for (let i = 0; i < bases.length; i++) {
-        const idx = (activeGameBaseIndex + i) % bases.length;
+        const idx = (activeIdx + i) % bases.length;
         const base = bases[idx];
         let target, fetchUrl;
         try {
             ({ target, fetchUrl } = buildTarget(base));
         } catch (e) {
-            log("games proxy: bad path for base", base, "-", e.message);
+            log(source.id, "bad path for base", base, "-", e.message);
             lastErr = Object.assign(new Error("Bad Path"), { status: 400 });
             continue;
         }
-        const host = getGameHostForBase(base);
+        const host = getHostForBase(base);
         if (!host || target.hostname !== host) {
-            log("games proxy: BLOCKED, hostname", target.hostname, "!=", host, "for base", base);
+            log(source.id, "BLOCKED, hostname", target.hostname, "!=", host, "for base", base);
             lastErr = Object.assign(new Error("Blocked"), { status: 403 });
             continue;
         }
         if (target.protocol !== "https:" && target.protocol !== "http:") {
-            log("games proxy: bad protocol", target.protocol, "for base", base);
+            log(source.id, "bad protocol", target.protocol, "for base", base);
             lastErr = Object.assign(new Error("Bad Path"), { status: 400 });
             continue;
         }
@@ -137,92 +166,21 @@ async function fetchFromGameBases(buildTarget, { retries = 1 } = {}) {
                 headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
             }, retries);
             if (!upstream.ok && upstream.status !== 304) {
-                log("games proxy: base", base, "returned status", upstream.status, "for", fetchUrl, "- trying next base");
+                log(source.id, "base", base, "returned status", upstream.status, "for", fetchUrl, "- trying next base");
                 lastErr = Object.assign(new Error("Upstream Error"), { status: upstream.status });
                 continue;
             }
-            if (idx !== activeGameBaseIndex) {
-                log("games proxy: switching active game base from", bases[activeGameBaseIndex], "to", base);
-                activeGameBaseIndex = idx;
+            if (idx !== activeIdx) {
+                log(source.id, "switching active game base from", bases[activeIdx], "to", base);
+                activeBaseIndexBySource.set(source.id, idx);
             }
             return { upstream, base, fetchUrl };
         } catch (e) {
-            errlog("games proxy: upstream fetch threw for base", base, "-", e.message, "- trying next base");
+            errlog(source.id, "upstream fetch threw for base", base, "-", e.message, "- trying next base");
             lastErr = Object.assign(new Error(e.message || "Proxy Error"), { status: 502 });
         }
     }
     throw lastErr || Object.assign(new Error("All Game Bases Failed"), { status: 502 });
-}
-async function fetchZonesFresh() {
-    let lastErr = null;
-    for (const url of getZoneUrls()) {
-        log("fetching zones from", url);
-        try {
-            const res = await fetchWithTimeout(url, {
-                headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusZoneFetch/1.0)" },
-            });
-            log("zones response from", url, "status", res.status);
-            if (!res.ok) throw new Error(`Bad Status ${res.status}`);
-            const json = await res.json();
-            if (!Array.isArray(json)) throw new Error("Invalid Zones Format");
-            log("zones fetch OK from", url, "entries:", json.length);
-            return json;
-        } catch (e) {
-            log("zones fetch FAILED from", url, "-", e.message);
-            lastErr = e;
-        }
-    }
-    throw lastErr || new Error("Failed To Fetch Zones");
-}
-async function getZones() {
-    if (zoneCache.data) {
-        log("getZones: serving in-memory zones, entries:", zoneCache.data.length, "age(ms):", Date.now() - zoneCache.fetchedAt);
-        return zoneCache.data;
-    }
-    log("getZones: no zones in memory - attempting on-demand fetch");
-    if (!inFlightFetch) {
-        inFlightFetch = fetchZonesFresh()
-            .then((data) => {
-                zoneCache = { data, fetchedAt: Date.now() };
-                return data;
-            })
-            .finally(() => { inFlightFetch = null; });
-    }
-    try {
-        return await inFlightFetch;
-    } catch (e) {
-        errlog("getZones: on-demand fetch also failed -", e.message);
-        throw new Error("Zones Not Loaded");
-    }
-}
-async function refreshZonesFromNetwork() {
-    log("refreshZonesFromNetwork: forcing a fresh fetch from the zones feed");
-    const data = await fetchZonesFresh();
-    zoneCache = { data, fetchedAt: Date.now() };
-    return data;
-}
-function startZoneRefreshLoop() {
-    if (zoneRefreshTimer) return;
-    zoneRefreshTimer = setInterval(async () => {
-        try {
-            await refreshZonesFromNetwork();
-            log("background refresh: zones updated, entries:", zoneCache.data.length);
-        } catch (e) {
-            errlog("background refresh: FAILED, continuing to serve stale/cached zones -", e.message);
-        }
-    }, ZONE_CACHE_TTL_MS);
-    if (zoneRefreshTimer.unref) zoneRefreshTimer.unref();
-}
-function shuffle(arr) {
-    const out = arr.slice();
-    for (let i = out.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [out[i], out[j]] = [out[j], out[i]];
-    }
-    return out;
-}
-function zoneKey(id) {
-    return `${ZONE_KEY_PREFIX}${id}`;
 }
 function injectHead(html, extra) {
     if (/<\/head>/i.test(html)) return html.replace(/<\/head>/i, `${extra}</head>`);
@@ -241,12 +199,6 @@ function injectHead(html, extra) {
 function injectBaseTag(html, baseHref) {
     if (/<base(?=[\s/>])/i.test(html)) return html;
     return injectHead(html, `<base href="${baseHref}">`);
-}
-function log(...args) {
-    console.log("[zoneStore]", ...args);
-}
-function errlog(...args) {
-    console.error("[zoneStore]", ...args);
 }
 function injectCustomCss(html) {
     return injectHead(html, `
@@ -287,35 +239,42 @@ function injectCustomCss(html) {
         </script>
     `);
 }
-function ensureGamesFile(GAMES_JSON) {
-    const dir = path.dirname(GAMES_JSON);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(GAMES_JSON)) fs.writeFileSync(GAMES_JSON, JSON.stringify({}, null, 2));
+function sourceDir(__dirname, sourceId) {
+    return path.join(__dirname, "data", "games", sourceId);
 }
-function ensureHiddenFile(HIDDEN_JSON) {
-    const dir = path.dirname(HIDDEN_JSON);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(HIDDEN_JSON)) fs.writeFileSync(HIDDEN_JSON, JSON.stringify([], null, 2));
+function gamesJsonPath(__dirname, sourceId) {
+    return path.join(sourceDir(__dirname, sourceId), "games.json");
 }
-function loadHiddenJSON(HIDDEN_JSON) {
+function hiddenJsonPath(__dirname, sourceId) {
+    return path.join(sourceDir(__dirname, sourceId), "hidden.json");
+}
+function ensureSourceFiles(__dirname, sourceId) {
+    const dir = sourceDir(__dirname, sourceId);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const gamesPath = gamesJsonPath(__dirname, sourceId);
+    if (!fs.existsSync(gamesPath)) fs.writeFileSync(gamesPath, JSON.stringify({}, null, 2));
+    const hiddenPath = hiddenJsonPath(__dirname, sourceId);
+    if (!fs.existsSync(hiddenPath)) fs.writeFileSync(hiddenPath, JSON.stringify([], null, 2));
+}
+function loadHiddenJSON(__dirname, sourceId) {
     try {
-        const arr = JSON.parse(fs.readFileSync(HIDDEN_JSON, "utf8"));
+        const arr = JSON.parse(fs.readFileSync(hiddenJsonPath(__dirname, sourceId), "utf8"));
         return Array.isArray(arr) ? arr.map(String) : [];
     } catch {
         return [];
     }
 }
-function saveHiddenJSON(HIDDEN_JSON, hidden) {
-    fs.writeFileSync(HIDDEN_JSON, JSON.stringify(hidden.map(String).filter(Boolean), null, 2));
+function saveHiddenJSON(__dirname, sourceId, hidden) {
+    fs.writeFileSync(hiddenJsonPath(__dirname, sourceId), JSON.stringify(hidden.map(String).filter(Boolean), null, 2));
 }
-function loadGamesJSON(GAMES_JSON) {
+function loadGamesJSON(__dirname, sourceId) {
     try {
-        return JSON.parse(fs.readFileSync(GAMES_JSON, "utf8"));
+        return JSON.parse(fs.readFileSync(gamesJsonPath(__dirname, sourceId), "utf8"));
     } catch {
         return {};
     }
 }
-function saveGamesJSON(GAMES_JSON, games) {
+function saveGamesJSON(__dirname, sourceId, games) {
     const nonZone = {};
     const zoneEntries = [];
     for (const [key, val] of Object.entries(games)) {
@@ -329,178 +288,312 @@ function saveGamesJSON(GAMES_JSON, games) {
     zoneEntries.sort((a, b) => a[2] - b[2]);
     const merged = { ...nonZone };
     for (const [key, val] of zoneEntries) merged[key] = val;
-    fs.writeFileSync(GAMES_JSON, JSON.stringify(merged, null, 2));
+    fs.writeFileSync(gamesJsonPath(__dirname, sourceId), JSON.stringify(merged, null, 2));
 }
-function getHiddenIdSet(games, HIDDEN_JSON) {
-    let hidden = loadHiddenJSON(HIDDEN_JSON);
+function getHiddenIdSet(__dirname, sourceId, games) {
+    let hidden = loadHiddenJSON(__dirname, sourceId);
     if (hidden.length === 0 && Array.isArray(games._hidden) && games._hidden.length > 0) {
         hidden = games._hidden.map(String);
-        saveHiddenJSON(HIDDEN_JSON, hidden);
+        saveHiddenJSON(__dirname, sourceId, hidden);
     }
     return new Set(hidden);
 }
-function buildListFromZones(zones, games) {
+function isValidZoneGame(z) {
+    return (
+        z &&
+        typeof z === "object" &&
+        typeof z.id === "number" &&
+        Number.isFinite(z.id) &&
+        z.id >= 0 &&
+        typeof z.name === "string" &&
+        z.name.trim().length > 0 &&
+        typeof z.author === "string" &&
+        z.author.trim().length > 0
+    );
+}
+function isValidManifestGame(g) {
+    return (
+        g &&
+        typeof g === "object" &&
+        typeof g.name === "string" &&
+        g.name.trim().length > 0 &&
+        typeof g.url === "string" &&
+        g.url.trim().length > 0
+    );
+}
+function hashId(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) {
+        h = ((h * 33) ^ str.charCodeAt(i)) >>> 0;
+    }
+    return h.toString(36);
+}
+function zoneKey(id) {
+    return `${ZONE_KEY_PREFIX}${id}`;
+}
+async function fetchRawFeed(source) {
+    let lastErr = null;
+    for (const url of source.manifestUrls) {
+        log(source.id, "fetching feed from", url);
+        try {
+            const res = await fetchWithTimeout(url, {
+                headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameFeedFetch/1.0)" },
+            });
+            if (!res.ok) throw new Error(`Bad Status ${res.status}`);
+            const json = await res.json();
+            if (source.kind === "zone") {
+                if (!Array.isArray(json)) throw new Error("Invalid Zone Feed Format (expected array)");
+                log(source.id, "feed fetch OK from", url, "entries:", json.length);
+                return json;
+            }
+            const games = Array.isArray(json?.games) ? json.games : null;
+            if (!games) throw new Error("Invalid Manifest Feed Format (expected { games: [...] })");
+            log(source.id, "feed fetch OK from", url, "entries:", games.length);
+            return games;
+        } catch (e) {
+            log(source.id, "feed fetch FAILED from", url, "-", e.message);
+            lastErr = e;
+        }
+    }
+    throw lastErr || new Error("Failed To Fetch Feed");
+}
+function buildZoneList(zones, games) {
     const valid = zones.filter(isValidZoneGame);
     return valid.map((z) => {
         const key = zoneKey(z.id);
-        if (!games[key]) {
-            games[key] = { popularity: 0, dateAdded: Date.now() };
-        }
+        if (!games[key]) games[key] = { popularity: 0, dateAdded: Date.now() };
         const stored = games[key];
         return {
-            id: z.id,
+            id: String(z.id),
             name: z.name,
             author: z.author || null,
             authorLink: typeof z.authorLink === "string" && z.authorLink ? z.authorLink : null,
             hasThumbnail: true,
+            frameType: "zone",
             popularity: stored.popularity || 0,
             dateAdded: stored.dateAdded || null,
         };
     });
 }
-async function mergeZonesIntoGamesJSON(GAMES_JSON) {
-    const zones = await refreshZonesFromNetwork();
-    const games = loadGamesJSON(GAMES_JSON);
-    const list = buildListFromZones(zones, games);
+function buildManifestList(entries, games) {
+    const valid = entries.filter(isValidManifestGame);
+    return valid.map((g) => {
+        const id = hashId(g.url);
+        if (!games[id]) games[id] = { popularity: 0, dateAdded: Date.now() };
+        const stored = games[id];
+        stored.url = g.url;
+        stored.thumbnail = typeof g.thumbnail === "string" ? g.thumbnail : null;
+        stored.frameType = typeof g.frameType === "string" && g.frameType ? g.frameType : "iframe";
+        stored.name = g.name;
+        games[id] = stored;
+        return {
+            id,
+            name: g.name,
+            author: null,
+            authorLink: null,
+            hasThumbnail: !!stored.thumbnail,
+            frameType: stored.frameType,
+            popularity: stored.popularity || 0,
+            dateAdded: stored.dateAdded || null,
+        };
+    });
+}
+const feedCache = new Map();
+const inFlightFetch = new Map();
+const refreshTimers = new Map();
+async function getRawFeed(source) {
+    const cached = feedCache.get(source.id);
+    if (cached?.data) return cached.data;
+    if (inFlightFetch.has(source.id)) return inFlightFetch.get(source.id);
+    const p = fetchRawFeed(source)
+        .then((data) => {
+            feedCache.set(source.id, { data, fetchedAt: Date.now() });
+            return data;
+        })
+        .finally(() => { inFlightFetch.delete(source.id); });
+    inFlightFetch.set(source.id, p);
+    return p;
+}
+async function refreshRawFeed(source) {
+    const data = await fetchRawFeed(source);
+    feedCache.set(source.id, { data, fetchedAt: Date.now() });
+    return data;
+}
+function startRefreshLoop(source, deps) {
+    if (refreshTimers.has(source.id)) return;
+    const timer = setInterval(async () => {
+        try {
+            await mergeSourceIntoGamesJSON(source, deps);
+            log(source.id, "background refresh: source updated");
+        } catch (e) {
+            errlog(source.id, "background refresh FAILED, continuing to serve stale/cached data -", e.message);
+        }
+    }, SOURCE_CACHE_TTL_MS);
+    if (timer.unref) timer.unref();
+    refreshTimers.set(source.id, timer);
+}
+async function mergeSourceIntoGamesJSON(source, deps) {
+    const { __dirname } = deps;
+    const raw = await refreshRawFeed(source);
+    const games = loadGamesJSON(__dirname, source.id);
+    const list = source.kind === "zone" ? buildZoneList(raw, games) : buildManifestList(raw, games);
     games._list = list;
-    saveGamesJSON(GAMES_JSON, games);
-    log("mergeZonesIntoGamesJSON: merged", list.length, "zone games into games.json");
+    saveGamesJSON(__dirname, source.id, games);
+    log(source.id, "merged", list.length, "games into", `data/games/${source.id}/games.json`);
     return list;
 }
 export async function initZoneGames(deps) {
-    const { __dirname } = deps;
-    const GAMES_JSON = path.join(__dirname, "data", "games", "games.json");
-    ensureGamesFile(GAMES_JSON);
-    try {
-        await mergeZonesIntoGamesJSON(GAMES_JSON);
-        log("initZoneGames: startup zone fetch + merge succeeded");
-    } catch (e) {
-        errlog("initZoneGames: startup zone fetch FAILED -", e.message, "- serving existing games.json (if any) with no live zone validation until the next refresh succeeds");
+    const sources = getSourcesConfig();
+    for (const source of sources) {
+        ensureSourceFiles(deps.__dirname, source.id);
+        try {
+            await mergeSourceIntoGamesJSON(source, deps);
+            log(source.id, "startup feed fetch + merge succeeded");
+        } catch (e) {
+            errlog(source.id, "startup feed fetch FAILED -", e.message, "- serving existing games.json (if any) until the next refresh succeeds");
+        }
+        startRefreshLoop(source, deps);
     }
-    startZoneRefreshLoop();
 }
 function isAdminPass(req) {
     const pass = req.headers["x-admin-password"];
     return pass === process.env.ADMIN_PASSWORD || pass === process.env.ADMIN_PASSWORD_2;
 }
+function shuffle(arr) {
+    const out = arr.slice();
+    for (let i = out.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [out[i], out[j]] = [out[j], out[i]];
+    }
+    return out;
+}
+function requireSource(req, res) {
+    const source = getSource(req.params.sourceId);
+    if (!source) {
+        res.status(404).json({ ok: false, error: "Unknown Game Source" });
+        return null;
+    }
+    return source;
+}
 export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
-    const GAMES_JSON = path.join(__dirname, "data", "games", "games.json");
-    const HIDDEN_JSON = path.join(__dirname, "data", "games", "hidden.json");
-    ensureGamesFile(GAMES_JSON);
-    ensureHiddenFile(HIDDEN_JSON);
-    app.get("/api/zone-games", async (req, res) => {
-        log("GET /api/zone-games from", req.ip);
+    const sources = getSourcesConfig();
+    for (const source of sources) ensureSourceFiles(__dirname, source.id);
+
+    app.get("/api/game-sources", (req, res) => {
+        res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name })) });
+    });
+    app.get("/api/games/:sourceId", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         try {
-            const games = loadGamesJSON(GAMES_JSON);
-            const hidden = getHiddenIdSet(games, HIDDEN_JSON);
+            const games = loadGamesJSON(__dirname, source.id);
+            const hidden = getHiddenIdSet(__dirname, source.id, games);
             const list = Array.isArray(games._list) ? games._list.filter((g) => !hidden.has(String(g.id))) : [];
-            log("zone-games: serving list from games.json -", list.length, "games (", hidden.size, "hidden)");
+            log(source.id, "serving list -", list.length, "games (", hidden.size, "hidden)");
             res.json({ ok: true, games: shuffle(list) });
         } catch (e) {
-            console.error("Zone Games List Error:", e.message);
-            errlog("zone-games: FAILED -", e.stack || e.message);
+            errlog(source.id, "list FAILED -", e.stack || e.message);
             res.status(502).json({ ok: false, error: "Failed To Load Games" });
         }
     });
-    app.post("/admin/zone-games/regenerate", async (req, res) => {
-        if (!isAdminPass(req)) {
-            return res.status(403).json({ ok: false, error: "Not Allowed" });
-        }
+    app.post("/admin/games/:sourceId/regenerate", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (!isAdminPass(req)) return res.status(403).json({ ok: false, error: "Not Allowed" });
         try {
-            const list = await mergeZonesIntoGamesJSON(GAMES_JSON);
-            log("zone-games: /admin/zone-games/regenerate forced a fresh zones fetch, entries:", list.length);
+            const list = await mergeSourceIntoGamesJSON(source, deps);
+            log(source.id, "/admin/games/:sourceId/regenerate forced a fresh fetch, entries:", list.length);
             res.json({ ok: true, count: list.length });
         } catch (e) {
-            errlog("zone-games: regenerate FAILED -", e.stack || e.message);
-            res.status(500).json({ ok: false, error: "Failed To Refresh Zones" });
+            errlog(source.id, "regenerate FAILED -", e.stack || e.message);
+            res.status(500).json({ ok: false, error: "Failed To Refresh Source" });
         }
     });
-    app.get("/admin/games-json", (req, res) => {
-        if (!isAdminPass(req)) {
-            return res.status(403).json({ ok: false, error: "Not Allowed" });
-        }
+    app.get("/admin/games-json/:sourceId", (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (!isAdminPass(req)) return res.status(403).json({ ok: false, error: "Not Allowed" });
         try {
-            res.json({ ok: true, games: loadGamesJSON(GAMES_JSON) });
+            res.json({ ok: true, games: loadGamesJSON(__dirname, source.id) });
         } catch (e) {
-            errlog("games-json: GET FAILED -", e.stack || e.message);
+            errlog(source.id, "games-json GET FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Load games.json" });
         }
     });
-    app.post("/admin/games-json", (req, res) => {
-        if (!isAdminPass(req)) {
-            return res.status(403).json({ ok: false, error: "Not Allowed" });
-        }
+    app.post("/admin/games-json/:sourceId", (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (!isAdminPass(req)) return res.status(403).json({ ok: false, error: "Not Allowed" });
         try {
             const { games } = req.body || {};
             if (!games || typeof games !== "object" || Array.isArray(games)) {
                 return res.status(400).json({ ok: false, error: "Invalid games.json Payload" });
             }
-            saveGamesJSON(GAMES_JSON, games);
-            log("games-json: saved via admin edit -", Object.keys(games).length, "top-level keys");
+            saveGamesJSON(__dirname, source.id, games);
+            log(source.id, "games-json saved via admin edit -", Object.keys(games).length, "top-level keys");
             res.json({ ok: true });
         } catch (e) {
-            errlog("games-json: POST FAILED -", e.stack || e.message);
+            errlog(source.id, "games-json POST FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Save games.json" });
         }
     });
-    app.get("/admin/hidden-games", (req, res) => {
-        if (!isAdminPass(req)) {
-            return res.status(403).json({ ok: false, error: "Not Allowed" });
-        }
+    app.get("/admin/hidden-games/:sourceId", (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (!isAdminPass(req)) return res.status(403).json({ ok: false, error: "Not Allowed" });
         try {
-            const games = loadGamesJSON(GAMES_JSON);
-            const hidden = [...getHiddenIdSet(games, HIDDEN_JSON)];
+            const games = loadGamesJSON(__dirname, source.id);
+            const hidden = [...getHiddenIdSet(__dirname, source.id, games)];
             res.json({ ok: true, hidden });
         } catch (e) {
-            errlog("hidden-games: GET FAILED -", e.stack || e.message);
+            errlog(source.id, "hidden-games GET FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Load Hidden Games" });
         }
     });
-    app.post("/admin/hidden-games", (req, res) => {
-        if (!isAdminPass(req)) {
-            return res.status(403).json({ ok: false, error: "Not Allowed" });
-        }
+    app.post("/admin/hidden-games/:sourceId", (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (!isAdminPass(req)) return res.status(403).json({ ok: false, error: "Not Allowed" });
         try {
             const { hidden } = req.body || {};
-            if (!Array.isArray(hidden)) {
-                return res.status(400).json({ ok: false, error: "Invalid Hidden List" });
-            }
+            if (!Array.isArray(hidden)) return res.status(400).json({ ok: false, error: "Invalid Hidden List" });
             const cleaned = hidden.map(String).filter(Boolean);
-            saveHiddenJSON(HIDDEN_JSON, cleaned);
-            const games = loadGamesJSON(GAMES_JSON);
+            saveHiddenJSON(__dirname, source.id, cleaned);
+            const games = loadGamesJSON(__dirname, source.id);
             if (games._hidden) {
                 delete games._hidden;
-                saveGamesJSON(GAMES_JSON, games);
+                saveGamesJSON(__dirname, source.id, games);
             }
-            log("hidden-games: saved -", cleaned.length, "hidden id(s)");
+            log(source.id, "hidden-games saved -", cleaned.length, "hidden id(s)");
             res.json({ ok: true, hidden: cleaned });
         } catch (e) {
-            errlog("hidden-games: POST FAILED -", e.stack || e.message);
+            errlog(source.id, "hidden-games POST FAILED -", e.stack || e.message);
             res.status(500).json({ ok: false, error: "Failed To Save Hidden Games" });
         }
     });
     const popularityDebounce = new Map();
-    app.post("/api/zone-games/:id/popularity", async (req, res) => {
+    app.post("/api/games/:sourceId/:id/popularity", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
         const id = req.params.id;
-        log("POST /api/zone-games/" + id + "/popularity from", req.ip);
         try {
-            if (!/^\d+$/.test(id)) {
-                log("popularity: rejected, invalid id", id);
-                return res.status(400).json({ ok: false, error: "Invalid Id" });
+            const games = loadGamesJSON(__dirname, source.id);
+            let key, exists;
+            if (source.kind === "zone") {
+                if (!/^\d+$/.test(id)) return res.status(400).json({ ok: false, error: "Invalid Id" });
+                const zones = await getRawFeed(source);
+                exists = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
+                key = zoneKey(id);
+            } else {
+                exists = games[id];
+                key = id;
             }
-            const zones = await getZones();
-            const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
-            if (!z) {
-                log("popularity: id", id, "not found in zones feed");
-                return res.status(404).json({ ok: false, error: "Not Found" });
-            }
-            const games = loadGamesJSON(GAMES_JSON);
-            const key = zoneKey(id);
+            if (!exists) return res.status(404).json({ ok: false, error: "Not Found" });
             if (!games[key]) games[key] = { popularity: 0, dateAdded: Date.now() };
             const ip = req.headers["x-forwarded-for"]?.split(",")[0]?.trim() || req.socket?.remoteAddress || "unknown";
-            const dkey = `${ip}:${id}`;
+            const dkey = `${source.id}:${ip}:${id}`;
             const now = Date.now();
             const last = popularityDebounce.get(dkey) || 0;
             if (now - last > 10_000) {
@@ -510,146 +603,151 @@ export function attachZoneGameRoutes(app, deps) {
                     const entry = games._list.find((g) => String(g.id) === id);
                     if (entry) entry.popularity = games[key].popularity;
                 }
-                saveGamesJSON(GAMES_JSON, games);
-                log("popularity: bumped id", id, "to", games[key].popularity);
-            } else {
-                log("popularity: debounced for id", id, "(", ip, ")");
+                saveGamesJSON(__dirname, source.id, games);
+                log(source.id, "popularity bumped id", id, "to", games[key].popularity);
             }
             res.json({ ok: true, popularity: games[key].popularity });
         } catch (e) {
-            errlog("popularity: FAILED for id", id, "-", e.stack || e.message);
+            errlog(source.id, "popularity FAILED for id", id, "-", e.stack || e.message);
             res.status(500).json({ ok: false });
         }
     });
-    app.get("/zonegames/:id/thumbnail", async (req, res) => {
+    app.get("/games/:sourceId/:id/thumbnail", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
         const id = req.params.id;
-        log("GET /zonegames/" + id + "/thumbnail from", req.ip);
         try {
-            if (!/^\d+$/.test(id)) {
-                log("thumbnail: rejected, invalid id", id);
-                return res.status(400).send("Bad Request");
+            let thumbUrl;
+            if (source.kind === "zone") {
+                if (!/^\d+$/.test(id)) return res.status(400).send("Bad Request");
+                const zones = await getRawFeed(source);
+                const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
+                if (!z) return res.status(404).send("Not Found");
+                thumbUrl = `${source.coverBase}/${encodeURIComponent(id)}.png`;
+            } else {
+                const games = loadGamesJSON(__dirname, source.id);
+                const entry = games[id];
+                if (!entry || !entry.thumbnail) return res.status(404).send("Not Found");
+                if (!source.bases.length) return res.status(404).send("Not Found");
+                thumbUrl = new URL(entry.thumbnail, source.bases[0] + "/").toString();
             }
-            const zones = await getZones();
-            const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
-            if (!z) {
-                log("thumbnail: id", id, "not found in zones feed");
-                return res.status(404).send("Not Found");
-            }
-            const thumbUrl = `${getCoverBase()}/${encodeURIComponent(id)}.png`;
-            log("thumbnail: fetching upstream for id", id, "->", thumbUrl);
             let upstream;
             try {
                 upstream = await fetchWithTimeout(thumbUrl, {
                     headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusThumbProxy/1.0)" },
                 });
             } catch (e) {
-                errlog("thumbnail: upstream fetch threw for id", id, "-", e.message);
+                errlog(source.id, "thumbnail upstream fetch threw for id", id, "-", e.message);
                 return res.status(502).send("Proxy Error");
             }
-            log("thumbnail: upstream status for id", id, "=", upstream.status);
             if (!upstream.ok) return res.status(404).send("Not Found");
             const contentType = upstream.headers.get("content-type") || "image/png";
             res.setHeader("Content-Type", contentType.startsWith("image/") ? contentType : "image/png");
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=2592000, immutable");
             const buf = Buffer.from(await upstream.arrayBuffer());
-            log("thumbnail: served id", id, "-", buf.length, "bytes,", contentType);
             res.send(buf);
         } catch (e) {
-            errlog("thumbnail: FAILED for id", id, "-", e.stack || e.message);
+            errlog(source.id, "thumbnail FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });
-    app.get("/games/:id{/*rest}", async (req, res) => {
+    app.get("/games/:sourceId/:id{/*rest}", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
         const id = req.params.id;
         const rest = Array.isArray(req.params.rest) ? req.params.rest.join("/") : req.params.rest || "";
-        log("GET /games/" + id + (rest ? "/" + rest : ""), "from", req.ip, "referer:", req.headers.referer || "(none)");
+        log(source.id, "GET", `/games/${source.id}/${id}${rest ? "/" + rest : ""}`, "from", req.ip);
         try {
-            if (!/^\d+$/.test(id)) {
-                log("games proxy: rejected, invalid id", id);
-                return res.status(404).send("Not Found");
-            }
-            const zones = await getZones();
-            const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
-            if (!z) {
-                log("games proxy: id", id, "not found in zones feed");
-                return res.status(404).send("Not Found");
-            }
-            let upstream, fetchUrl;
-            try {
-                ({ upstream, fetchUrl } = await fetchFromGameBases((base) => {
-                    if (rest) {
-                        const target = new URL(rest, base + "/");
+            let upstream, fetchUrl, basePath;
+            if (source.kind === "zone") {
+                if (!/^\d+$/.test(id)) return res.status(404).send("Not Found");
+                const zones = await getRawFeed(source);
+                const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
+                if (!z) return res.status(404).send("Not Found");
+                try {
+                    ({ upstream, fetchUrl } = await fetchFromBases(source, source.gameBases, (base) => {
+                        if (rest) {
+                            const target = new URL(rest, base + "/");
+                            return { target, fetchUrl: target.toString() };
+                        }
+                        const url = `${base}?id=${encodeURIComponent(id)}`;
+                        return { target: new URL(url), fetchUrl: url };
+                    }));
+                } catch (e) {
+                    const status = e.status || 502;
+                    const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                    return res.status(status).send(msg);
+                }
+                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
+            } else {
+                const games = loadGamesJSON(__dirname, source.id);
+                const entry = games[id];
+                if (!entry || !entry.url) return res.status(404).send("Not Found");
+                try {
+                    ({ upstream, fetchUrl } = await fetchFromBases(source, source.bases, (base) => {
+                        const target = rest ? new URL(rest, new URL(entry.url, base + "/")) : new URL(entry.url, base + "/");
                         return { target, fetchUrl: target.toString() };
-                    }
-                    const url = `${base}?id=${encodeURIComponent(id)}`;
-                    return { target: new URL(url), fetchUrl: url };
-                }));
-            } catch (e) {
-                errlog("games proxy: all game bases FAILED for id", id, "-", e.message);
-                const status = e.status || 502;
-                const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
-                return res.status(status).send(msg);
+                    }));
+                } catch (e) {
+                    const status = e.status || 502;
+                    const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                    return res.status(status).send(msg);
+                }
+                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
             }
-            log("games proxy: upstream", fetchUrl, "-> status", upstream.status, "final url:", upstream.url);
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
-            log("games proxy: content-type", contentType, "for", fetchUrl);
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=300");
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
-                const basePath = `/games/${encodeURIComponent(id)}/`;
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                log("games proxy: serving HTML for id", id, "-", html.length, "chars, basePath", basePath);
-                return res.send(injectCustomCss(injectBaseTag(html, basePath)));
+                const withBase = injectBaseTag(html, basePath);
+                const finalHtml = source.kind === "zone" ? injectCustomCss(withBase) : withBase;
+                return res.send(finalHtml);
             }
             res.setHeader("Content-Type", contentType);
             const buf = Buffer.from(await upstream.arrayBuffer());
-            log("games proxy: serving asset for id", id, "-", buf.length, "bytes,", contentType);
             res.send(buf);
         } catch (e) {
-            console.error("Zone Game Proxy Error:", e.message);
-            errlog("games proxy: FAILED for id", id, "-", e.stack || e.message);
+            errlog(source.id, "games proxy FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });
     app.get("/commits", async (req, res) => {
-        log("GET /commits from", req.ip);
+        const zoneSource = getZoneSource();
+        if (!zoneSource) return res.status(404).send("Not Found");
+        log(zoneSource.id, "GET /commits from", req.ip);
         try {
             let upstream, fetchUrl;
             try {
-                ({ upstream, fetchUrl } = await fetchFromGameBases((base) => {
+                ({ upstream, fetchUrl } = await fetchFromBases(zoneSource, zoneSource.gameBases, (base) => {
                     const url = `${base}/commits`;
                     return { target: new URL(url), fetchUrl: url };
                 }));
             } catch (e) {
-                errlog("commits: all game bases FAILED -", e.message);
                 const status = e.status || 502;
                 const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
                 return res.status(status).send(msg);
             }
-            log("commits: upstream", fetchUrl, "-> status", upstream.status, "final url:", upstream.url);
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=60");
             if (contentType.includes("application/json")) {
                 const json = await upstream.text();
                 res.setHeader("Content-Type", "application/json; charset=utf-8");
-                log("commits: serving JSON -", json.length, "chars");
                 return res.send(json);
             }
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                log("commits: serving HTML -", html.length, "chars");
                 return res.send(injectCustomCss(injectBaseTag(html, "/commits/")));
             }
             const buf = Buffer.from(await upstream.arrayBuffer());
             res.setHeader("Content-Type", contentType);
-            log("commits: serving raw body -", buf.length, "bytes,", contentType);
             res.send(buf);
         } catch (e) {
-            errlog("commits: FAILED -", e.stack || e.message);
+            errlog(zoneSource.id, "commits FAILED -", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
     });
