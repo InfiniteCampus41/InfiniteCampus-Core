@@ -29,6 +29,7 @@ import * as Groups from "./groupsstore.js";
 import { attachGameRoutes, attachGameAssetFallback } from "./gamesstore.js";
 import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
 import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMap as persistDiscordChannelMap } from "./datastore.js";
+import { loadUrlsFile, saveUrlsFile, isAllowedHost, normalizeOrigin, makeEntryId } from "./urlsstore.js";
 import { getOrCreatePartnerId, findPartnerImageFile, deletePartnerImageFiles, partnerDir } from "./partnersstore.js";
 import { loadUsersShape, saveUsersShape, USERS_DIR } from "./usersstore.js";
 import * as Bans from "./bansstore.js";
@@ -108,6 +109,19 @@ const DEFAULT_CHANNEL_ID = process.env.CHANNEL_ID;
 const DISCORD_BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
 const PRIVATE_MEDIA_CHANNEL_ID = process.env.PRIVATE_MEDIA_CHANNEL_ID || null;
 const GROUP_MEDIA_CHANNEL_ID = process.env.GROUP_MEDIA_CHANNEL_ID || null;
+const URL_VISIT_CHANNEL_ID = process.env.URL_VISIT_CHANNEL_ID || null;
+const URL_FORWARD_CHANNEL_ID = process.env.URL_FORWARD_CHANNEL_ID || null;
+const urlEntryIndex = new Map();
+(function primeUrlEntryIndex() {
+    try {
+        const { visited } = loadUrlsFile();
+        for (const [origin, entry] of Object.entries(visited)) {
+            if (entry?.entryId) urlEntryIndex.set(entry.entryId, origin);
+        }
+    } catch (e) {
+        console.error("[UrlsStore] Failed To Prime Entry Index:", e.message);
+    }
+})();
 const discordBridgeState = {};
 let DISCORD_CHANNEL_MAP = (() => {
     try {
@@ -253,6 +267,7 @@ const RATE_LIMITS = {
     online:  { max: 20,   window: 30_000 },  // 20  pings  / 30 s  (client calls every 20 s)
     status:  { max: 30,   window: 30_000 },  // 30  status changes / 30 s
     upload:  { max: 10,  window: 60_000 },  // 10 uploads/ 60 s
+    trackurl:{ max: 20,  window: 10_000 },  // 20 url-track pings / 10 s
     default: { max: 40,  window: 10_000 },
 };
 const _rateLimitStore = new Map();
@@ -625,6 +640,46 @@ app.all("/admin/modify-restricted-words", verifyFirebaseToken, async (req, res) 
         return res.status(405).json({ error: "Method Not Allowed" });
     } catch (err) {
         console.error("modify-restricted-words error:", err);
+        return res.status(500).json({ error: err.message || "Internal Server Error" });
+    }
+});
+app.all("/admin/modify-tracked-urls", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`);
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isHAdmin || profile.isDev)) {
+            return res.status(403).json({ error: "Not Authorized" });
+        }
+        if (req.method === "GET") {
+            return res.json(loadUrlsFile());
+        }
+        if (req.method === "POST") {
+            const { visited, allowedHosts } = req.body || {};
+            if (visited === undefined && allowedHosts === undefined) {
+                return res.status(400).json({ error: "Nothing To Save" });
+            }
+            const current = loadUrlsFile();
+            const next = {
+                visited: visited !== undefined ? visited : current.visited,
+                allowedHosts: allowedHosts !== undefined ? allowedHosts : current.allowedHosts
+            };
+            if (typeof next.visited !== "object" || next.visited === null || Array.isArray(next.visited)) {
+                return res.status(400).json({ error: "Invalid visited object" });
+            }
+            if (!Array.isArray(next.allowedHosts)) {
+                return res.status(400).json({ error: "Invalid allowedHosts array" });
+            }
+            const saved = saveUrlsFile(next);
+            urlEntryIndex.clear();
+            for (const [origin, entry] of Object.entries(saved.visited)) {
+                if (entry?.entryId) urlEntryIndex.set(entry.entryId, origin);
+            }
+            console.log(`[admin/modify-tracked-urls] Saved by ${uid}`);
+            return res.json({ ok: true });
+        }
+        return res.status(405).json({ error: "Method Not Allowed" });
+    } catch (err) {
+        console.error("modify-tracked-urls error:", err);
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
@@ -1028,6 +1083,40 @@ app.get("/api/movies-json", (req, res) => {
         res.json(data);
     } catch (err) {
         res.status(500).json({ error: "Failed To Load movies.json" });
+    }
+});
+app.post("/urls", rateLimit("trackurl"), async (req, res) => {
+    try {
+        const { url } = req.body || {};
+        if (!url || typeof url !== "string") {
+            return res.status(400).json({ error: "Missing url" });
+        }
+        const parsedOrigin = normalizeOrigin(url);
+        if (!parsedOrigin) {
+            return res.status(400).json({ error: "Invalid url" });
+        }
+        const { origin, hostname } = parsedOrigin;
+        const store = loadUrlsFile();
+        if (isAllowedHost(hostname, store.allowedHosts)) {
+            return res.json({ ok: true, tracked: false, reason: "allowed-host" });
+        }
+        if (store.visited[origin]) {
+            return res.json({ ok: true, tracked: false, reason: "already-tracked" });
+        }
+        const entryId = makeEntryId();
+        const visitedAt = Date.now();
+        store.visited[origin] = { visitedAt, entryId };
+        saveUrlsFile(store);
+        urlEntryIndex.set(entryId, origin);
+        res.json({ ok: true, tracked: true });
+        if (URL_VISIT_CHANNEL_ID) {
+            sendUrlVisitAlert(origin, visitedAt, entryId).catch(e =>
+                console.error("[TrackUrl] Failed To Send Discord Alert:", e.message)
+            );
+        }
+    } catch (err) {
+        console.error("track-url error:", err);
+        if (!res.headersSent) res.status(500).json({ error: "Internal Server Error" });
     }
 });
 app.get("/discord-avatar-proxy", async (req, res) => {
@@ -4440,6 +4529,109 @@ async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTime
         return null;
     }
 }
+async function sendUrlVisitAlert(origin, visitedAt, entryId) {
+    const embed = {
+        title: "New URL Visited",
+        description: `**URL:** ${origin}\n**Visited:** <t:${Math.floor(visitedAt / 1000)}:F>`,
+        color: 0x5865f2,
+        timestamp: new Date(visitedAt).toISOString()
+    };
+    const payload = {
+        embeds: [embed],
+        components: [
+            {
+                type: 1,
+                components: [
+                    { type: 2, style: 3, label: "Send To Channel", custom_id: `urlsend_${entryId}` },
+                    { type: 2, style: 4, label: "Delete", custom_id: `urldel_${entryId}` }
+                ]
+            }
+        ]
+    };
+    const resp = await discordRequest({
+        method: "post",
+        url: `https://discord.com/api/v10/channels/${URL_VISIT_CHANNEL_ID}/messages`,
+        data: payload,
+        headers: { "Content-Type": "application/json" }
+    });
+    const discordMsgId = resp?.data?.id;
+    if (discordMsgId) {
+        const store = loadUrlsFile();
+        if (store.visited[origin]) {
+            store.visited[origin].messageId = discordMsgId;
+            saveUrlsFile(store);
+        }
+    }
+}
+async function respondToDiscordInteraction(interactionId, token, payload) {
+    try {
+        await axios.post(
+            `https://discord.com/api/v10/interactions/${interactionId}/${token}/callback`,
+            payload,
+            { headers: { "Content-Type": "application/json" } }
+        );
+    } catch (e) {
+        console.error("[UrlInteraction] Failed To Respond To Interaction:", e.message);
+    }
+}
+async function handleUrlButtonInteraction(action, entryId, interaction) {
+    const origin = urlEntryIndex.get(entryId);
+    if (!origin) {
+        await respondToDiscordInteraction(interaction.id, interaction.token, {
+            type: 4,
+            data: { content: "This URL entry could no longer be found.", flags: 64 }
+        });
+        return;
+    }
+    if (action === "urlsend") {
+        if (URL_FORWARD_CHANNEL_ID) {
+            try {
+                await discordRequest({
+                    method: "post",
+                    url: `https://discord.com/api/v10/channels/${URL_FORWARD_CHANNEL_ID}/messages`,
+                    data: { content: origin },
+                    headers: { "Content-Type": "application/json" }
+                });
+            } catch (e) {
+                console.error("[UrlInteraction] Failed To Forward URL:", e.message);
+            }
+        }
+        const store = loadUrlsFile();
+        if (store.visited[origin]) {
+            store.visited[origin].forwarded = true;
+            store.visited[origin].forwardedAt = Date.now();
+            saveUrlsFile(store);
+        }
+        const originalEmbed = interaction.message?.embeds?.[0] || {};
+        const actorName = interaction.member?.user?.username || interaction.user?.username || "someone";
+        await respondToDiscordInteraction(interaction.id, interaction.token, {
+            type: 7,
+            data: {
+                embeds: [{ ...originalEmbed, color: 0x2ecc71, footer: { text: `Sent to forwarding channel by ${actorName}` } }],
+                components: []
+            }
+        });
+    } else if (action === "urldel") {
+        await respondToDiscordInteraction(interaction.id, interaction.token, { type: 6 });
+        const channelId = interaction.channel_id;
+        const messageId = interaction.message?.id;
+        if (channelId && messageId) {
+            try {
+                await discordRequest({
+                    method: "delete",
+                    url: `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`
+                });
+            } catch (e) {
+                console.error("[UrlInteraction] Failed To Delete Message:", e.message);
+            }
+        }
+        const store = loadUrlsFile();
+        if (store.visited[origin]) {
+            delete store.visited[origin].messageId;
+            saveUrlsFile(store);
+        }
+    }
+}
 async function createVM(apiKey) {
     const now = Date.now();
     if (now - lastCreateTime < CREATE_COOLDOWN) {
@@ -4794,6 +4986,10 @@ async function loadData() {
 async function loadRules() {
     const data = await fs.promises.readFile("./rules.json", "utf-8");
     return JSON.parse(data).rules;
+}
+async function loadUrls() {
+    const data = await fs.promises.readFile("./urls.json", "utf-8");
+    return JSON.parse(data).urls;
 }
 async function resumeInProgressAccepts() {
     const resumes = loadAllAcceptResumes();
@@ -7329,6 +7525,18 @@ function startDiscordGateway() {
                 }
                 const newUsername = d.username || null;
                 updateDiscordUserAcrossMessages(userId, newUsername, newAvatarProxied);
+            } else if (op === 0 && t === "INTERACTION_CREATE") {
+                if (d.type === 3 && d.data?.component_type === 2) {
+                    const customId = d.data.custom_id || "";
+                    const sepIdx = customId.indexOf("_");
+                    const action = sepIdx === -1 ? customId : customId.slice(0, sepIdx);
+                    const entryId = sepIdx === -1 ? "" : customId.slice(sepIdx + 1);
+                    if ((action === "urlsend" || action === "urldel") && entryId) {
+                        handleUrlButtonInteraction(action, entryId, d).catch(e =>
+                            console.error("[UrlInteraction] Handler Error:", e.message)
+                        );
+                    }
+                }
             }
         });
         ws.on("close", (code) => {
