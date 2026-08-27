@@ -3777,7 +3777,11 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
                 })();
             } else if (DISCORD_CHANNEL_MAP[channelName] && !getMirrorId(channelName, ts)) {
                 if (msgText) {
-                    bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null).catch(() => {});
+                    bridgeWebsiteMsgToDiscord(channelName, null, `${anonName}: ${msgText}\n-# This User Is Not Logged In`, null)
+                        .then(discordMsgId => {
+                            if (discordMsgId) setMirrorId(channelName, ts, discordMsgId);
+                        })
+                        .catch(() => {});
                 }
             }
             return res.json({ success: true });
@@ -4368,12 +4372,7 @@ async function bridgeDeleteToDiscordWithEntry(channelName, timestamp, entry) {
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
     if (!discordChannelId) return;
     if (!entry) return;
-    // The entry has already been removed from the data store by the time this
-    // runs, so getMirrorId's data-store fallback can no longer find it (it only
-    // works via the in-memory mirrorIdMap cache). Fall back to the mirror id
-    // captured on the entry itself before deletion so this still works after a
-    // server restart / cold cache.
-    const mirrorId = getMirrorId(channelName, timestamp) || (entry._discordMirrorId ? String(entry._discordMirrorId) : null);
+    const mirrorId = getMirrorId(channelName, timestamp) || (entry.discordid ? String(entry.discordid) : null);
     if (!mirrorId) return;
     try {
         await discordRequestForce({
@@ -4390,7 +4389,7 @@ async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
     const data = getDataCache();
     const entry = data?.messages?.[channelName]?.[timestamp];
     if (!entry) return;
-    const mirrorId = getMirrorId(channelName, timestamp) || (entry._discordMirrorId ? String(entry._discordMirrorId) : null);
+    const mirrorId = getMirrorId(channelName, timestamp) || (entry.discordid ? String(entry.discordid) : null);
     if (!mirrorId) return;
     try {
         const isAnon = isAnonMessageEntry(entry);
@@ -5407,7 +5406,6 @@ async function syncDiscordHistory(channelName, discordChannelId) {
     if (!data.messages[channelName]) data.messages[channelName] = {};
     const existing = data.messages[channelName];
     const existingTs = new Set(Object.keys(existing).map(Number));
-    let mirrorIdsDirty = false;
     for (const [ts, entry] of Object.entries(existing)) {
         if (entry?._discordId) {
             discordMsgIdToTimestamp[entry._discordId] = {
@@ -5415,15 +5413,11 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 timestamp: Number(ts)
             };
         }
-        if (entry?._discordMirrorId) {
-            setMirrorId(channelName, ts, entry._discordMirrorId);
-            delete entry._discordMirrorId;
-            data.messages[channelName][ts] = entry;
-            mirrorIdsDirty = true;
+        if (entry?.discordid) {
+            const idStr = String(entry.discordid);
+            mirrorIdMap[`${channelName}:${ts}`] = idStr;
+            discordMsgIdToTimestamp[idStr] = { channel: channelName, timestamp: ts };
         }
-    }
-    if (mirrorIdsDirty) {
-        saveData(data);
     }
     const state = discordBridgeState[channelName] || {};
     if (state.synced) return;
@@ -5459,7 +5453,7 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 discordMsgIdToTimestamp[discordMsg.id] = { channel: channelName, timestamp: ts };
                 const _syncMsgs = data?.messages?.[channelName] || {};
                 for (const [wts, wEntry] of Object.entries(_syncMsgs)) {
-                    if (wEntry?._discordMirrorId === String(discordMsg.id)) {
+                    if (wEntry?.discordid === String(discordMsg.id)) {
                         setMirrorId(channelName, wts, discordMsg.id);
                         mirrorIdsDirty = true;
                         break;
@@ -5629,7 +5623,7 @@ function findWebsiteMirrorEntry(channelName, discordMsgId, data) {
     const msgs = data?.messages?.[channelName] || {};
     for (const [wts, wEntry] of Object.entries(msgs)) {
         if (wEntry?._discordId) continue;
-        const mirrorId = getMirrorId(channelName, wts) || (wEntry?._discordMirrorId ? String(wEntry._discordMirrorId) : null);
+        const mirrorId = getMirrorId(channelName, wts) || (wEntry?.discordid ? String(wEntry.discordid) : null);
         if (mirrorId === String(discordMsgId)) return [wts, wEntry];
     }
     return null;
@@ -6150,8 +6144,8 @@ function getMirrorId(channelName, timestamp) {
     if (mirrorIdMap[key]) return mirrorIdMap[key];
     const data = getDataCache();
     const entry = data?.messages?.[channelName]?.[String(timestamp)];
-    if (entry?._discordMirrorId) {
-        mirrorIdMap[key] = String(entry._discordMirrorId);
+    if (entry?.discordid) {
+        mirrorIdMap[key] = String(entry.discordid);
         return mirrorIdMap[key];
     }
     return null;
@@ -6819,7 +6813,7 @@ function setMirrorId(channelName, timestamp, discordMirrorId) {
     discordMsgIdToTimestamp[idStr] = { channel: channelName, timestamp: tsKey };
     try {
         const cachedEntry = _dataCache?.messages?.[channelName]?.[tsKey];
-        if (cachedEntry) cachedEntry._discordMirrorId = idStr;
+        if (cachedEntry) cachedEntry.discordid = idStr;
     } catch {}
     try {
         const channelMessages = getChannelMessages(channelName);
@@ -6828,10 +6822,10 @@ function setMirrorId(channelName, timestamp, discordMirrorId) {
             console.error(`[setMirrorId] No message found at ${channelName}:${tsKey} — Discord id ${idStr} was NOT saved.`);
             return;
         }
-        entry._discordMirrorId = idStr;
+        entry.discordid = idStr;
         saveChannelMessages(channelName, channelMessages);
     } catch (e) {
-        console.error("[setMirrorId] Failed to persist _discordMirrorId:", e.message);
+        console.error("[setMirrorId] Failed to persist discordid:", e.message);
     }
 }
 function setupSocketHandlers(ioInstance, label) {
@@ -7223,7 +7217,7 @@ function startDiscordGateway() {
                     const _mirrorData = getDataCache();
                     const _mirrorMsgs = _mirrorData?.messages?.[channelName] || {};
                     for (const [wts, wEntry] of Object.entries(_mirrorMsgs)) {
-                        if (wEntry?._discordMirrorId === String(d.id)) {
+                        if (wEntry?.discordid === String(d.id)) {
                             setMirrorId(channelName, wts, d.id);
                             break;
                         }
