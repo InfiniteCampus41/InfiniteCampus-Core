@@ -21,6 +21,7 @@ Object.assign(wisp.options, {
 const REPO_URL = process.env.REPO_URL;
 const BRANCH = process.env.BRANCH;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
+const API_PROXY_TARGET = process.env.API_PROXY_TARGET || "http://localhost:3000";
 const REPO_CLONE_PATH = "./repo-cache";
 const PUBLIC_DIR = publicPath;
 const LOG_FILE = "log.json";
@@ -568,6 +569,38 @@ fastify.post("/scramjet/url", async (req, reply) => {
 fastify.get("/join/:code", async (req, reply) => {
     const code = encodeURIComponent(req.params.code || "");
     return reply.redirect(`/InfiniteChatters.html?joinCode=${code}`);
+});
+fastify.all("/api/*", async (req, reply) => {
+    try {
+        let forwardPath = req.url;
+        if (forwardPath === "/api") {
+            forwardPath = "/";
+        } else if (forwardPath.startsWith("/api/")) {
+            forwardPath = forwardPath.slice(4);
+        }
+        const targetUrl = new URL(forwardPath, API_PROXY_TARGET);
+        const headers = { ...req.headers };
+        delete headers.host;
+        delete headers.connection;
+        delete headers["content-length"];
+        const response = await fetch(targetUrl.toString(), {
+            method: req.method,
+            headers,
+            body: ["GET", "HEAD"].includes(req.method) ? undefined : req.rawBody,
+        });
+        const outHeaders = {};
+        for (const [key, value] of response.headers.entries()) {
+            if (key.toLowerCase() === "content-encoding") continue;
+            if (key.toLowerCase() === "transfer-encoding") continue;
+            outHeaders[key] = value;
+        }
+        const body = Buffer.from(await response.arrayBuffer());
+        return reply.code(response.status).headers(outHeaders).send(body);
+    } catch (err) {
+        if (!reply.sent && !reply.raw.headersSent) {
+            reply.code(502).send({ error: "Upstream request failed", details: err.message });
+        }
+    }
 });
 fastify.setNotFoundHandler((req, reply) => {
     return reply.code(404).type("text/html").sendFile("404.html");
