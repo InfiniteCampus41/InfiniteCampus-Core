@@ -21,7 +21,7 @@ Object.assign(wisp.options, {
 const REPO_URL = process.env.REPO_URL;
 const BRANCH = process.env.BRANCH;
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET;
-const API_PROXY_TARGET = process.env.API_PROXY_TARGET || "http://localhost:3000";
+const API_PROXY_TARGET = process.env.API_PROXY_TARGET;
 const REPO_CLONE_PATH = "./repo-cache";
 const PUBLIC_DIR = publicPath;
 const LOG_FILE = "log.json";
@@ -597,8 +597,9 @@ fastify.all("/api/*", async (req, reply) => {
         const body = Buffer.from(await response.arrayBuffer());
         return reply.code(response.status).headers(outHeaders).send(body);
     } catch (err) {
+        console.error("Proxy error:", err.cause || err);
         if (!reply.sent && !reply.raw.headersSent) {
-            reply.code(502).send({ error: "Upstream request failed", details: err.message });
+            reply.code(502).send({ error: "Upstream request failed", details: err.cause?.message || err.message });
         }
     }
 });
