@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import net from "net";
 import { DATA_ROOT } from "./channelsstore.js";
 const URLS_DIR = path.join(DATA_ROOT, "urls");
 export const URLS_PATH = path.join(URLS_DIR, "urls.json");
@@ -45,7 +46,14 @@ export function isAllowedHost(hostname, allowedHosts = []) {
     }
     return false;
 }
-export function normalizeOrigin(rawUrl) {
+export function isLocalOrIpHost(hostname) {
+    if (!hostname) return false;
+    const host = String(hostname).toLowerCase();
+    if (host === "localhost" || host.endsWith(".localhost")) return true;
+    if (net.isIP(host)) return true;
+    return false;
+}
+export function normalizeOrigin(rawUrl, { allowLocal = false } = {}) {
     let parsed;
     try {
         parsed = new URL(rawUrl);
@@ -53,6 +61,7 @@ export function normalizeOrigin(rawUrl) {
         return null;
     }
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    if (!allowLocal && isLocalOrIpHost(parsed.hostname)) return null;
     return { origin: parsed.origin, hostname: parsed.hostname };
 }
 export function makeEntryId() {
