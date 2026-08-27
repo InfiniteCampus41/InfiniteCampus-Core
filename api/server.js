@@ -363,6 +363,13 @@ const wsClients = new Map();
 const WS_POLL_INTERVAL_NORMAL = 3000;
 const WS_POLL_INTERVAL_TYPING = 1000;
 const wss = new WebSocketServer({ noServer: true });
+const UNBOUNDED_WS_PATHS = new Set(["users"]);
+function trimObjectToLimit(pathParts, current, limit) {
+    if (!current || typeof current !== "object" || Array.isArray(current)) return current;
+    if (UNBOUNDED_WS_PATHS.has(pathParts[0])) return current;
+    const keys = Object.keys(current).slice(-limit);
+    return keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
+}
 class DataSnapshot {
     constructor(data) {
         this.data = data;
@@ -511,7 +518,10 @@ app.use(cors({
         "X-Anon-Session"
     ]
 }));
-app.use(express.json({ limit: "10mb" }));
+app.use((req, res, next) => {
+    if (req.originalUrl === "/square-webhook") return next();
+    express.json({ limit: "10mb" })(req, res, next);
+});
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // attachGameAssetFallback(app, { __dirname });
 attachZoneGameRoutes(app, { __dirname });
@@ -2860,11 +2870,10 @@ app.post("/limit-to-last", async (req, res) => {
             return res.status(403).json({ error: "Permission denied" });
         let current = dataJson;
         for (const p of path) current = current?.[p];
-        if (current && typeof current === "object" && !Array.isArray(current)) {
-            const keys = Object.keys(current).slice(-limit);
-            current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
-        } else if (Array.isArray(current)) {
-            current = current.slice(-limit);
+        if (Array.isArray(current)) {
+            current = UNBOUNDED_WS_PATHS.has(path[0]) ? current : current.slice(-limit);
+        } else {
+            current = trimObjectToLimit(path, current, limit);
         }
         const filtered = filterDataByRules(current, path, auth, root, rules);
         res.json({ data: filtered });
@@ -3904,6 +3913,21 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
             }
             saveData(dataJson);
         }
+        if (
+            path.length === 4 &&
+            path[0] === "users" &&
+            path[2] === "profile" &&
+            path[3] === "displayName" &&
+            newValue !== oldValue
+        ) {
+            const changedUid = path[1];
+            const changedProfile = dataJson?.users?.[changedUid]?.profile || {};
+            if (!isVerifiedProfile(changedProfile)) {
+                sendVerificationNotification(changedUid, newValue || "User").catch(e =>
+                    console.error("Verification Notification Update Failed:", e.message)
+                );
+            }
+        }
         broadcastUpdate(path, newValue);
         if (
             uploadedFile &&
@@ -4303,10 +4327,7 @@ wss.on("connection", async (ws, req) => {
         try {
             let current = dataJson;
             for (const p of wsPath) current = current?.[p];
-            if (current && typeof current === "object" && !Array.isArray(current)) {
-                const keys = Object.keys(current).slice(-limit);
-                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
-            }
+            current = trimObjectToLimit(wsPath, current, limit);
             const filtered = filterDataByRules(current, wsPath, auth, root, rules);
             const snapshotStr = JSON.stringify(filtered);
             ws.send(snapshotStr);
@@ -4660,10 +4681,30 @@ async function getUidByDisplayNameServer(displayName) {
     }
     return null;
 }
+function dedupeTokensByDevice(tokenMap) {
+    const chosenByDevice = new Map(); // deviceId -> { token, isPWA, ts }
+    const noDeviceId = [];
+    for (const [token, meta] of Object.entries(tokenMap || {})) {
+        const info = (meta && typeof meta === "object") ? meta : {};
+        const deviceId = info.deviceId;
+        if (!deviceId) {
+            noDeviceId.push(token);
+            continue;
+        }
+        const ts = typeof info.ts === "number" ? info.ts : 0;
+        const isPWA = !!info.isPWA;
+        const existing = chosenByDevice.get(deviceId);
+        const isBetter = !existing
+            || (isPWA && !existing.isPWA)
+            || (isPWA === existing.isPWA && ts >= existing.ts);
+        if (isBetter) chosenByDevice.set(deviceId, { token, isPWA, ts });
+    }
+    return [...noDeviceId, ...[...chosenByDevice.values()].map(v => v.token)];
+}
 async function _getPushTokensForUser(uid) {
     const data = getDataCache();
     const tokenMap = data?.notifications?.[uid]?.tokens || {};
-    return Object.keys(tokenMap);
+    return dedupeTokensByDevice(tokenMap);
 }
 async function grantPremium(uid, amount) {
     try {
@@ -5204,6 +5245,7 @@ async function sendTemplatedEmail(templateName, toEmail, subject, vars = {}) {
         throw err;
     }
 }
+const VERIFY_NOTIFICATION_ICON = "/icons/shield-check.svg";
 async function sendVerificationNotification(uid, displayName) {
     const _svData = getDataCache();
     const tokens = [];
@@ -5211,9 +5253,7 @@ async function sendVerificationNotification(uid, displayName) {
         const profile = userData?.profile || {};
         if (profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev) {
             const pushTokens = _svData?.notifications?.[user]?.tokens || {};
-            for (const tokenKey of Object.keys(pushTokens)) {
-                tokens.push(tokenKey);
-            }
+            tokens.push(...dedupeTokensByDevice(pushTokens));
         }
     }
     if (tokens.length === 0) {
@@ -5221,12 +5261,14 @@ async function sendVerificationNotification(uid, displayName) {
         return;
     }
     const verifyUrl = `/verify-user?uid=${encodeURIComponent(uid)}`;
+    const tag = `verify-${uid}`;
     const message = {
         data: {
             type: "verifyUser",
             uid: uid,
             url: `/InfiniteAdmins.html?chat=true`,
-            verifyUrl
+            verifyUrl,
+            tag
         },
         notification: {
             title: "A New User Has Signed Up!",
@@ -5238,11 +5280,14 @@ async function sendVerificationNotification(uid, displayName) {
             notification: {
                 title: "A New User Has Signed Up!",
                 body: `User ${displayName} Is Awaiting Verification`,
+                icon: VERIFY_NOTIFICATION_ICON,
+                tag,
+                renotify: true,
                 actions: [
                     { action: "verify", title: "Verify User" },
                     { action: "dismiss", title: "Dismiss" }
                 ],
-                data: { type: "verifyUser", uid, verifyUrl }
+                data: { type: "verifyUser", uid, verifyUrl, tag }
             }
         }
     };
@@ -5728,10 +5773,7 @@ function broadcastUpdate(changedPath, newValue) {
             const root = new DataSnapshot(dataJson);
             let current = dataJson;
             for (const p of clientInfo.path) current = current?.[p];
-            if (current && typeof current === "object" && !Array.isArray(current)) {
-                const keys = Object.keys(current).slice(-clientInfo.limit);
-                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
-            }
+            current = trimObjectToLimit(clientInfo.path, current, clientInfo.limit);
             const filtered = filterDataByRules(current, clientInfo.path, clientInfo.auth, root, clientInfo.rules);
             const snapshotStr = JSON.stringify(filtered);
             ws.send(snapshotStr);
@@ -7644,10 +7686,7 @@ setInterval(async () => {
         try {
             let current = dataJson;
             for (const p of clientInfo.path) current = current?.[p];
-            if (current && typeof current === "object" && !Array.isArray(current)) {
-                const keys = Object.keys(current).slice(-clientInfo.limit);
-                current = keys.reduce((acc, k) => { acc[k] = current[k]; return acc; }, {});
-            }
+            current = trimObjectToLimit(clientInfo.path, current, clientInfo.limit);
             const filtered = filterDataByRules(current, clientInfo.path, clientInfo.auth, root, clientInfo.rules);
             const snapshotStr = JSON.stringify(filtered);
             if (isTypingPath || snapshotStr !== clientInfo.lastData) {

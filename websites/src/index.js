@@ -142,12 +142,13 @@ async function syncRepoToPublic(src, dest) {
 }
 async function cloneOrPullRepo() {
     try {
-        await fs.access(REPO_CLONE_PATH);
+        await fs.access(path.join(REPO_CLONE_PATH, ".git"));
         console.log("Fetching Repo");
         await run(`git -C ${REPO_CLONE_PATH} fetch origin ${BRANCH}`);
         await run(`git -C ${REPO_CLONE_PATH} reset --hard origin/${BRANCH}`);
     } catch {
         console.log("Cloning Repo");
+        await fs.rm(REPO_CLONE_PATH, { recursive: true, force: true });
         await run(`git clone --branch ${BRANCH} ${REPO_URL} ${REPO_CLONE_PATH}`);
     }
     console.log("Syncing Repo");
@@ -212,6 +213,69 @@ async function clearLogs() {
         console.error("Failed To Clear Logs:", err);
     }
 }
+function getRequestOrigin(req) {
+    const forwardedProto = req.headers["x-forwarded-proto"];
+    const protocol = forwardedProto
+        ? forwardedProto.split(",")[0].trim()
+        : (req.protocol || "https");
+    const forwardedHost = req.headers["x-forwarded-host"];
+    const host = forwardedHost
+        ? forwardedHost.split(",")[0].trim()
+        : req.headers.host;
+    return `${protocol}://${host}`;
+}
+async function streamToString(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    return Buffer.concat(chunks).toString("utf-8");
+}
+function extractMetaContent(html, property) {
+    const tagMatch = html.match(
+        new RegExp(`<meta\\b[^>]*\\bproperty=["']${property}["'][^>]*>`, "i")
+    );
+    if (!tagMatch) return null;
+    const contentMatch = tagMatch[0].match(/content=["']([^"']*)["']/i);
+    return contentMatch ? contentMatch[1] : null;
+}
+function injectMetaTags(html, origin, pathname) {
+    const canonicalUrl = origin + pathname;
+    const imageUrl = origin + "/res/icon.png";
+    const ogUrlTag = `<meta property="og:url" content="${canonicalUrl}">`;
+    const ogImageTag = `<meta property="og:image" content="${imageUrl}">`;
+    const canonicalTag = `<link rel="canonical" href="${canonicalUrl}">`;
+    if (/<meta\b[^>]*\bproperty=["']og:url["'][^>]*>/i.test(html)) {
+        html = html.replace(/<meta\b[^>]*\bproperty=["']og:url["'][^>]*>/i, ogUrlTag);
+    } else {
+        html = html.replace(/<\/head>/i, `    ${ogUrlTag}\n</head>`);
+    }
+    if (/<meta\b[^>]*\bproperty=["']og:image["'][^>]*>/i.test(html)) {
+        html = html.replace(/<meta\b[^>]*\bproperty=["']og:image["'][^>]*>/i, ogImageTag);
+    } else {
+        html = html.replace(/<\/head>/i, `    ${ogImageTag}\n</head>`);
+    }
+    if (/<link\b[^>]*\brel=["']canonical["'][^>]*>/i.test(html)) {
+        html = html.replace(/<link\b[^>]*\brel=["']canonical["'][^>]*>/i, canonicalTag);
+    } else {
+        html = html.replace(/<\/head>/i, `    ${canonicalTag}\n</head>`);
+    }
+    if (!/<meta\b[^>]*\bproperty=["']og:type["'][^>]*>/i.test(html)) {
+        html = html.replace(/<\/head>/i, `    <meta property="og:type" content="website">\n</head>`);
+    }
+    if (!/<meta\b[^>]*\bname=["']twitter:card["'][^>]*>/i.test(html)) {
+        const title = extractMetaContent(html, "og:title") || "Infinite Campus";
+        const description = extractMetaContent(html, "og:description") || "";
+        const twitterTags = [
+            `<meta name="twitter:card" content="summary">`,
+            `<meta name="twitter:title" content="${title}">`,
+            description ? `<meta name="twitter:description" content="${description}">` : "",
+            `<meta name="twitter:image" content="${imageUrl}">`
+        ].filter(Boolean).join("\n    ");
+        html = html.replace(/<\/head>/i, `    ${twitterTags}\n</head>`);
+    }
+    return html;
+}
 function scheduleDailyLogClear() {
     const now = new Date();
     const next10PM = new Date();
@@ -258,6 +322,27 @@ fastify.addHook("onSend", async (req, reply, payload) => {
     if (req.url.startsWith("/scram/sw.js")) {
         reply.header("Service-Worker-Allowed", "/");
         reply.header("Cache-Control", "no-store");
+    }
+    const contentType = reply.getHeader("content-type");
+    if (typeof contentType === "string" && contentType.includes("text/html")) {
+        let html;
+        if (Buffer.isBuffer(payload)) {
+            html = payload.toString("utf-8");
+        } else if (typeof payload === "string") {
+            html = payload;
+        } else if (payload && typeof payload.pipe === "function") {
+            html = await streamToString(payload);
+        } else {
+            return payload;
+        }
+        const origin = getRequestOrigin(req);
+        let pathname = "/";
+        try {
+            pathname = new URL(req.url, origin).pathname;
+        } catch {}
+        html = injectMetaTags(html, origin, pathname);
+        reply.header("Content-Length", Buffer.byteLength(html));
+        return html;
     }
     return payload;
 });
@@ -500,7 +585,11 @@ await cloneOrPullRepo().catch((err) => console.error("Initial Sync Failed:", err
 let port = parseInt(process.env.PORT || "");
 if (isNaN(port)) port = 8080;
 loadSettings().then(() => {
-    fastify.listen({ port, host: "0.0.0.0" }, () => {
+    fastify.listen({ port, host: "0.0.0.0" }, (err) => {
+        if (err) {
+            console.error("Failed to start server:", err.message);
+            process.exit(1);
+        }
         const address = fastify.server.address();
         console.log("Listening On:");
         console.log(`\thttp://localhost:${address.port}`);
