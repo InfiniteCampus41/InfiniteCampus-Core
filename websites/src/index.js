@@ -12,6 +12,7 @@ import { baremuxPath } from "@mercuryworkshop/bare-mux/node";
 import fs from "fs/promises";
 import path from "path";
 import dotenv from "dotenv";
+import httpProxy from "http-proxy";
 dotenv.config();
 const publicPath = fileURLToPath(new URL("../public/", import.meta.url));
 logging.set_level(logging.NONE);
@@ -171,6 +172,16 @@ async function loadBlockedUrls() {
         blockedUrls = {};
     }
 }
+const apiWsProxy = httpProxy.createProxyServer({
+    target: API_PROXY_TARGET,
+    ws: true,
+    changeOrigin: true,
+    secure: true,
+});
+apiWsProxy.on("error", (err, req, socket) => {
+    console.error("API WS Proxy Error:", err.message);
+    if (socket && socket.writable) socket.end();
+});
 function verifySignature(req) {
     const sig = req.headers["x-hub-signature-256"];
     if (!sig) return false;
@@ -303,8 +314,14 @@ const fastify = Fastify({
             handler(req, res);
         })
         .on("upgrade", (req, socket, head) => {
-            if (req.url.endsWith("/wisp/")) wisp.routeRequest(req, socket, head);
-            else socket.end();
+            if (req.url.endsWith("/wisp/")) {
+                wisp.routeRequest(req, socket, head);
+            } else if (req.url === "/api" || req.url.startsWith("/api/")) {
+                req.url = req.url === "/api" ? "/" : req.url.slice(4);
+                apiWsProxy.ws(req, socket, head);
+            } else {
+                socket.end();
+            }
         });
     },
 });
