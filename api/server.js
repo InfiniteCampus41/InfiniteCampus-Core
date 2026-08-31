@@ -687,7 +687,7 @@ app.all("/admin/modify-rules", verifyFirebaseToken, async (req, res) => {
     try {
         const uid = req.user.uid;
         const profile = readDataPath(`users/${uid}/profile`);
-        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isHAdmin || profile.isDev)) {
+        if (!profile || !(profile.isOwner || profile.isCoOwner || profile.isDev)) {
             return res.status(403).json({ error: "Not Authorized" });
         }
         if (req.method === "GET") {
@@ -2050,6 +2050,15 @@ app.post("/admin/lockdown", (req, res) => {
     res.json({ lockdown: LOCKDOWN });
 });
 app.post("/admin/movies_toggle", (req, res) => {
+    const pass = req.headers["x-admin-password"];
+    const validPasswords = [
+        process.env.ADMIN_PASSWORD,
+        process.env.ADMIN_PASSWORD_2,
+        process.env.YOYOMASTER
+    ];
+    if (!pass || !validPasswords.includes(pass)) {
+        return res.status(401).json({ error: "Unauthorized: Invalid Admin Password" });
+    }
     MOVIE_LOCKDOWN = !MOVIE_LOCKDOWN;
     broadcastMovieLockdown();
     if (MOVIE_LOCKDOWN) {
@@ -2075,6 +2084,15 @@ app.post("/admin/movies_toggle", (req, res) => {
     res.json({ moviesDisabled: MOVIE_LOCKDOWN });
 });
 app.post("/admin/discord_chat_lockdown_toggle", (req, res) => {
+    const pass = req.headers["x-admin-password"];
+    const validPasswords = [
+        process.env.ADMIN_PASSWORD,
+        process.env.ADMIN_PASSWORD_2,
+        process.env.YOYOMASTER
+    ];
+    if (!pass || !validPasswords.includes(pass)) {
+        return res.status(401).json({ error: "Unauthorized: Invalid Admin Password" });
+    }
     DISCORD_CHAT_LOCKDOWN = !DISCORD_CHAT_LOCKDOWN;
     broadcastDiscordChatLockdown();
     if (DISCORD_CHAT_LOCKDOWN) {
@@ -5996,7 +6014,7 @@ function getRecentSentMessagesForUser(uid, limit = 10) {
 }
 function isPrivilegedAdminProfile(profile) {
     return !!(profile && (
-        profile.isOwner || profile.isCoOwner || profile.isHAdmin ||
+        profile.isOwner || profile.isCoOwner ||
         profile.isTester || profile.isDev
     ));
 }
