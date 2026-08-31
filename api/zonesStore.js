@@ -483,6 +483,28 @@ export function attachZoneGameRoutes(app, deps) {
     app.get("/api/game-sources", (req, res) => {
         res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name })) });
     });
+    app.get("/api/games/popular", async (req, res) => {
+        res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
+        try {
+            const allSources = getSourcesConfig();
+            let combined = [];
+            for (const source of allSources) {
+                const games = loadGamesJSON(__dirname, source.id);
+                const hidden = getHiddenIdSet(__dirname, source.id, games);
+                const list = Array.isArray(games._list) ? games._list.filter((g) => !hidden.has(String(g.id))) : [];
+                for (const g of list) {
+                    combined.push({ ...g, sourceId: source.id, sourceName: source.name });
+                }
+            }
+            combined.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
+            const top = combined.slice(0, 6);
+            log("popular", "serving top", top.length, "popular games out of", combined.length, "total");
+            res.json({ ok: true, games: top });
+        } catch (e) {
+            errlog("popular", "top games FAILED -", e.stack || e.message);
+            res.status(502).json({ ok: false, error: "Failed To Load Popular Games" });
+        }
+    });
     app.get("/api/games/:sourceId", async (req, res) => {
         const source = requireSource(req, res);
         if (!source) return;
