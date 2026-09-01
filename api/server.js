@@ -281,16 +281,16 @@ let _restrictedWordsCache = null;
 const RESTRICTED_WORDS_PATH = path.join(__dirname, "data", "restrictedwords", "data.json");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const ROUTES = {
-    UPLOAD: `/api/upload_apply_${UNIQUE_SUFFIX}`,
-    LIST_APPLY: `/api/list_apply_${UNIQUE_SUFFIX}`,
+    UPLOAD: `/upload_apply_${UNIQUE_SUFFIX}`,
+    LIST_APPLY: `/list_apply_${UNIQUE_SUFFIX}`,
     STREAM_APPLY: `/apply_stream_${UNIQUE_SUFFIX}/:name`,
-    LIST_VIDEOS: `/api/list_videos_${UNIQUE_SUFFIX}`,
+    LIST_VIDEOS: `/list_videos_${UNIQUE_SUFFIX}`,
     STREAM_VIDEO: `/movies/${UNIQUE_SUFFIX}/:name`,
     DOWNLOAD_VIDEO: `/download/${UNIQUE_SUFFIX}/:name`,
     DELETE_VIDEO: `/delete/${UNIQUE_SUFFIX}/:name`,
     ADMIN_ACCEPT: `/admin/accept_${UNIQUE_SUFFIX}`,
-    MARK_WATCHED: `/api/watch_${UNIQUE_SUFFIX}/:name`,
-    UPLOAD_SUBTITLE: `/api/upload_subtitle_${UNIQUE_SUFFIX}/:name`,
+    MARK_WATCHED: `/watch_${UNIQUE_SUFFIX}/:name`,
+    UPLOAD_SUBTITLE: `/upload_subtitle_${UNIQUE_SUFFIX}/:name`,
     THUMB_PROXY: `/thumb/${UNIQUE_SUFFIX}/:name`,
 };
 const RULES_PATH = path.join(__dirname, "rules.json");
@@ -776,7 +776,7 @@ app.all("/admin/modify-users", verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
-app.get("/api/ban-status", async (req, res) => {
+app.get("/ban-status", async (req, res) => {
     try {
         const header = req.headers.authorization || "";
         const token = header.split("Bearer ")[1];
@@ -807,7 +807,7 @@ app.get("/api/ban-status", async (req, res) => {
         res.status(500).json({ error: "Could Not Check Ban Status" });
     }
 });
-app.get("/api/moderation/ban-status/:id", verifyFirebaseToken, async (req, res) => {
+app.get("/moderation/ban-status/:id", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
         if (!isPrivilegedAdminProfile(requesterProfile)) {
@@ -819,7 +819,7 @@ app.get("/api/moderation/ban-status/:id", verifyFirebaseToken, async (req, res) 
         res.status(500).json({ error: "Could Not Check Ban Status" });
     }
 });
-app.post("/api/moderation/ban", verifyFirebaseToken, async (req, res) => {
+app.post("/moderation/ban", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterUid = req.user.uid;
         const requesterProfile = readDataPath(`users/${requesterUid}/profile`);
@@ -862,7 +862,7 @@ app.post("/api/moderation/ban", verifyFirebaseToken, async (req, res) => {
         res.status(500).json({ error: "Could Not Ban User" });
     }
 });
-app.post("/api/moderation/unban", verifyFirebaseToken, async (req, res) => {
+app.post("/moderation/unban", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
         if (!isPrivilegedAdminProfile(requesterProfile)) {
@@ -883,7 +883,7 @@ app.post("/api/moderation/unban", verifyFirebaseToken, async (req, res) => {
         res.status(500).json({ error: "Could Not Unban User" });
     }
 });
-app.get("/api/moderation/bans", verifyFirebaseToken, async (req, res) => {
+app.get("/moderation/bans", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterProfile = readDataPath(`users/${req.user.uid}/profile`);
         if (!isPrivilegedAdminProfile(requesterProfile)) {
@@ -1011,7 +1011,7 @@ app.get("/admin/logs", (req, res) => {
         activeLinks: activeLinks.slice(-100),
     });
 });
-app.get("/api/guest-channel-info", async (req, res) => {
+app.get("/guest-channel-info", async (req, res) => {
     const channel = req.query.channel;
     if (!channel) return res.status(400).json({ error: "Missing channel" });
     const data = getDataCache();
@@ -1022,7 +1022,7 @@ app.get("/api/guest-channel-info", async (req, res) => {
         guestWrite: !!(chData.guestWrite),
     });
 });
-app.post("/api/mentionable-users", verifyFirebaseTokenOrAnon, rateLimit("read"), async (req, res) => {
+app.post("/mentionable-users", verifyFirebaseTokenOrAnon, rateLimit("read"), async (req, res) => {
     try {
         const requesterUid = req.user?.uid || req.anonId;
         const { type, channel, groupId, targetUid } = req.body || {};
@@ -1073,7 +1073,7 @@ app.post("/api/mentionable-users", verifyFirebaseTokenOrAnon, rateLimit("read"),
         res.status(500).json({ error: "Could Not Load Mentionable Users" });
     }
 });
-app.get("/api/movies-json", (req, res) => {
+app.get("/movies-json", (req, res) => {
     const pass = req.headers["x-admin-password"];
     if (pass === process.env.DON_PASS_1) {
         return res.status(403).json({
@@ -1557,10 +1557,10 @@ app.get("/ping", (req, res) => {
         serverTime: now
     });
 });
-app.get("/api/movies_status_x9a7b2", (req, res) => {
+app.get("/movies_status_x9a7b2", (req, res) => {
     res.json({ disabled: MOVIE_LOCKDOWN });
 });
-app.get("/api/movies_lockdown_stream_x9a7b2", (req, res) => {
+app.get("/movies_lockdown_stream_x9a7b2", (req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -1578,10 +1578,10 @@ app.get("/api/movies_lockdown_stream_x9a7b2", (req, res) => {
         movieLockdownStreamClients.delete(res);
     });
 });
-app.get("/api/discord_chat_lockdown_status_x9a7b2", (req, res) => {
+app.get("/discord_chat_lockdown_status_x9a7b2", (req, res) => {
     res.json({ locked: DISCORD_CHAT_LOCKDOWN });
 });
-app.get("/api/discord_chat_lockdown_stream_x9a7b2", (req, res) => {
+app.get("/discord_chat_lockdown_stream_x9a7b2", (req, res) => {
     res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -2190,7 +2190,7 @@ app.post("/admin/restart", verifyFirebaseToken, async (req, res) => {
         return res.status(500).json({ error: err.message || "Internal Server Error" });
     }
 });
-app.post("/api/anon-name", (req, res) => {
+app.post("/anon-name", (req, res) => {
     let { name, sessionToken } = req.body;
     if (!name || typeof name !== "string") return res.status(400).json({ error: "Missing name" });
     name = name.trim().slice(0, 32);
@@ -2206,7 +2206,7 @@ app.post("/api/anon-name", (req, res) => {
     anonSessions.set(sessionToken, { name, createdAt: existing?.createdAt || Date.now() });
     res.json({ sessionToken, name });
 });
-app.post(`/api/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
+app.post(`/delete_apply_${UNIQUE_SUFFIX}`, express.json(), (req, res) => {
     const { filename } = req.body;
     if (!filename) return res.json({ ok: false, message: "No Filename Provided" });
     const full = path.join(APPLICANTS_DIR, filename);
@@ -4328,7 +4328,7 @@ app.post("/write", rateLimit("write"), (req, res, next) => {
         res.status(401).json({ error: "Unauthorized" });
     }
 });
-app.put("/api/movies-json", requireAdminPassword, (req, res) => {
+app.put("/movies-json", requireAdminPassword, (req, res) => {
     const pass = req.headers["x-admin-password"];
     if (pass === process.env.DON_PASS_1) {
         return res.status(403).json({
@@ -6862,14 +6862,14 @@ function requireAdminForChannel(req, res, allowedSet, channelId) {
 function requireAdminPassword(req, res, next) {
     const adminRoutes = [
         `/hyperadminvm`,
-        `/api/movies-json`,
-        `/api/list_apply_${UNIQUE_SUFFIX}`,
+        `/movies-json`,
+        `/list_apply_${UNIQUE_SUFFIX}`,
         `/delete/${UNIQUE_SUFFIX}`,
-        `/api/delete_apply_${UNIQUE_SUFFIX}`
+        `/delete_apply_${UNIQUE_SUFFIX}`
     ];
     const adminPrefixRoutes = [
         `/delete/${UNIQUE_SUFFIX}/`,
-        `/api/upload_subtitle_${UNIQUE_SUFFIX}/`
+        `/upload_subtitle_${UNIQUE_SUFFIX}/`
     ];
     const isAdminPrefix = req.path.startsWith("/admin") || adminPrefixRoutes.some(p => req.path.startsWith(p));
     const isAdminExact = adminRoutes.includes(req.path);

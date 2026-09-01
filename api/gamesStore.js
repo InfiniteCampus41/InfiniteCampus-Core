@@ -339,7 +339,7 @@ export function attachGameRoutes(app, deps) {
             return null;
         }
     }
-    app.post("/api/games/upload", verifyFirebaseToken, (req, res) => {
+    app.post("/games/upload", verifyFirebaseToken, (req, res) => {
         upload.fields([{ name: "file", maxCount: 1 }, { name: "thumbnail", maxCount: 1 }])(req, res, async (err) => {
             if (err) {
                 if (err instanceof multer.MulterError && err.code === "LIMIT_FILE_SIZE") {
@@ -748,7 +748,7 @@ export function attachGameRoutes(app, deps) {
             }
         });
     });
-    app.get("/api/games-json", (req, res) => {
+    app.get("/games-json", (req, res) => {
         try {
             res.json(loadGamesJSON());
         } catch {
@@ -756,7 +756,7 @@ export function attachGameRoutes(app, deps) {
         }
     });
     const popularityDebounce = new Map();
-    app.post("/api/games/:id/popularity", (req, res) => {
+    app.post("/games/:id/popularity", (req, res) => {
         try {
             const id = req.params.id;
             const games = loadGamesJSON();
@@ -775,7 +775,7 @@ export function attachGameRoutes(app, deps) {
             res.status(500).json({ ok: false });
         }
     });
-    app.get("/api/games/by-user/:uid", async (req, res) => {
+    app.get("/games/by-user/:uid", async (req, res) => {
         try {
             const targetUid = req.params.uid;
             let viewerUid = null;

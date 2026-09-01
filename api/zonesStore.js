@@ -480,10 +480,10 @@ export function attachZoneGameRoutes(app, deps) {
     const sources = getSourcesConfig();
     for (const source of sources) ensureSourceFiles(__dirname, source.id);
 
-    app.get("/api/game-sources", (req, res) => {
+    app.get("/game-sources", (req, res) => {
         res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name })) });
     });
-    app.get("/api/games/popular", async (req, res) => {
+    app.get("/games/popular", async (req, res) => {
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
         try {
             const allSources = getSourcesConfig();
@@ -505,7 +505,7 @@ export function attachZoneGameRoutes(app, deps) {
             res.status(502).json({ ok: false, error: "Failed To Load Popular Games" });
         }
     });
-    app.get("/api/games/:sourceId", async (req, res) => {
+    app.get("/games/:sourceId", async (req, res) => {
         const source = requireSource(req, res);
         if (!source) return;
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
@@ -596,7 +596,7 @@ export function attachZoneGameRoutes(app, deps) {
         }
     });
     const popularityDebounce = new Map();
-    app.post("/api/games/:sourceId/:id/popularity", async (req, res) => {
+    app.post("/games/:sourceId/:id/popularity", async (req, res) => {
         const source = requireSource(req, res);
         if (!source) return;
         const id = req.params.id;
