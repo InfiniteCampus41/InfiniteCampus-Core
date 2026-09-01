@@ -497,7 +497,7 @@ export function attachZoneGameRoutes(app, deps) {
                 }
             }
             combined.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
-            const top = combined.slice(0, 6);
+            const top = combined.slice(0, 5);
             log("popular", "serving top", top.length, "popular games out of", combined.length, "total");
             res.json({ ok: true, games: top });
         } catch (e) {
