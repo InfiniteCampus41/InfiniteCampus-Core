@@ -96,6 +96,8 @@ const ARCHIVE_DIR = path.join(__dirname, "data", "logs", "archive");
 const AUTO_DELETE_MS = 10 * 60 * 1000;
 const AUTO_DELETE_PM_MS = 15 * 60 * 1000;
 const botSentDiscordIds = loadBotSentDiscordIds();
+const PROCESSED_PAYMENTS_PATH = path.join(DISCORD_DIR, "processedpayments.json");
+const processedPaymentIds = loadProcessedPaymentIds();
 const client = new Client({
     environment: Environment.Production,
     accessToken: process.env.SQUARE_ACCESS_TOKEN,
@@ -3391,6 +3393,15 @@ app.post("/square-webhook",
                 const uid = payment.note;
                 const amount = payment.approved_money.amount;
                 const amountDollars = amount / 100;
+                const paymentId = payment.id;
+                if (paymentId && processedPaymentIds.has(paymentId)) {
+                    console.log("Duplicate Square Webhook Ignored For Payment:", paymentId);
+                    return res.sendStatus(200);
+                }
+                if (paymentId) {
+                    processedPaymentIds.add(paymentId);
+                    saveProcessedPaymentIds();
+                }
                 const donationData = getDataCache();
                 if (!donationData.donations) donationData.donations = {};
                 donationData.donations.amount = (donationData.donations.amount || 0) + amountDollars;
@@ -3398,7 +3409,7 @@ app.post("/square-webhook",
                 if (uid) {
                     await grantPremium(uid, amount);
                     logEvent("payments", {
-                        id: payment.id || `payment_${Date.now()}`,
+                        id: paymentId || `payment_${Date.now()}`,
                         data: {
                             author: uid,
                             amount: `$${(amount / 100).toFixed(2)}`
@@ -6617,6 +6628,20 @@ function loadBotSentDiscordIds() {
         }
     } catch (e) { console.warn("Failed To Load discordids.json:", e.message); }
     return new Set();
+}
+function loadProcessedPaymentIds() {
+    try {
+        if (fs.existsSync(PROCESSED_PAYMENTS_PATH)) {
+            const parsed = JSON.parse(fs.readFileSync(PROCESSED_PAYMENTS_PATH, "utf-8"));
+            if (Array.isArray(parsed)) return new Set(parsed);
+        }
+    } catch (e) { console.warn("Failed To Load processedpayments.json:", e.message); }
+    return new Set();
+}
+function saveProcessedPaymentIds() {
+    try {
+        fs.writeFileSync(PROCESSED_PAYMENTS_PATH, JSON.stringify([...processedPaymentIds], null, 2));
+    } catch (e) { console.warn("Failed To Save processedpayments.json:", e.message); }
 }
 function loadDataSync() {
     return getDataCache();
