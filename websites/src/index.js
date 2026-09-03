@@ -333,7 +333,7 @@ fastify.addHook("onSend", async (req, reply, payload) => {
          worker-src * blob:;
          connect-src *;
          img-src * data: blob:;
-         frame-src *;
+         frame-src * data:;
          style-src * 'unsafe-inline';`
         .replace(/\s+/g, " ")
     );
@@ -549,7 +549,7 @@ fastify.post("/scramjet/url", async (req, reply) => {
                 worker-src * blob:;
                 connect-src *;
                 img-src * data: blob:;
-                frame-src *;
+                frame-src * data:;
             style-src * 'unsafe-inline';`
         )
         .header(
