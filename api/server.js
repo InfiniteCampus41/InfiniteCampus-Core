@@ -380,6 +380,22 @@ const wsClients = new Map();
 const WS_POLL_INTERVAL_NORMAL = 3000;
 const WS_POLL_INTERVAL_TYPING = 1000;
 const wss = new WebSocketServer({ noServer: true });
+const SYNC_WS_PATH = "/wireless_sync";
+const syncWss = new WebSocketServer({ noServer: true });
+const syncClients = new Map();
+const SYNC_ID_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+function generateSyncId() {
+    let id;
+    do {
+        id = Array.from({ length: 6 }, () => SYNC_ID_CHARS[Math.floor(Math.random() * SYNC_ID_CHARS.length)]).join("");
+    } while (syncClients.has(id));
+    return id;
+}
+function syncSend(ws, obj) {
+    try {
+        if (ws && ws.readyState === ws.OPEN) ws.send(JSON.stringify(obj));
+    } catch (e) {}
+}
 const UNBOUNDED_WS_PATHS = new Set(["users"]);
 function trimObjectToLimit(pathParts, current, limit) {
     if (!current || typeof current !== "object" || Array.isArray(current)) return current;
@@ -4365,6 +4381,12 @@ httpServer.on("upgrade", (request, socket, head) => {
     ) {
         return;
     }
+    if (pathname.startsWith(SYNC_WS_PATH)) {
+        syncWss.handleUpgrade(request, socket, head, (ws) => {
+            syncWss.emit("connection", ws, request);
+        });
+        return;
+    }
     wss.handleUpgrade(request, socket, head, (ws) => {
         wss.emit("connection", ws, request);
     });
@@ -4467,6 +4489,83 @@ wss.on("connection", async (ws, req) => {
         console.error("WS connection error:", err);
         ws.close();
     }
+});
+syncWss.on("connection", (ws) => {
+    const id = generateSyncId();
+    ws.syncId = id;
+    ws.syncPeerId = null;
+    ws.syncPending = null;
+    syncClients.set(id, ws);
+    syncSend(ws, { type: "assigned", id });
+    ws.on("message", (raw) => {
+        let msg;
+        try {
+            msg = JSON.parse(raw.toString());
+        } catch (e) {
+            return;
+        }
+        if (!msg || typeof msg !== "object") return;
+        if (msg.type === "pairAttempt") {
+            const peerId = String(msg.peerId || "").toUpperCase().slice(0, 6);
+            const role = msg.role === "receive" ? "receive" : "transmit";
+            if (!peerId || peerId.length !== 6) {
+                return syncSend(ws, { type: "pairError", message: "Enter A Valid 6 Character ID" });
+            }
+            if (peerId === ws.syncId) {
+                return syncSend(ws, { type: "pairError", message: "You Can't Pair With Yourself" });
+            }
+            const peerWs = syncClients.get(peerId);
+            if (!peerWs || peerWs.readyState !== peerWs.OPEN) {
+                return syncSend(ws, { type: "pairError", message: "That ID Was Not Found" });
+            }
+            ws.syncPending = { peerId, role };
+            const peerPending = peerWs.syncPending;
+            if (peerPending && peerPending.peerId === ws.syncId && peerPending.role !== role) {
+                ws.syncPeerId = peerId;
+                peerWs.syncPeerId = ws.syncId;
+                ws.syncPending = null;
+                peerWs.syncPending = null;
+                syncSend(ws, { type: "paired", peerId, role });
+                syncSend(peerWs, { type: "paired", peerId: ws.syncId, role: peerPending.role });
+            } else {
+                syncSend(ws, { type: "pairWaiting", peerId });
+            }
+            return;
+        }
+        if (msg.type === "relay") {
+            const peerWs = ws.syncPeerId ? syncClients.get(ws.syncPeerId) : null;
+            if (peerWs && peerWs.syncPeerId === ws.syncId) {
+                syncSend(peerWs, { type: "relay", data: msg.data });
+            }
+            return;
+        }
+        if (msg.type === "cancelPair") {
+            ws.syncPending = null;
+            return;
+        }
+        if (msg.type === "disconnectPeer") {
+            const peerWs = ws.syncPeerId ? syncClients.get(ws.syncPeerId) : null;
+            ws.syncPeerId = null;
+            if (peerWs && peerWs.syncPeerId === ws.syncId) {
+                peerWs.syncPeerId = null;
+                syncSend(peerWs, { type: "peerDisconnected" });
+            }
+            return;
+        }
+    });
+    ws.on("close", () => {
+        syncClients.delete(id);
+        if (ws.syncPeerId) {
+            const peerWs = syncClients.get(ws.syncPeerId);
+            if (peerWs && peerWs.syncPeerId === id) {
+                peerWs.syncPeerId = null;
+                syncSend(peerWs, { type: "peerDisconnected" });
+            }
+        }
+    });
+    ws.on("error", () => {
+        syncClients.delete(id);
+    });
 });
 async function bridgeDeleteToDiscord(channelName, timestamp) {
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
