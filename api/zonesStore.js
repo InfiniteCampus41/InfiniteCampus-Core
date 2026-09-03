@@ -1,5 +1,13 @@
 import fs from "fs";
 import path from "path";
+import { Readable } from "stream";
+function pipeUpstream(upstream, res) {
+    if (upstream.body) {
+        Readable.fromWeb(upstream.body).pipe(res);
+    } else {
+        upstream.arrayBuffer().then((ab) => res.send(Buffer.from(ab)));
+    }
+}
 const ZONE_KEY_PREFIX = "zone:";
 const SOURCE_CACHE_TTL_MS = 10 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 15000;
@@ -23,6 +31,136 @@ const CUSTOM_GAME_CSS = `
         display:none !important;
     }
 `;
+const EMULATED_FRAME_TYPES = new Set(["swf", "jsdos"]);
+const RUFFLE_CDN = "https://unpkg.com/@ruffle-rs/ruffle";
+const JSDOS_CSS = "https://v8.js-dos.com/latest/js-dos.css";
+const JSDOS_JS = "https://v8.js-dos.com/latest/js-dos.js";
+function buildEmulatorWrapperHtml(kind, mediaUrl) {
+    const safeUrl = JSON.stringify(mediaUrl);
+    if (kind === "swf") {
+        return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>html,body{margin:0;height:100%;background:#0b0b0f;overflow:hidden}#player{width:100%;height:100%}</style>
+</head><body>
+<div id="player"></div>
+<script src="${RUFFLE_CDN}"></script>
+<script>
+  window.RufflePlayer = window.RufflePlayer || {};
+  const ruffle = window.RufflePlayer.newest();
+  const player = ruffle.createPlayer();
+  player.style.width = "100%";
+  player.style.height = "100%";
+  document.getElementById("player").appendChild(player);
+  player.load(${safeUrl});
+</script>
+</body></html>`;
+    }
+    return `<!DOCTYPE html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="${JSDOS_CSS}">
+<style>html,body{margin:0;height:100%;background:#0b0b0f;overflow:hidden}#jsdos{width:100%;height:100%}</style>
+</head><body>
+<div id="jsdos"></div>
+<script src="${JSDOS_JS}"></script>
+<script>
+  Dos(document.getElementById("jsdos"), { url: ${safeUrl} });
+</script>
+</body></html>`;
+}
+function detectEmulatorKind(entry) {
+    if (entry.frameType && EMULATED_FRAME_TYPES.has(entry.frameType)) return entry.frameType;
+    const raw = entry.file || entry.url || "";
+    let pathPart = raw;
+    try {
+        pathPart = new URL(raw).pathname;
+    } catch {
+    }
+    const lower = String(pathPart).toLowerCase();
+    if (lower.endsWith(".swf")) return "swf";
+    if (lower.endsWith(".jsdos")) return "jsdos";
+    return null;
+}
+const EMULATOR_DATA_URI_CACHE_TTL_MS = 10 * 60 * 1000;
+const EMULATOR_DATA_URI_MAX_BYTES = Number(process.env.EMULATOR_DATA_URI_MAX_BYTES) || 40 * 1024 * 1024;
+const DATA_URI_CACHE_MAX_TOTAL_BYTES = Number(process.env.DATA_URI_CACHE_MAX_TOTAL_BYTES) || 100 * 1024 * 1024;
+function createBoundedCache(maxTotalBytes) {
+    const map = new Map();
+    let totalBytes = 0;
+    return {
+        get(key) {
+            return map.get(key);
+        },
+        set(key, value) {
+            const existing = map.get(key);
+            if (existing) totalBytes -= existing.bytes;
+            map.delete(key);
+            map.set(key, value);
+            totalBytes += value.bytes;
+            while (totalBytes > maxTotalBytes && map.size > 0) {
+                const oldestKey = map.keys().next().value;
+                totalBytes -= map.get(oldestKey).bytes;
+                map.delete(oldestKey);
+            }
+        },
+    };
+}
+const emulatorDataUriCache = createBoundedCache(DATA_URI_CACHE_MAX_TOTAL_BYTES);
+async function readBounded(response, maxBytes) {
+    if (!response.body || typeof response.body.getReader !== "function") {
+        const buf = Buffer.from(await response.arrayBuffer());
+        if (buf.length > maxBytes) {
+            throw Object.assign(new Error("Resource too large to inline"), { status: 413 });
+        }
+        return buf;
+    }
+    const reader = response.body.getReader();
+    const chunks = [];
+    let total = 0;
+    try {
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            total += value.length;
+            if (total > maxBytes) {
+                throw Object.assign(new Error("Resource too large to inline"), { status: 413 });
+            }
+            chunks.push(value);
+        }
+    } finally {
+        try { await reader.cancel(); } catch {}
+    }
+    return Buffer.concat(chunks.map((c) => Buffer.from(c)), total);
+}
+function guessEmulatorMime(kind, upstreamContentType) {
+    const ct = (upstreamContentType || "").split(";")[0].trim().toLowerCase();
+    if (ct && ct !== "application/octet-stream" && ct !== "text/plain" && ct !== "binary/octet-stream") {
+        return ct;
+    }
+    return kind === "swf" ? "application/x-shockwave-flash" : "application/octet-stream";
+}
+async function buildEmulatorDataUri(source, id, entry, emulatorKind) {
+    const cacheKey = `${source.id}:${id}`;
+    const cached = emulatorDataUriCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < EMULATOR_DATA_URI_CACHE_TTL_MS) {
+        return cached.dataUri;
+    }
+    const { upstream } = await fetchResolvedFileUrl(source, entry.file, "");
+    const buf = await readBounded(upstream, EMULATOR_DATA_URI_MAX_BYTES);
+    const mime = guessEmulatorMime(emulatorKind, upstream.headers.get("content-type"));
+    const dataUri = `data:${mime};base64,${buf.toString("base64")}`;
+    emulatorDataUriCache.set(cacheKey, { dataUri, fetchedAt: Date.now(), bytes: buf.length });
+    return dataUri;
+}
+const EMBED_WRAPPER_MIME = "application/xhtml+xml";
+function xmlEscapeAttr(value) {
+    return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+function buildEmbedRedirectDataUri(gameUrl) {
+    const safeUrl = xmlEscapeAttr(gameUrl);
+    const xhtml =
+        `<html xmlns="http://www.w3.org/1999/xhtml"><head><meta charset="utf-8" />` +
+        `<style>html,body{margin:0;height:100%;background:#0b0b0f;overflow:hidden}#g{width:100%;height:100%;border:none}</style>` +
+        `</head><body><embed id="g" src="${safeUrl}" type="text/html" /></body></html>`;
+    return `data:${EMBED_WRAPPER_MIME};base64,${Buffer.from(xhtml, "utf8").toString("base64")}`;
+}
 function log(sourceId, ...args) {
     console.log(`[gameSource:${sourceId || "-"}]`, ...args);
 }
@@ -40,13 +178,14 @@ function buildZoneSource() {
     let gameBases = splitEnvList(process.env.GAME_BASE1, process.env.GAME_BASE2, process.env.GAME_BASE3);
     if (!gameBases.length && process.env.GAME_BASE) gameBases = [process.env.GAME_BASE];
     const coverBase = process.env.COVER_BASE || "";
+    const customCss = process.env.GAMES_1_CSS || process.env.GAME_SOURCE_ZONE_CSS || CUSTOM_GAME_CSS;
     if (!manifestUrls.length) {
         console.warn("gameSources: ZONE1/ZONE2/ZONE3 not set in env - the zone source will be empty");
     }
     if (!gameBases.length) {
         console.warn("gameSources: GAME_BASE1/GAME_BASE2/GAME_BASE3 (or GAME_BASE) not set in env - zone game proxying will fail");
     }
-    return { id, name, kind: "zone", manifestUrls, gameBases, coverBase };
+    return { id, name, kind: "zone", manifestUrls, gameBases, coverBase, customCss };
 }
 function buildManifestSources() {
     const sources = [];
@@ -77,22 +216,41 @@ function buildManifestSources() {
                 process.env[`${legacyPrefix}MANIFEST3`]
             );
         }
-        if (!bases.length && manifestUrls.length === 0) continue; // this slot isn't configured, skip
+        if (!bases.length && manifestUrls.length === 0) continue;
         const id = process.env[`${legacyPrefix}ID`] || `source${n}`;
         const name = process.env[`GAMES_${n}_NAME`] || process.env[`${legacyPrefix}NAME`] || `Source ${n}`;
+        const kind = (process.env[`GAMES_${n}_KIND`] || process.env[`${legacyPrefix}KIND`] || "manifest").trim().toLowerCase();
+        const customCss = process.env[`GAMES_${n}_CSS`] || process.env[`${legacyPrefix}CSS`] || "";
         if (!bases.length) {
             console.warn(`gameSources: GAME_SOURCE${n} (or ${legacyPrefix}BASE1/2/3) not set - source "${id}" cannot resolve game/thumbnail urls`);
         }
-        if (!manifestUrls.length) {
+        if (kind !== "dated" && !manifestUrls.length) {
             console.warn(`gameSources: GAME${n}_ZONE (or ${legacyPrefix}MANIFEST1 etc) not set - source "${id}" will be empty`);
         }
-        sources.push({ id, name, kind: "manifest", manifestUrls, bases });
+        sources.push({ id, name, kind: kind === "dated" ? "dated" : "manifest", manifestUrls, bases, customCss });
     }
     return sources;
 }
+function getMainGameSourceId() {
+    return process.env.MAIN_GAME_SOURCE || process.env.MAIN_GAME_SOURCE_ID || "";
+}
 function getSourcesConfig() {
     if (cachedSources) return cachedSources;
-    cachedSources = [buildZoneSource(), ...buildManifestSources()];
+    const sources = [buildZoneSource(), ...buildManifestSources()];
+    const mainId = getMainGameSourceId();
+    if (mainId) {
+        const idx = sources.findIndex((s) => s.id === mainId);
+        if (idx > 0) {
+            const [main] = sources.splice(idx, 1);
+            sources.unshift(main);
+        } else if (idx === -1) {
+            console.warn(`gameSources: MAIN_GAME_SOURCE "${mainId}" does not match any configured source id - ignoring`);
+        }
+    }
+    for (const s of sources) s.main = s.id === mainId;
+
+    cachedSources = sources;
+
     return cachedSources;
 }
 function getSource(sourceId) {
@@ -123,6 +281,38 @@ async function fetchWithRetry(url, opts = {}, retries = 1) {
         }
     }
     throw lastErr;
+}
+async function fetchResolvedFileUrl(source, fileUrl, rest, { fromOrigin = false } = {}) {
+    let anchor;
+    try {
+        anchor = new URL(fileUrl);
+    } catch (e) {
+        throw Object.assign(new Error("Bad Path"), { status: 400 });
+    }
+    const resolveBase = fromOrigin ? anchor.origin + "/" : anchor;
+    let target;
+    try {
+        target = rest ? new URL(rest, resolveBase) : new URL(resolveBase);
+    } catch (e) {
+        throw Object.assign(new Error("Bad Path"), { status: 400 });
+    }
+    if (target.protocol !== "https:" && target.protocol !== "http:") {
+        throw Object.assign(new Error("Bad Path"), { status: 400 });
+    }
+    const fetchUrl = target.toString();
+    try {
+        const upstream = await fetchWithRetry(fetchUrl, {
+            redirect: "follow",
+            headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameProxy/1.0)" },
+        }, 1);
+        if (!upstream.ok && upstream.status !== 304) {
+            throw Object.assign(new Error("Upstream Error"), { status: upstream.status });
+        }
+        return { upstream, fetchUrl };
+    } catch (e) {
+        if (e.status) throw e;
+        throw Object.assign(new Error(e.message || "Proxy Error"), { status: 502 });
+    }
 }
 function getHostForBase(base) {
     try {
@@ -196,15 +386,43 @@ function injectHead(html, extra) {
     }
     return extra + html;
 }
+function injectHeadStart(html, extra) {
+    const headOpenMatch = html.match(/<head[^>]*>/i);
+    if (headOpenMatch) {
+        const idx = headOpenMatch.index + headOpenMatch[0].length;
+        return html.slice(0, idx) + extra + html.slice(idx);
+    }
+    const htmlOpenMatch = html.match(/<html[^>]*>/i);
+    if (htmlOpenMatch) {
+        const idx = htmlOpenMatch.index + htmlOpenMatch[0].length;
+        return html.slice(0, idx) + `<head>${extra}</head>` + html.slice(idx);
+    }
+    return extra + html;
+}
 function injectBaseTag(html, baseHref) {
     if (/<base(?=[\s/>])/i.test(html)) return html;
-    return injectHead(html, `<base href="${baseHref}">`);
+    return injectHeadStart(html, `<base href="${baseHref}">`);
 }
-function injectCustomCss(html) {
-    return injectHead(html, `
+function rewriteRootRelativeUrls(content, basePath, rootBasePath) {
+    const rootPrefixRaw = rootBasePath || basePath;
+    const rootPrefix = rootPrefixRaw.endsWith("/") ? rootPrefixRaw.slice(0, -1) : rootPrefixRaw;
+    let result = content.replace(
+        /((?:src|href|action|poster)\s*=\s*)(["'])\/(?!\/)/gi,
+        (m, attr, quote) => `${attr}${quote}${rootPrefix}/`
+    );
+    result = result.replace(
+        /url\(\s*(["']?)\/(?!\/)/gi,
+        (m, quote) => `url(${quote}${rootPrefix}/`
+    );
+    return result;
+}
+function injectCustomCss(html, css) {
+    const styleBlock = css ? `
         <style id="ic-zone-game-style">
-        ${CUSTOM_GAME_CSS}
-        </style>
+        ${css}
+        </style>` : "";
+    return injectHead(html, `
+        ${styleBlock}
         <script>
         (() => {
             function applyMaxHeight() {
@@ -248,13 +466,36 @@ function gamesJsonPath(__dirname, sourceId) {
 function hiddenJsonPath(__dirname, sourceId) {
     return path.join(sourceDir(__dirname, sourceId), "hidden.json");
 }
-function ensureSourceFiles(__dirname, sourceId) {
+function seedJsonPath(__dirname, sourceId) {
+    return path.join(sourceDir(__dirname, sourceId), "seed.json");
+}
+function readSeedJSON(__dirname, sourceId) {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(seedJsonPath(__dirname, sourceId), "utf8"));
+        if (!Array.isArray(parsed)) {
+            errlog(sourceId, "data/games/" + sourceId + "/seed.json is not a JSON array - ignoring, treating as empty");
+            return [];
+        }
+        return parsed;
+    } catch (e) {
+        errlog(sourceId, "could not read data/games/" + sourceId + "/seed.json -", e.message, "- treating this source as empty until a seed file is added");
+        return [];
+    }
+}
+function ensureSourceFiles(__dirname, sourceId, kind) {
     const dir = sourceDir(__dirname, sourceId);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     const gamesPath = gamesJsonPath(__dirname, sourceId);
     if (!fs.existsSync(gamesPath)) fs.writeFileSync(gamesPath, JSON.stringify({}, null, 2));
     const hiddenPath = hiddenJsonPath(__dirname, sourceId);
     if (!fs.existsSync(hiddenPath)) fs.writeFileSync(hiddenPath, JSON.stringify([], null, 2));
+    if (kind === "dated") {
+        const seedPath = seedJsonPath(__dirname, sourceId);
+        if (!fs.existsSync(seedPath)) {
+            fs.writeFileSync(seedPath, JSON.stringify([], null, 2));
+            console.warn(`gameSources: created empty data/games/${sourceId}/seed.json - paste the raw games array in there for source "${sourceId}" (there is no remote URL for this source kind)`);
+        }
+    }
 }
 function loadHiddenJSON(__dirname, sourceId) {
     try {
@@ -267,11 +508,15 @@ function loadHiddenJSON(__dirname, sourceId) {
 function saveHiddenJSON(__dirname, sourceId, hidden) {
     fs.writeFileSync(hiddenJsonPath(__dirname, sourceId), JSON.stringify(hidden.map(String).filter(Boolean), null, 2));
 }
-function loadGamesJSON(__dirname, sourceId) {
+function loadGamesJSON(__dirname, sourceId, _retried) {
+    const p = gamesJsonPath(__dirname, sourceId);
     try {
-        return JSON.parse(fs.readFileSync(gamesJsonPath(__dirname, sourceId), "utf8"));
-    } catch {
-        return {};
+        return JSON.parse(fs.readFileSync(p, "utf8"));
+    } catch (e) {
+        if (e.code === "ENOENT") return {};
+        if (!_retried) return loadGamesJSON(__dirname, sourceId, true);
+        errlog(sourceId, "games.json exists but failed to parse after retry -", e.message, "- refusing to treat it as empty");
+        throw e;
     }
 }
 function saveGamesJSON(__dirname, sourceId, games) {
@@ -288,7 +533,10 @@ function saveGamesJSON(__dirname, sourceId, games) {
     zoneEntries.sort((a, b) => a[2] - b[2]);
     const merged = { ...nonZone };
     for (const [key, val] of zoneEntries) merged[key] = val;
-    fs.writeFileSync(gamesJsonPath(__dirname, sourceId), JSON.stringify(merged, null, 2));
+    const finalPath = gamesJsonPath(__dirname, sourceId);
+    const tmpPath = `${finalPath}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmpPath, JSON.stringify(merged, null, 2));
+    fs.renameSync(tmpPath, finalPath);
 }
 function getHiddenIdSet(__dirname, sourceId, games) {
     let hidden = loadHiddenJSON(__dirname, sourceId);
@@ -321,6 +569,29 @@ function isValidManifestGame(g) {
         g.url.trim().length > 0
     );
 }
+function isValidDatedGame(g) {
+    return (
+        g &&
+        typeof g === "object" &&
+        typeof g.name === "string" &&
+        g.name.trim().length > 0 &&
+        typeof g.date === "number" &&
+        Number.isFinite(g.date) &&
+        g.date > 0
+    );
+}
+function encodeDatedId(dateMs) {
+    return Math.trunc(dateMs).toString(36);
+}
+function resolveDatedFile(fileField, source, id) {
+    if (typeof fileField !== "string" || !fileField.trim()) return null;
+    const trimmed = fileField.trim();
+    if (trimmed.startsWith("/games")) {
+        if (!source.bases || !source.bases.length) return null;
+        return new URL(`g/${encodeURIComponent(id)}/`, source.bases[0] + "/").toString();
+    }
+    return trimmed;
+}
 function hashId(str) {
     let h = 5381;
     for (let i = 0; i < str.length; i++) {
@@ -343,6 +614,11 @@ async function fetchRawFeed(source) {
             const json = await res.json();
             if (source.kind === "zone") {
                 if (!Array.isArray(json)) throw new Error("Invalid Zone Feed Format (expected array)");
+                log(source.id, "feed fetch OK from", url, "entries:", json.length);
+                return json;
+            }
+            if (source.kind === "dated") {
+                if (!Array.isArray(json)) throw new Error("Invalid Dated Feed Format (expected array, no zones.json wrapper)");
                 log(source.id, "feed fetch OK from", url, "entries:", json.length);
                 return json;
             }
@@ -398,6 +674,59 @@ function buildManifestList(entries, games) {
         };
     });
 }
+function frameTypeForGameType(gameType) {
+    const normalized = typeof gameType === "string" ? gameType.trim().toLowerCase() : "";
+    if (normalized === "flash") return "swf";
+    if (normalized === "dos") return "jsdos";
+    return "iframe";
+}
+function parseDatedAddedDate(g) {
+    if (typeof g.date_iso === "string" && g.date_iso.trim()) {
+        const parsed = Date.parse(g.date_iso);
+        if (Number.isFinite(parsed)) return parsed;
+    }
+    return Date.now();
+}
+function buildDatedList(entries, games, source) {
+    const valid = entries.filter(isValidDatedGame);
+    return valid.map((g) => {
+        const id = encodeDatedId(g.date);
+        const isNew = !games[id];
+        if (isNew) {
+            games[id] = {
+                popularity: 0,
+                dateAdded: parseDatedAddedDate(g),
+            };
+        }
+        const stored = games[id];
+        stored.name = g.name;
+        stored.desc = typeof g.desc === "string" && g.desc.trim() ? g.desc.trim() : null;
+        stored.user = typeof g.user === "string" && g.user.trim() ? g.user.trim() : "Anonymous";
+        stored.gameType = typeof g.type === "string" && g.type.trim() ? g.type.trim() : null;
+        stored.frameType = frameTypeForGameType(stored.gameType);
+        stored.tags = typeof g.tags === "string" && g.tags.trim() ? g.tags.trim() : null;
+        const resolvedFile = resolveDatedFile(g.file, source, id);
+        if (resolvedFile) stored.file = resolvedFile;
+        else if (typeof stored.file === "undefined") stored.file = null;
+        const resolvedThumbnail = typeof g.thumbnail === "string" && g.thumbnail.trim() ? g.thumbnail.trim() : null;
+        if (resolvedThumbnail) stored.thumbnail = resolvedThumbnail;
+        else if (typeof stored.thumbnail === "undefined") stored.thumbnail = null;
+        stored.sourceDate = g.date;
+        games[id] = stored;
+        return {
+            id,
+            name: g.name,
+            author: stored.user,
+            authorLink: null,
+            desc: stored.desc,
+            gameType: stored.gameType,
+            hasThumbnail: true,
+            frameType: "dated",
+            popularity: stored.popularity || 0,
+            dateAdded: stored.dateAdded || null,
+        };
+    });
+}
 const feedCache = new Map();
 const inFlightFetch = new Map();
 const refreshTimers = new Map();
@@ -434,9 +763,12 @@ function startRefreshLoop(source, deps) {
 }
 async function mergeSourceIntoGamesJSON(source, deps) {
     const { __dirname } = deps;
-    const raw = await refreshRawFeed(source);
+    const raw = source.kind === "dated" ? readSeedJSON(__dirname, source.id) : await refreshRawFeed(source);
     const games = loadGamesJSON(__dirname, source.id);
-    const list = source.kind === "zone" ? buildZoneList(raw, games) : buildManifestList(raw, games);
+    const list =
+        source.kind === "zone" ? buildZoneList(raw, games) :
+        source.kind === "dated" ? buildDatedList(raw, games, source) :
+        buildManifestList(raw, games);
     games._list = list;
     saveGamesJSON(__dirname, source.id, games);
     log(source.id, "merged", list.length, "games into", `data/games/${source.id}/games.json`);
@@ -445,7 +777,7 @@ async function mergeSourceIntoGamesJSON(source, deps) {
 export async function initZoneGames(deps) {
     const sources = getSourcesConfig();
     for (const source of sources) {
-        ensureSourceFiles(deps.__dirname, source.id);
+        ensureSourceFiles(deps.__dirname, source.id, source.kind);
         try {
             await mergeSourceIntoGamesJSON(source, deps);
             log(source.id, "startup feed fetch + merge succeeded");
@@ -478,10 +810,9 @@ function requireSource(req, res) {
 export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
     const sources = getSourcesConfig();
-    for (const source of sources) ensureSourceFiles(__dirname, source.id);
-
+    for (const source of sources) ensureSourceFiles(__dirname, source.id, source.kind);
     app.get("/game-sources", (req, res) => {
-        res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name })) });
+        res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name, main: !!s.main })) });
     });
     app.get("/games/popular", async (req, res) => {
         res.setHeader("Cache-Control", "public, max-age=60, stale-while-revalidate=300");
@@ -646,6 +977,12 @@ export function attachZoneGameRoutes(app, deps) {
                 const z = zones.find((z) => String(z.id) === id && isValidZoneGame(z));
                 if (!z) return res.status(404).send("Not Found");
                 thumbUrl = `${source.coverBase}/${encodeURIComponent(id)}.png`;
+            } else if (source.kind === "dated") {
+                const games = loadGamesJSON(__dirname, source.id);
+                const entry = games[id];
+                if (!entry) return res.status(404).send("Not Found");
+                if (!source.bases.length) return res.status(404).send("Not Found");
+                thumbUrl = new URL(`p/${encodeURIComponent(id)}`, source.bases[0] + "/").toString();
             } else {
                 const games = loadGamesJSON(__dirname, source.id);
                 const entry = games[id];
@@ -667,18 +1004,101 @@ export function attachZoneGameRoutes(app, deps) {
             res.setHeader("Content-Type", contentType.startsWith("image/") ? contentType : "image/png");
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=604800, stale-while-revalidate=2592000, immutable");
-            const buf = Buffer.from(await upstream.arrayBuffer());
-            res.send(buf);
+            pipeUpstream(upstream, res);
         } catch (e) {
             errlog(source.id, "thumbnail FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
         }
+    });
+    app.get("/games/:sourceId/:id/_root{/*rest}", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        const id = req.params.id;
+        const rest = Array.isArray(req.params.rest) ? req.params.rest.join("/") : req.params.rest || "";
+        log(source.id, "GET", `/games/${source.id}/${id}/_root${rest ? "/" + rest : ""}`, "from", req.ip);
+        try {
+            let upstream;
+            if (source.kind === "zone") {
+                if (!/^\d+$/.test(id)) return res.status(404).send("Not Found");
+                if (!source.gameBases || !source.gameBases.length) return res.status(404).send("Not Found");
+                try {
+                    ({ upstream } = await fetchFromBases(source, source.gameBases, (base) => {
+                        const target = rest ? new URL(rest, base + "/") : new URL(base + "/");
+                        return { target, fetchUrl: target.toString() };
+                    }));
+                } catch (e) {
+                    const status = e.status || 502;
+                    const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                    return res.status(status).send(msg);
+                }
+            } else {
+                const games = loadGamesJSON(__dirname, source.id);
+                const entry = games[id];
+                if (!entry) return res.status(404).send("Not Found");
+                const anchor = source.kind === "dated" ? entry.file : entry.url;
+                try {
+                    if (anchor) {
+                        ({ upstream } = await fetchResolvedFileUrl(source, anchor, rest, { fromOrigin: true }));
+                    } else if (source.bases && source.bases.length) {
+                        ({ upstream } = await fetchFromBases(source, source.bases, (base) => {
+                            const target = rest ? new URL(rest, base + "/") : new URL(base + "/");
+                            return { target, fetchUrl: target.toString() };
+                        }));
+                    } else {
+                        return res.status(404).send("Not Found");
+                    }
+                } catch (e) {
+                    const status = e.status || 502;
+                    const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                    return res.status(status).send(msg);
+                }
+            }
+            const rootBasePath = `/games/${source.id}/${encodeURIComponent(id)}/_root/`;
+            const contentType = upstream.headers.get("content-type") || "application/octet-stream";
+            res.setHeader("X-Content-Type-Options", "nosniff");
+            res.setHeader("Cache-Control", "public, max-age=300");
+            if (contentType.includes("text/html")) {
+                const html = await upstream.text();
+                res.setHeader("Content-Type", "text/html; charset=utf-8");
+                const rewritten = rewriteRootRelativeUrls(html, rootBasePath, rootBasePath);
+                return res.send(injectBaseTag(rewritten, rootBasePath));
+            }
+            if (contentType.includes("text/css")) {
+                const css = await upstream.text();
+                res.setHeader("Content-Type", "text/css; charset=utf-8");
+                return res.send(rewriteRootRelativeUrls(css, rootBasePath, rootBasePath));
+            }
+            res.setHeader("Content-Type", contentType);
+            pipeUpstream(upstream, res);
+        } catch (e) {
+            errlog(source.id, "_root asset proxy FAILED for id", id, "rest", rest, "-", e.stack || e.message);
+            if (!res.headersSent) res.status(502).send("Proxy Error");
+        }
+    });
+    app.get("/games/:sourceId/:id/inline", async (req, res) => {
+        const source = requireSource(req, res);
+        if (!source) return;
+        if (source.kind !== "dated") {
+            return res.status(404).json({ ok: false, error: "Not A Dated Game Source" });
+        }
+        const id = req.params.id;
+        const games = loadGamesJSON(__dirname, source.id);
+        const entry = games[id];
+        if (!entry || !entry.file) {
+            return res.status(404).json({ ok: false, error: "Not Found" });
+        }
+        if (detectEmulatorKind(entry)) {
+            return res.status(404).json({ ok: false, error: "Not An Inlineable HTML Document" });
+        }
+        res.json({ ok: true, dataUri: buildEmbedRedirectDataUri(entry.file) });
     });
     app.get("/games/:sourceId/:id{/*rest}", async (req, res) => {
         const source = requireSource(req, res);
         if (!source) return;
         const id = req.params.id;
         const rest = Array.isArray(req.params.rest) ? req.params.rest.join("/") : req.params.rest || "";
+        const isRawAssetRequest = rest === "__raw__";
+        const effectiveRest = isRawAssetRequest ? "" : rest;
         log(source.id, "GET", `/games/${source.id}/${id}${rest ? "/" + rest : ""}`, "from", req.ip);
         try {
             let upstream, fetchUrl, basePath;
@@ -702,35 +1122,123 @@ export function attachZoneGameRoutes(app, deps) {
                     return res.status(status).send(msg);
                 }
                 basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
-            } else {
+            } else if (source.kind === "dated") {
                 const games = loadGamesJSON(__dirname, source.id);
                 const entry = games[id];
-                if (!entry || !entry.url) return res.status(404).send("Not Found");
+                if (!entry) return res.status(404).send("Not Found");
+                if (!rest) {
+                    const emulatorKind = detectEmulatorKind(entry);
+                    if (emulatorKind) {
+                        let mediaUrl = `/games/${source.id}/${encodeURIComponent(id)}/__raw__`;
+                        if (entry.file) {
+                            try {
+                                mediaUrl = await buildEmulatorDataUri(source, id, entry, emulatorKind);
+                            } catch (e) {
+                                log(source.id, "data URI inlining failed for id", id, "- falling back to proxy URL:", e.message);
+                            }
+                        }
+                        res.setHeader("Content-Type", "text/html; charset=utf-8");
+                        res.setHeader("Cache-Control", "no-store");
+                        return res.send(buildEmulatorWrapperHtml(emulatorKind, mediaUrl));
+                    }
+                }
                 try {
-                    ({ upstream, fetchUrl } = await fetchFromBases(source, source.bases, (base) => {
-                        const target = rest ? new URL(rest, new URL(entry.url, base + "/")) : new URL(entry.url, base + "/");
-                        return { target, fetchUrl: target.toString() };
-                    }));
+                    if (entry.file) {
+                        try {
+                            ({ upstream, fetchUrl } = await fetchResolvedFileUrl(source, entry.file, effectiveRest));
+                        } catch (e) {
+                            if (effectiveRest && e.status === 404) {
+                                ({ upstream, fetchUrl } = await fetchResolvedFileUrl(source, entry.file, effectiveRest, { fromOrigin: true }));
+                            } else {
+                                throw e;
+                            }
+                        }
+                    } else {
+                        ({ upstream, fetchUrl } = await fetchFromBases(source, source.bases, (base) => {
+                            const gameRoot = new URL(`g/${encodeURIComponent(id)}/`, base + "/");
+                            const target = effectiveRest ? new URL(effectiveRest, gameRoot) : gameRoot;
+                            return { target, fetchUrl: target.toString() };
+                        }));
+                    }
                 } catch (e) {
                     const status = e.status || 502;
                     const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
                     return res.status(status).send(msg);
                 }
                 basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
+            } else if (source.id === "source3" && rest === "main.js") {
+                const localPath = path.join(sourceDir(__dirname, source.id), "main.js");
+                let buf;
+                try {
+                    buf = fs.readFileSync(localPath);
+                } catch (e) {
+                    errlog(source.id, "local main.js not found at", localPath, "-", e.message);
+                    return res.status(404).send("Not Found");
+                }
+                res.setHeader("Content-Type", "application/javascript; charset=utf-8");
+                res.setHeader("X-Content-Type-Options", "nosniff");
+                res.setHeader("Cache-Control", "public, max-age=300");
+                return res.send(buf);
+            } else {
+                const games = loadGamesJSON(__dirname, source.id);
+                const entry = games[id];
+                if (!entry || !entry.url) return res.status(404).send("Not Found");
+                if (!rest) {
+                    const emulatorKind = detectEmulatorKind(entry);
+                    if (emulatorKind) {
+                        res.setHeader("Content-Type", "text/html; charset=utf-8");
+                        res.setHeader("Cache-Control", "no-store");
+                        return res.send(buildEmulatorWrapperHtml(
+                            emulatorKind,
+                            `/games/${source.id}/${encodeURIComponent(id)}/__raw__`
+                        ));
+                    }
+                }
+                try {
+                    ({ upstream, fetchUrl } = await fetchFromBases(source, source.bases, (base) => {
+                        const target = effectiveRest ? new URL(effectiveRest, new URL(entry.url, base + "/")) : new URL(entry.url, base + "/");
+                        return { target, fetchUrl: target.toString() };
+                    }));
+                } catch (e) {
+                    if (effectiveRest && e.status === 404) {
+                        try {
+                            ({ upstream, fetchUrl } = await fetchFromBases(source, source.bases, (base) => {
+                                const origin = new URL(entry.url, base + "/").origin + "/";
+                                const target = new URL(effectiveRest, origin);
+                                return { target, fetchUrl: target.toString() };
+                            }));
+                        } catch (e2) {
+                            const status = e2.status || 502;
+                            const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                            return res.status(status).send(msg);
+                        }
+                    } else {
+                        const status = e.status || 502;
+                        const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
+                        return res.status(status).send(msg);
+                    }
+                }
+                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
             }
+            const rootBasePath = `/games/${source.id}/${encodeURIComponent(id)}/_root/`;
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=300");
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                const withBase = injectBaseTag(html, basePath);
-                const finalHtml = source.kind === "zone" ? injectCustomCss(withBase) : withBase;
+                const rewritten = rewriteRootRelativeUrls(html, basePath, rootBasePath);
+                const withBase = injectBaseTag(rewritten, basePath);
+                const finalHtml = injectCustomCss(withBase, source.customCss);
                 return res.send(finalHtml);
             }
+            if (contentType.includes("text/css")) {
+                const css = await upstream.text();
+                res.setHeader("Content-Type", "text/css; charset=utf-8");
+                return res.send(rewriteRootRelativeUrls(css, basePath, rootBasePath));
+            }
             res.setHeader("Content-Type", contentType);
-            const buf = Buffer.from(await upstream.arrayBuffer());
-            res.send(buf);
+            pipeUpstream(upstream, res);
         } catch (e) {
             errlog(source.id, "games proxy FAILED for id", id, "-", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
@@ -763,11 +1271,16 @@ export function attachZoneGameRoutes(app, deps) {
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                return res.send(injectCustomCss(injectBaseTag(html, "/commits/")));
+                const rewritten = rewriteRootRelativeUrls(html, "/commits/");
+                return res.send(injectCustomCss(injectBaseTag(rewritten, "/commits/"), zoneSource.customCss));
             }
-            const buf = Buffer.from(await upstream.arrayBuffer());
+            if (contentType.includes("text/css")) {
+                const css = await upstream.text();
+                res.setHeader("Content-Type", "text/css; charset=utf-8");
+                return res.send(rewriteRootRelativeUrls(css, "/commits/"));
+            }
             res.setHeader("Content-Type", contentType);
-            res.send(buf);
+            pipeUpstream(upstream, res);
         } catch (e) {
             errlog(zoneSource.id, "commits FAILED -", e.stack || e.message);
             if (!res.headersSent) res.status(502).send("Proxy Error");
