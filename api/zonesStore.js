@@ -469,13 +469,20 @@ function hiddenJsonPath(__dirname, sourceId) {
 function seedJsonPath(__dirname, sourceId) {
     return path.join(sourceDir(__dirname, sourceId), "seed.json");
 }
+const seedJsonCache = new Map();
 function readSeedJSON(__dirname, sourceId) {
+    const p = seedJsonPath(__dirname, sourceId);
     try {
-        const parsed = JSON.parse(fs.readFileSync(seedJsonPath(__dirname, sourceId), "utf8"));
+        const stat = fs.statSync(p);
+        const cached = seedJsonCache.get(sourceId);
+        if (cached && cached.mtimeMs === stat.mtimeMs) return cached.data;
+        const parsed = JSON.parse(fs.readFileSync(p, "utf8"));
         if (!Array.isArray(parsed)) {
             errlog(sourceId, "data/games/" + sourceId + "/seed.json is not a JSON array - ignoring, treating as empty");
+            seedJsonCache.set(sourceId, { mtimeMs: stat.mtimeMs, data: [] });
             return [];
         }
+        seedJsonCache.set(sourceId, { mtimeMs: stat.mtimeMs, data: parsed });
         return parsed;
     } catch (e) {
         errlog(sourceId, "could not read data/games/" + sourceId + "/seed.json -", e.message, "- treating this source as empty until a seed file is added");
@@ -508,12 +515,20 @@ function loadHiddenJSON(__dirname, sourceId) {
 function saveHiddenJSON(__dirname, sourceId, hidden) {
     fs.writeFileSync(hiddenJsonPath(__dirname, sourceId), JSON.stringify(hidden.map(String).filter(Boolean), null, 2));
 }
+const gamesJsonCache = new Map();
 function loadGamesJSON(__dirname, sourceId, _retried) {
+    if (gamesJsonCache.has(sourceId)) return gamesJsonCache.get(sourceId);
     const p = gamesJsonPath(__dirname, sourceId);
     try {
-        return JSON.parse(fs.readFileSync(p, "utf8"));
+        const parsed = JSON.parse(fs.readFileSync(p, "utf8"));
+        gamesJsonCache.set(sourceId, parsed);
+        return parsed;
     } catch (e) {
-        if (e.code === "ENOENT") return {};
+        if (e.code === "ENOENT") {
+            const empty = {};
+            gamesJsonCache.set(sourceId, empty);
+            return empty;
+        }
         if (!_retried) return loadGamesJSON(__dirname, sourceId, true);
         errlog(sourceId, "games.json exists but failed to parse after retry -", e.message, "- refusing to treat it as empty");
         throw e;
@@ -537,6 +552,7 @@ function saveGamesJSON(__dirname, sourceId, games) {
     const tmpPath = `${finalPath}.${process.pid}.${Date.now()}.tmp`;
     fs.writeFileSync(tmpPath, JSON.stringify(merged, null, 2));
     fs.renameSync(tmpPath, finalPath);
+    gamesJsonCache.set(sourceId, merged);
 }
 function getHiddenIdSet(__dirname, sourceId, games) {
     let hidden = loadHiddenJSON(__dirname, sourceId);

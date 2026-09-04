@@ -113,6 +113,7 @@ const PRIVATE_MEDIA_CHANNEL_ID = process.env.PRIVATE_MEDIA_CHANNEL_ID || null;
 const GROUP_MEDIA_CHANNEL_ID = process.env.GROUP_MEDIA_CHANNEL_ID || null;
 const URL_VISIT_CHANNEL_ID = process.env.URL_VISIT_CHANNEL_ID || null;
 const URL_FORWARD_CHANNEL_ID = process.env.URL_FORWARD_CHANNEL_ID || null;
+const POLL_ANNOUNCE_UID = process.env.SYSTEM_UID || null;
 const urlEntryIndex = new Map();
 (function primeUrlEntryIndex() {
     try {
@@ -4626,6 +4627,165 @@ async function bridgeEditToDiscord(channelName, timestamp, newText, senderUid) {
         console.error("Failed To Edit Discord Mirror Message:", e.message);
     }
 }
+const POLL_MIN_DURATION_MS = 60 * 1000;
+const POLL_MAX_DURATION_MS = 14 * 24 * 60 * 60 * 1000;
+const POLL_MAX_ANSWERS = 10;
+function stripPollMarkdownLinks(text) {
+    return String(text || "").replace(/\[([^\[\]]*)\]\(([^)]*)\)/g, "$1");
+}
+function computePollResults(poll) {
+    const voterSet = new Set();
+    const counts = {};
+    for (const ans of poll.answers) {
+        counts[ans.id] = ans.votes ? Object.keys(ans.votes).length : 0;
+        for (const uid of Object.keys(ans.votes || {})) voterSet.add(uid);
+    }
+    const totalVoters = voterSet.size;
+    let max = 0;
+    for (const ans of poll.answers) if (counts[ans.id] > max) max = counts[ans.id];
+    const winners = max > 0 ? poll.answers.filter(a => counts[a.id] === max).map(a => a.text) : [];
+    return { totalVoters, counts, winners };
+}
+async function endPoll(channelName, ts, msgEntry, dataJson) {
+    const poll = msgEntry?.poll;
+    if (!poll || poll.ended) return;
+    poll.ended = true;
+    poll.endedAt = Date.now();
+    broadcastUpdate(["messages", channelName, String(ts)], msgEntry);
+    const results = computePollResults(poll);
+    const creatorProfile = dataJson?.users?.[msgEntry.s]?.profile || {};
+    const creatorName = creatorProfile.displayName || "A User";
+    const winnerText = results.winners.length
+        ? results.winners.map(stripPollMarkdownLinks).join(" & ")
+        : "Nobody (No Votes Were Cast)";
+    const pollQuestion = stripPollMarkdownLinks(poll.question || "");
+    const announceText = `${creatorName}'s Website Poll "${pollQuestion}" Has Ended. The Winner Was ${winnerText}!`;
+    dataJson.messages[channelName] = dataJson.messages[channelName] || {};
+    let announceTs = String(Date.now());
+    while (dataJson.messages[channelName][announceTs]) announceTs = String(Number(announceTs) + 1);
+    const announceMsg = { s: POLL_ANNOUNCE_UID, t: announceText, timestamp: Number(announceTs) };
+    dataJson.messages[channelName][announceTs] = announceMsg;
+    saveData(dataJson);
+    broadcastUpdate(["messages", channelName, announceTs], announceMsg);
+    try {
+        const discordMsgId = await bridgeWebsiteMsgToDiscord(channelName, POLL_ANNOUNCE_UID, announceText, null);
+        if (discordMsgId) setMirrorId(channelName, announceTs, discordMsgId);
+    } catch (e) {
+        console.error("[Polls] Failed To Bridge Poll End Announcement To Discord:", e.message);
+    }
+}
+async function sweepExpiredPolls() {
+    try {
+        const dataJson = getDataCache();
+        const now = Date.now();
+        for (const [channelName, msgs] of Object.entries(dataJson.messages || {})) {
+            for (const [ts, msgEntry] of Object.entries(msgs || {})) {
+                if (msgEntry?.type === "poll" && msgEntry.poll && !msgEntry.poll.ended && msgEntry.poll.endsAt <= now) {
+                    await endPoll(channelName, ts, msgEntry, dataJson);
+                }
+            }
+        }
+    } catch (e) {
+        console.error("[Polls] Sweep Error:", e.message);
+    }
+}
+function startPollSweep() {
+    sweepExpiredPolls();
+    setInterval(sweepExpiredPolls, 15000);
+}
+app.post("/poll/create", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const dataJson = getDataCache();
+        const profile = dataJson?.users?.[uid]?.profile || {};
+        const isAdminUser = !!(profile.isOwner || profile.isCoOwner || profile.isAdmin || profile.isHAdmin || profile.isTester);
+        if (!isAdminUser) return res.status(403).json({ error: "Only Admins Can Create Polls." });
+        if (DISCORD_CHAT_LOCKDOWN) {
+            return res.status(423).json({ error: "The Chat Is Currently Locked Down." });
+        }
+        const channelName = req.body?.channel;
+        if (!channelName || typeof channelName !== "string" || !dataJson.channels?.[channelName]) {
+            return res.status(400).json({ error: "Invalid Channel." });
+        }
+        const question = String(req.body?.question || "").trim().slice(0, 300);
+        if (!question) return res.status(400).json({ error: "Poll Must Have A Question." });
+        let rawAnswers = Array.isArray(req.body?.answers) ? req.body.answers : [];
+        rawAnswers = rawAnswers.map(a => String(a || "").trim().slice(0, 200)).filter(Boolean);
+        if (rawAnswers.length < 2) return res.status(400).json({ error: "Poll Needs At Least 2 Answers." });
+        if (rawAnswers.length > POLL_MAX_ANSWERS) {
+            return res.status(400).json({ error: `Poll Can Have At Most ${POLL_MAX_ANSWERS} Answers.` });
+        }
+        const multi = !!req.body?.multi;
+        const allowChangeVote = !!req.body?.allowChangeVote;
+        let durationMs = Number(req.body?.durationMs) || POLL_MIN_DURATION_MS;
+        durationMs = Math.min(Math.max(durationMs, POLL_MIN_DURATION_MS), POLL_MAX_DURATION_MS);
+        const createdAt = Date.now();
+        dataJson.messages[channelName] = dataJson.messages[channelName] || {};
+        let ts = String(createdAt);
+        while (dataJson.messages[channelName][ts]) ts = String(Number(ts) + 1);
+        const poll = {
+            question,
+            answers: rawAnswers.map((text, i) => ({ id: `a${i}`, text, votes: {} })),
+            multi,
+            allowChangeVote,
+            createdAt,
+            endsAt: createdAt + durationMs,
+            ended: false,
+            endedAt: null
+        };
+        const msgObj = { s: uid, t: "", type: "poll", timestamp: Number(ts), poll };
+        dataJson.messages[channelName][ts] = msgObj;
+        saveData(dataJson);
+        broadcastUpdate(["messages", channelName, ts], msgObj);
+        res.json({ success: true, id: ts, message: msgObj });
+    } catch (err) {
+        console.error("[Polls] Create Error:", err);
+        res.status(500).json({ error: "Failed To Create Poll." });
+    }
+});
+app.post("/poll/vote", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const channelName = req.body?.channel;
+        const id = req.body?.id != null ? String(req.body.id) : null;
+        let answerIds = Array.isArray(req.body?.answerIds) ? req.body.answerIds.map(String) : [];
+        if (!channelName || !id) return res.status(400).json({ error: "Invalid Poll." });
+        const dataJson = getDataCache();
+        const msgEntry = dataJson?.messages?.[channelName]?.[id];
+        if (!msgEntry || msgEntry.type !== "poll" || !msgEntry.poll) {
+            return res.status(404).json({ error: "Poll Not Found." });
+        }
+        const poll = msgEntry.poll;
+        if (poll.ended || Date.now() >= poll.endsAt) {
+            if (!poll.ended) await endPoll(channelName, id, msgEntry, dataJson);
+            return res.status(400).json({ error: "This Poll Has Ended.", ended: true });
+        }
+        const validIds = new Set(poll.answers.map(a => a.id));
+        answerIds = [...new Set(answerIds)].filter(a => validIds.has(a));
+        if (!answerIds.length) return res.status(400).json({ error: "Select At Least One Answer." });
+        if (!poll.multi && answerIds.length > 1) answerIds = [answerIds[0]];
+        const hasExistingVote = poll.answers.some(a => a.votes && a.votes[uid]);
+        if (hasExistingVote && !poll.allowChangeVote) {
+            return res.status(403).json({ error: "You Have Already Voted On This Poll." });
+        }
+        for (const ans of poll.answers) {
+            if (ans.votes && ans.votes[uid]) delete ans.votes[uid];
+        }
+        for (const ansId of answerIds) {
+            const ans = poll.answers.find(a => a.id === ansId);
+            if (ans) {
+                ans.votes = ans.votes || {};
+                ans.votes[uid] = true;
+            }
+        }
+        saveData(dataJson);
+        broadcastUpdate(["messages", channelName, id], msgEntry);
+        res.json({ success: true, message: msgEntry });
+    } catch (err) {
+        console.error("[Polls] Vote Error:", err);
+        res.status(500).json({ error: "Failed To Submit Vote." });
+    }
+});
 async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTimestamp) {
     if (DISCORD_CHAT_LOCKDOWN) return null;
     const discordChannelId = DISCORD_CHANNEL_MAP[channelName];
@@ -8065,6 +8225,7 @@ setupSocketHandlers(ioRealtime, "REALTIME");
 scheduleDailyClear();
 restoreApplicantMessages();
 watchForNewUsers();
+startPollSweep();
 (async () => {
     await runInitialDiscordSync();
     if (!discordGatewayActive) {
