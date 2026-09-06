@@ -2160,9 +2160,9 @@ app.post("/admin/restart", verifyFirebaseToken, async (req, res) => {
             }
         }
         const runRestart = () => {
-            console.log(`[admin/restart] Running pm2 restart 0 (triggered by ${uid})`);
-            execProm("pm2 restart 0").catch(err => {
-                console.error("[admin/restart] pm2 restart 0 failed:", err.message);
+            console.log(`[admin/restart] Running pm2 restart 10 (triggered by ${uid})`);
+            execProm("pm2 restart 10").catch(err => {
+                console.error("[admin/restart] pm2 restart 10 failed:", err.message);
             });
         };
         if (activeAccepts.length > 0) {
