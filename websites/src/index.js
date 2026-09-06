@@ -179,8 +179,12 @@ const apiWsProxy = httpProxy.createProxyServer({
     secure: true,
 });
 apiWsProxy.on("error", (err, req, socket) => {
-    console.error("API WS Proxy Error:", err.message);
-    if (socket && socket.writable) socket.end();
+    console.error("API WS Proxy Error:", err.code || err.message);
+    if (socket && !socket.destroyed) {
+        try {
+            socket.end();
+        } catch {}
+    }
 });
 function verifySignature(req) {
     const sig = req.headers["x-hub-signature-256"];
@@ -302,6 +306,11 @@ function scheduleDailyLogClear() {
 const fastify = Fastify({
     serverFactory: (handler) => {
         return createServer()
+        .on("connection", (socket) => {
+            socket.setMaxListeners(30);
+            socket.on("error", (err) => {
+            });
+        })
         .on("request", (req, res) => {
             res.setHeader("Access-Control-Allow-Origin", "*");
             res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
@@ -314,6 +323,12 @@ const fastify = Fastify({
             handler(req, res);
         })
         .on("upgrade", (req, socket, head) => {
+            socket.setMaxListeners(30);
+            socket.on("error", (err) => {
+                try {
+                    if (!socket.destroyed) socket.destroy();
+                } catch {}
+            });
             if (req.url.endsWith("/wisp/")) {
                 wisp.routeRequest(req, socket, head);
             } else if (req.url === "/api" || req.url.startsWith("/api/")) {
@@ -630,6 +645,12 @@ function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("uncaughtException", (err) => {
+    if (err && (err.code === "EPIPE" || err.code === "ECONNRESET")) {
+        return;
+    }
+    process.exit(1);
+});
 scheduleDailyLogClear();
 await loadBlockedUrls();
 await cloneOrPullRepo().catch((err) => console.error("Initial Sync Failed:", err));
