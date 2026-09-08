@@ -387,7 +387,6 @@ export function startAttachmentRefreshLoop({ discordRequestForce, getDataCache, 
         const attachments = loadAttachments();
         const keys = Object.keys(attachments);
         if (keys.length === 0) return;
-        console.log(`[AttachmentTracker] Health check: verifying ${keys.length} attachment(s)...`);
         const toRefresh = new Map();
         for (const [key, rec] of Object.entries(attachments)) {
             if (!rec.currentUrl) continue;

@@ -621,7 +621,6 @@ function zoneKey(id) {
 async function fetchRawFeed(source) {
     let lastErr = null;
     for (const url of source.manifestUrls) {
-        log(source.id, "fetching feed from", url);
         try {
             const res = await fetchWithTimeout(url, {
                 headers: { "User-Agent": "Mozilla/5.0 (compatible; InfiniteCampusGameFeedFetch/1.0)" },
@@ -630,20 +629,17 @@ async function fetchRawFeed(source) {
             const json = await res.json();
             if (source.kind === "zone") {
                 if (!Array.isArray(json)) throw new Error("Invalid Zone Feed Format (expected array)");
-                log(source.id, "feed fetch OK from", url, "entries:", json.length);
                 return json;
             }
             if (source.kind === "dated") {
                 if (!Array.isArray(json)) throw new Error("Invalid Dated Feed Format (expected array, no zones.json wrapper)");
-                log(source.id, "feed fetch OK from", url, "entries:", json.length);
                 return json;
             }
             const games = Array.isArray(json?.games) ? json.games : null;
             if (!games) throw new Error("Invalid Manifest Feed Format (expected { games: [...] })");
-            log(source.id, "feed fetch OK from", url, "entries:", games.length);
             return games;
         } catch (e) {
-            log(source.id, "feed fetch FAILED from", url, "-", e.message);
+            errlog(source.id, "feed fetch FAILED from", url, "-", e.message);
             lastErr = e;
         }
     }
@@ -787,7 +783,6 @@ async function mergeSourceIntoGamesJSON(source, deps) {
         buildManifestList(raw, games);
     games._list = list;
     saveGamesJSON(__dirname, source.id, games);
-    log(source.id, "merged", list.length, "games into", `data/games/${source.id}/games.json`);
     return list;
 }
 export async function initZoneGames(deps) {
@@ -796,7 +791,6 @@ export async function initZoneGames(deps) {
         ensureSourceFiles(deps.__dirname, source.id, source.kind);
         try {
             await mergeSourceIntoGamesJSON(source, deps);
-            log(source.id, "startup feed fetch + merge succeeded");
         } catch (e) {
             errlog(source.id, "startup feed fetch FAILED -", e.message, "- serving existing games.json (if any) until the next refresh succeeds");
         }
@@ -845,7 +839,6 @@ export function attachZoneGameRoutes(app, deps) {
             }
             combined.sort((a, b) => (b.popularity || 0) - (a.popularity || 0));
             const top = combined.slice(0, 5);
-            log("popular", "serving top", top.length, "popular games out of", combined.length, "total");
             res.json({ ok: true, games: top });
         } catch (e) {
             errlog("popular", "top games FAILED -", e.stack || e.message);

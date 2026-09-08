@@ -559,7 +559,6 @@ app.use((req, res, next) => {
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // attachGameAssetFallback(app, { __dirname });
 attachZoneGameRoutes(app, { __dirname });
-initZoneGames({ __dirname }).catch((e) => console.error("initZoneGames failed:", e));
 app.use(express.static(path.join(__dirname, "public")));
 app.use(requireAdminPassword);
 attachGameRoutes(app, {
@@ -5905,7 +5904,6 @@ async function syncDiscordHistory(channelName, discordChannelId) {
     }
     const state = discordBridgeState[channelName] || {};
     if (state.synced) return;
-    console.log(`[DiscordBridge] Syncing history for #${channelName}`);
     let lastId = null;
     let totalNew = 0;
     let fetchMore = true;
@@ -5939,7 +5937,6 @@ async function syncDiscordHistory(channelName, discordChannelId) {
                 for (const [wts, wEntry] of Object.entries(_syncMsgs)) {
                     if (wEntry?.discordid === String(discordMsg.id)) {
                         setMirrorId(channelName, wts, discordMsg.id);
-                        mirrorIdsDirty = true;
                         break;
                     }
                 }
@@ -6053,11 +6050,6 @@ async function syncDiscordHistory(channelName, discordChannelId) {
     await syncPinnedMessages(channelName, discordChannelId, data);
     _dataCache = data;
     saveData(data);
-    if (totalNew > 0) {
-        console.log(`Synced ${totalNew} New Messages For #${channelName}`);
-    } else {
-        console.log(`No New Messages For #${channelName}`);
-    }
     discordBridgeState[channelName] = { synced: true };
 }
 async function syncPinnedMessages(channelName, discordChannelId, data) {
@@ -6101,7 +6093,6 @@ async function syncPinnedMessages(channelName, discordChannelId, data) {
         };
     }
     data.pinned[channelName] = pinnedObj;
-    console.log(`Synced ${pinnedMessages.length} Pinned Messages For #${channelName}`);
 }
 function findWebsiteMirrorEntry(channelName, discordMsgId, data) {
     const msgs = data?.messages?.[channelName] || {};
@@ -7709,7 +7700,6 @@ function startDiscordGateway() {
                     } catch {}
                     entry.r = resolvedReplyTs;
                 }
-                console.log(channelName);
                 if (botSentDiscordIds.has(d.id)) {
                     discordMsgIdToTimestamp[d.id] = { channel: channelName, timestamp: ts };
                     const _mirrorData = getDataCache();
@@ -7842,7 +7832,9 @@ function startDiscordGateway() {
             }
         });
         ws.on("close", (code) => {
-            console.warn("[DiscordGateway] Connection closed, code:", code);
+            if (code !== 1005) {
+                console.warn("[DiscordGateway] Connection closed, code:", code);
+            }
             if (gatewayHeartbeatInterval) { clearInterval(gatewayHeartbeatInterval); gatewayHeartbeatInterval = null; }
             const nonResumableCodes = new Set([4004, 4010, 4011, 4012, 4013, 4014]);
             if (nonResumableCodes.has(code)) {
@@ -8228,6 +8220,8 @@ watchForNewUsers();
 startPollSweep();
 (async () => {
     await runInitialDiscordSync();
+    await initZoneGames({ __dirname }).catch((e) => console.error("initZoneGames failed:", e));
+    console.log("Server Has Completed Startup");
     if (!discordGatewayActive) {
         startDiscordGateway()
         discordGatewayActive = true;
