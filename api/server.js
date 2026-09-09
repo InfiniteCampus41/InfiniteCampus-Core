@@ -36,6 +36,7 @@ import * as Bans from "./bansstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const IS_DEV_MODE = process.argv.includes("--dev") || process.env.DEV === "true" || process.env.NODE_ENV === "development";
 const UPLOADS_TEMP_DIR = path.join(DATA_ROOT, "movies", "apply", "uploads_temp");
 const UPLOADS_DIR = path.join(DATA_ROOT, "uploads");
 const UNIQUE_SUFFIX = "x9a7b2";
@@ -199,7 +200,6 @@ const ioRealtime = new IOServer(httpServer, {
     }
 });
 let lastCreateTime = 0;
-let _listFilesInterval = null;
 let liveInterval = null;
 let liveMode = false;
 let LOCKDOWN = false;
@@ -304,7 +304,29 @@ const server = httpServer.listen(PORT, () => {
     httpServer.setTimeout(0);
     httpServer.keepAliveTimeout = 0;
     httpServer.headersTimeout = 0;
-    mainMenu();
+    if (IS_DEV_MODE) {
+        import("./dev.js").then(({ initDevCli }) => {
+            initDevCli({
+                rl,
+                admin,
+                getDataCache,
+                readDataPath,
+                _getPushTokensForUser,
+                logEvent,
+                pruneInvalidTokens,
+                UPLOADS_DIR,
+                AUTO_DELETE_MS,
+                formatBytes,
+                getUploadLogs: () => uploadLogs,
+                getActiveLinks: () => activeLinks,
+                getRateLimitLogs: () => rateLimitLogs,
+                getLockdown: () => LOCKDOWN,
+                setLockdown: (v) => { LOCKDOWN = v; },
+            });
+        }).catch((e) => console.error("Failed To Load Dev CLI:", e));
+    } else {
+        console.log("Run With -- --dev To Access Testing Tools (e.g. npm start -- --dev).");
+    }
 });
 const sessions = new Map();
 const SQUARE_SIGNATURE_KEY = process.env.SQUARE_WEBHOOK_SIGNATURE_KEY;
@@ -4402,31 +4424,6 @@ process.on("uncaughtException", (err) => {
 process.on("unhandledRejection", (reason, promise) => {
     console.error("[FATAL] Unhandled Rejection:", reason && reason.stack || reason);
 });
-rl.on("line", (input) => {
-    const trimmed = input.trim();
-    {
-        switch (trimmed) {
-            case "1":
-                listFilesLive();
-                break;
-            case "2":
-                deleteFilePrompt();
-                break;
-            case "3":
-                toggleLockdown();
-                break;
-            case "4":
-                console.log("Exiting...");
-                rl.close();
-                process.exit(0);
-                break;
-            default:
-                console.log("Invalid Choice");
-                mainMenu();
-        }
-    }
-});
-rl.setPrompt("> ");
 wss.on("connection", async (ws, req) => {
     try {
         const url = new URL(req.url, `http://${req.headers.host}`);
@@ -4783,6 +4780,37 @@ app.post("/poll/vote", verifyFirebaseToken, requireNotBanned, rateLimit("write")
     } catch (err) {
         console.error("[Polls] Vote Error:", err);
         res.status(500).json({ error: "Failed To Submit Vote." });
+    }
+});
+app.post("/poll/remove-vote", verifyFirebaseToken, requireNotBanned, rateLimit("write"), async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const channelName = req.body?.channel;
+        const id = req.body?.id != null ? String(req.body.id) : null;
+        if (!channelName || !id) return res.status(400).json({ error: "Invalid Poll." });
+        const dataJson = getDataCache();
+        const msgEntry = dataJson?.messages?.[channelName]?.[id];
+        if (!msgEntry || msgEntry.type !== "poll" || !msgEntry.poll) {
+            return res.status(404).json({ error: "Poll Not Found." });
+        }
+        const poll = msgEntry.poll;
+        if (poll.ended || Date.now() >= poll.endsAt) {
+            if (!poll.ended) await endPoll(channelName, id, msgEntry, dataJson);
+            return res.status(400).json({ error: "This Poll Has Ended.", ended: true });
+        }
+        const hasExistingVote = poll.answers.some(a => a.votes && a.votes[uid]);
+        if (!hasExistingVote) {
+            return res.status(400).json({ error: "You Haven't Voted On This Poll." });
+        }
+        for (const ans of poll.answers) {
+            if (ans.votes && ans.votes[uid]) delete ans.votes[uid];
+        }
+        saveData(dataJson);
+        broadcastUpdate(["messages", channelName, id], msgEntry);
+        res.json({ success: true, message: msgEntry });
+    } catch (err) {
+        console.error("[Polls] Remove Vote Error:", err);
+        res.status(500).json({ error: "Failed To Remove Vote." });
     }
 });
 async function bridgeWebsiteMsgToDiscord(channelName, senderUid, text, replyTimestamp) {
@@ -5184,6 +5212,48 @@ async function _getPushTokensForUser(uid) {
     const tokenMap = data?.notifications?.[uid]?.tokens || {};
     return dedupeTokensByDevice(tokenMap);
 }
+const INVALID_FCM_TOKEN_ERROR_CODES = new Set([
+    "messaging/registration-token-not-registered",
+    "messaging/invalid-registration-token",
+    "messaging/invalid-argument",
+]);
+const STALE_TOKEN_MAX_AGE_MS = 300 * 24 * 60 * 60 * 1000; // 300 Days
+/**
+ * Cleans up push tokens after a send attempt: removes tokens FCM reports as
+ * dead/invalid, and bumps the `ts` of tokens that succeeded so they're
+ * recognized as still-active (dedupeTokensByDevice And The Stale-Token Sweep
+ * Both Rely On `ts`).
+ * @param {string[]} tokens - The token array passed to sendEachForMulticast, in order.
+ * @param {import("firebase-admin/messaging").BatchResponse} response
+ * @param {string|Object} resolveUid - Either a single uid (all tokens belong to one user)
+ *   or a { [token]: uid } map when tokens span multiple users (e.g. admin broadcasts).
+ */
+function pruneInvalidTokens(tokens, response, resolveUid) {
+    if (!response?.responses) return;
+    const data = getDataCache();
+    let removedTotal = 0;
+    let dirty = false;
+    response.responses.forEach((r, i) => {
+        const token = tokens[i];
+        const uid = typeof resolveUid === "string" ? resolveUid : resolveUid?.[token];
+        if (!uid) return;
+        const tokenMap = data?.notifications?.[uid]?.tokens;
+        if (!tokenMap || !tokenMap[token]) return;
+        if (r.success) {
+            if (typeof tokenMap[token] === "object") {
+                tokenMap[token].ts = Date.now();
+                dirty = true;
+            }
+        } else if (INVALID_FCM_TOKEN_ERROR_CODES.has(r.error?.code)) {
+            delete tokenMap[token];
+            removedTotal++;
+            dirty = true;
+        }
+    });
+    if (dirty) saveData(data);
+    if (removedTotal > 0) console.log(`[Push] Removed ${removedTotal} Invalid/Expired Token(s).`);
+}
+
 async function grantPremium(uid, amount) {
     try {
         if (amount >= 200) {
@@ -5600,13 +5670,14 @@ async function sendDMNotification(targetUid, senderUid, text) {
         const url = `/InfiniteChatters.html?dm=${encodeURIComponent(senderUid)}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
-            notification: {
+            data: {
+                type: "dm",
                 title: `DM From ${senderName}`,
-                body:  preview
-            },
-            data: { type: "dm", url, senderUid },
-            webpush: { fcmOptions: { link: url } }
-        });
+                body: preview,
+                url,
+                senderUid
+            }
+        }).then((response) => pruneInvalidTokens(tokens, response, targetUid));
         logEvent("notifications", {
             id: `dm_${Date.now()}`,
             data: { type: "dm", to: targetUid, from: senderUid }
@@ -5631,13 +5702,15 @@ async function sendMentionNotification(targetUid, senderUid, channel, msgId, tex
         const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
-            notification: {
+            data: {
+                type: "mention",
                 title: `${senderName} Mentioned You`,
-                body:  preview
-            },
-            data: { type: "mention", url, channel: channel || "", msgId: String(msgId) },
-            webpush: { fcmOptions: { link: url } }
-        });
+                body: preview,
+                url,
+                channel: channel || "",
+                msgId: String(msgId)
+            }
+        }).then((response) => pruneInvalidTokens(tokens, response, targetUid));
         logEvent("notifications", {
             id: `mention_${Date.now()}`,
             data: { type: "mention", to: targetUid, from: senderUid, channel: channel || "", msgId: String(msgId) }
@@ -5661,13 +5734,15 @@ async function sendReactionNotification(targetUid, reactorUid, emoji, channel, m
         const url = `/InfiniteChatters.html?channel=${encodeURIComponent(channel || "General")}#msg-${msgId}`;
         await admin.messaging().sendEachForMulticast({
             tokens,
-            notification: {
+            data: {
+                type: "reaction",
                 title: "New Reaction",
-                body:  `${reactorName} Reacted ${emoji} To Your Message`
-            },
-            data: { type: "reaction", url, channel: channel || "", msgId: String(msgId) },
-            webpush: { fcmOptions: { link: url } }
-        });
+                body: `${reactorName} Reacted ${emoji} To Your Message`,
+                url,
+                channel: channel || "",
+                msgId: String(msgId)
+            }
+        }).then((response) => pruneInvalidTokens(tokens, response, targetUid));
         logEvent("notifications", {
             id: `reaction_${Date.now()}`,
             data: { type: "reaction", to: targetUid, from: reactorUid, emoji, channel: channel || "", msgId: String(msgId) }
@@ -5693,10 +5768,15 @@ async function sendReplyNotification(targetUid, senderUid, senderDisplayName, ch
             : "Someone Replied To You";
         await admin.messaging().sendEachForMulticast({
             tokens,
-            notification: { title, body: preview },
-            data: { type: "reply", url, channel: channel || "", msgId: String(msgId) },
-            webpush: { fcmOptions: { link: url } }
-        });
+            data: {
+                type: "reply",
+                title,
+                body: preview,
+                url,
+                channel: channel || "",
+                msgId: String(msgId)
+            }
+        }).then((response) => pruneInvalidTokens(tokens, response, targetUid));
         logEvent("notifications", {
             id: `reply_${Date.now()}`,
             data: { type: "reply", to: targetUid, from: senderUid || senderDisplayName, channel: channel || "", msgId: String(msgId) }
@@ -5727,15 +5807,19 @@ async function sendTemplatedEmail(templateName, toEmail, subject, vars = {}) {
         throw err;
     }
 }
-const VERIFY_NOTIFICATION_ICON = "/icons/shield-check.svg";
 async function sendVerificationNotification(uid, displayName) {
     const _svData = getDataCache();
     const tokens = [];
+    const tokenOwners = {};
     for (const [user, userData] of Object.entries(_svData.users || {})) {
         const profile = userData?.profile || {};
-        if (profile.isOwner || profile.isTester || profile.isCoOwner || profile.isDev) {
+        if (isStaffProfile(profile) || profile.isDev) {
+            const settings = _svData?.notifications?.[user]?.settings || {};
+            if (settings.newSignups === false) continue;
             const pushTokens = _svData?.notifications?.[user]?.tokens || {};
-            tokens.push(...dedupeTokensByDevice(pushTokens));
+            const deduped = dedupeTokensByDevice(pushTokens);
+            for (const t of deduped) tokenOwners[t] = user;
+            tokens.push(...deduped);
         }
     }
     if (tokens.length === 0) {
@@ -5747,33 +5831,17 @@ async function sendVerificationNotification(uid, displayName) {
     const message = {
         data: {
             type: "verifyUser",
+            title: "A New User Has Signed Up!",
+            body: `User ${displayName} Is Awaiting Verification`,
             uid: uid,
             url: `/InfiniteAdmins.html?chat=true`,
             verifyUrl,
             tag
         },
-        notification: {
-            title: "A New User Has Signed Up!",
-            body: `User ${displayName} Is Awaiting Verification`
-        },
-        tokens: tokens,
-        webpush: {
-            fcmOptions: { link: `/InfiniteAdmins.html?chat=true` },
-            notification: {
-                title: "A New User Has Signed Up!",
-                body: `User ${displayName} Is Awaiting Verification`,
-                icon: VERIFY_NOTIFICATION_ICON,
-                tag,
-                renotify: true,
-                actions: [
-                    { action: "verify", title: "Verify User" },
-                    { action: "dismiss", title: "Dismiss" }
-                ],
-                data: { type: "verifyUser", uid, verifyUrl, tag }
-            }
-        }
+        tokens: tokens
     };
     const response = await admin.messaging().sendEachForMulticast(message);
+    pruneInvalidTokens(tokens, response, tokenOwners);
     console.log("Verification Notification Sent.");
     console.log("Success:", response.successCount);
     logEvent("notifications", {
@@ -6423,20 +6491,6 @@ function deleteApply(movieName) {
     delete data[movieName];
     saveApplyJSON(data);
 }
-function deleteFilePrompt() {
-    const files = fs.readdirSync(UPLOADS_DIR).filter((f) => fs.statSync(path.join(UPLOADS_DIR, f)).isFile());
-    if (files.length === 0) return console.log("No Files To Delete."), mainMenu();
-    console.log("\nAvailable Files:");
-    files.forEach((f, i) => console.log(`${i + 1}. ${f}`));
-    rl.question("Enter Number To Delete: ", (num) => {
-        const idx = parseInt(num) - 1;
-        if (!isNaN(idx) && files[idx]) {
-            fs.unlinkSync(path.join(UPLOADS_DIR, files[idx]));
-            console.log(`Deleted ${files[idx]}`);
-        }
-        mainMenu();
-    });
-}
 function deleteMirrorId(channelName, timestamp) {
     delete mirrorIdMap[`${channelName}:${timestamp}`];
 }
@@ -6737,59 +6791,6 @@ function canBypassRestrictedChannel(profile) {
     const roles = computeProfileRoles(profile);
     return !!(roles.isAdmin || roles.isOwner || roles.isCoOwner || roles.isHAdmin || roles.isTester || roles.isDev || roles.premium2 || roles.premium3);
 }
-function listFilesLive() {
-    if (_listFilesInterval) clearInterval(_listFilesInterval);
-    const renderList = () => {
-        const files = fs.readdirSync(UPLOADS_DIR).filter((f) => fs.statSync(path.join(UPLOADS_DIR, f)).isFile());
-        const lines = [];
-        lines.push(`LIVE FILE LIST (${files.length} Files)`);
-        lines.push("───────────────────────────────────────────────────────────────────────");
-        if (uploadLogs.length > 0) {
-            lines.push("Recent Upload Logs:");
-            const lastUploadLogs = uploadLogs.slice(-10);
-            for (const l of lastUploadLogs) lines.push("  " + l.message);
-            lines.push("───────────────────────────────────────────────────────────────────────");
-        }
-        if (activeLinks.length > 0) {
-            lines.push("Download Links:");
-            const lastLinks = activeLinks.slice(-10);
-            for (const l of lastLinks) lines.push("  " + l.url);
-            lines.push("───────────────────────────────────────────────────────────────────────");
-        }
-        if (rateLimitLogs.length > 0) {
-            lines.push("Rate-Limit / Queue Logs:");
-            const lastRateLogs = rateLimitLogs.slice(-10);
-            for (const l of lastRateLogs) lines.push("  " + l.message);
-            lines.push("───────────────────────────────────────────────────────────────────────");
-        }
-        if (files.length === 0) {
-            lines.push("No Files Uploaded.");
-        } else {
-            lines.push(" # | File Name                     | Size     | Age(s) | Deletes In(s)");
-            lines.push("───┼───────────────────────────────┼──────────┼────────┼──────────────");
-            files.forEach((file, i) => {
-                let stats;
-                try {
-                    stats = fs.statSync(path.join(UPLOADS_DIR, file));
-                } catch {
-                    return null;
-                }
-                const age = Math.floor((Date.now() - stats.birthtimeMs) / 1000);
-                const remain = Math.max(0, Math.floor((AUTO_DELETE_MS - (Date.now() - stats.birthtimeMs)) / 1000));
-                const size = formatBytes(stats.size).padEnd(8);
-                const name = file.length > 30 ? file.slice(0, 27) + ".." : file.padEnd(30);
-                lines.push(`${String(i + 1).padEnd(2)} | ${name} | ${size} | ${String(age).padEnd(6)} | ${remain}`);
-            });
-        }
-        lines.push("───────────────────────────────────────────────────────────────────────");
-        lines.push("Type A File Number To Get A Download Link,");
-        lines.push("Type DELETE # To Delete A File,");
-        lines.push("Type MENU To Return To The Main Menu.");
-        renderScreen(lines);
-    };
-    _listFilesInterval = setInterval(renderList, 1000);
-    renderList();
-}
 function listMovies() {
     const moviesJson = loadMoviesJSON();
     const files = fs.readdirSync(MOVIES_DIR).filter((f) => {
@@ -6946,38 +6947,6 @@ function logEvent(eventType, eventData) {
     }
     saveReportJSON(report);
 }
-function mainMenu() {
-    if (_listFilesInterval) {
-        clearInterval(_listFilesInterval);
-        _listFilesInterval = null;
-    }
-    console.log("\n FILE SERVER MENU");
-    console.log("1  Files");
-    console.log("2  Delete A File");
-    console.log("3  Lockdown (Currently: " + (LOCKDOWN ? "ON" : "OFF") + ")");
-    console.log("4  Exit");
-    rl.question("Choose An Option: ", (a) => {
-        switch (a.trim()) {
-            case "1":
-                listFilesLive();
-                break;
-            case "2":
-                deleteFilePrompt();
-                break;
-            case "3":
-                toggleLockdown();
-                break;
-            case "4":
-                console.log("Exiting...");
-                rl.close();
-                console.clear();
-                process.exit(0);
-            default:
-                console.log("Invalid Choice");
-                mainMenu();
-        }
-    });
-}
 function markExpiredTokens() {
     const logs = loadAccLogs();
     const now = Date.now();
@@ -7082,15 +7051,6 @@ function renderPinnedAccept() {
     readline.cursorTo(process.stdout, 0, 0);
     readline.clearLine(process.stdout, 0);
     process.stdout.write([...pinnedAcceptLines.values()].join(" | "));
-    readline.cursorTo(process.stdout, prompt.length + currentInput.length);
-}
-function renderScreen(lines) {
-    const currentInput = rl.line || "";
-    const prompt = rl.getPrompt() || "> ";
-    readline.cursorTo(process.stdout, 0, 0);
-    readline.clearScreenDown(process.stdout);
-    for (const ln of lines) process.stdout.write(ln + "\n");
-    process.stdout.write(prompt + currentInput);
     readline.cursorTo(process.stdout, prompt.length + currentInput.length);
 }
 function requireAdminForChannel(req, res, allowedSet, channelId) {
@@ -7876,11 +7836,6 @@ function startDiscordGateway() {
     }
     connect();
 }
-function toggleLockdown() {
-    LOCKDOWN = !LOCKDOWN;
-    console.log(LOCKDOWN ? "Uploads Locked." : "Uploads Unlocked.");
-    mainMenu();
-}
 function updateApply(movieName, newData) {
     const data = loadApplyJSON();
     if (!data[movieName]) {
@@ -8212,6 +8167,31 @@ setInterval(() => {
         console.error("WAV Cleanup Job Error:", e.message);
     }
 }, 5 * 60 * 1000);
+setInterval(() => {
+    try {
+        const data = getDataCache();
+        const notifications = data?.notifications || {};
+        const now = Date.now();
+        let removedTotal = 0;
+        let dirty = false;
+        for (const [uid, entry] of Object.entries(notifications)) {
+            const tokenMap = entry?.tokens;
+            if (!tokenMap) continue;
+            for (const [token, meta] of Object.entries(tokenMap)) {
+                const ts = (meta && typeof meta === "object" && typeof meta.ts === "number") ? meta.ts : 0;
+                if (now - ts > STALE_TOKEN_MAX_AGE_MS) {
+                    delete tokenMap[token];
+                    removedTotal++;
+                    dirty = true;
+                }
+            }
+        }
+        if (dirty) saveData(data);
+        if (removedTotal > 0) console.log(`[Push] Stale Token Sweep Removed ${removedTotal} Token(s) Unused For 300+ Days.`);
+    } catch (e) {
+        console.error("Stale Token Sweep Error:", e.message);
+    }
+}, 24 * 60 * 60 * 1000);
 setupSocketHandlers(ioLive, "LIVE");
 setupSocketHandlers(ioRealtime, "REALTIME");
 scheduleDailyClear();
