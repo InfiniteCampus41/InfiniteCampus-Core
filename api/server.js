@@ -2491,8 +2491,9 @@ app.post("/discord-channel-map", verifyFirebaseToken, async (req, res) => {
 });
 app.post("/discordVerify", verifyFirebaseToken, async (req, res) => {
     try {
-        const { username, uid } = req.body;
-        if (!username || !uid) {
+        const uid = req.user.uid;
+        const { username } = req.body;
+        if (!username) {
             return res.status(400).json({ error: "Missing Username Or Uid" });
         }
         const GUILD_ID = process.env.DISCORD_GUILD_ID;
