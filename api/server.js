@@ -3559,13 +3559,18 @@ app.post("/partners/create", verifyFirebaseToken, async (req, res) => {
         const partnerName = typeof req.body?.name === "string" ? req.body.name.trim() : "";
         const link = typeof req.body?.link === "string" ? req.body.link.trim() : "";
         const desc = typeof req.body?.desc === "string" ? req.body.desc.trim() : "";
+        const color1 = typeof req.body?.color1 === "string" ? req.body.color1.trim() : "";
+        const color2 = typeof req.body?.color2 === "string" ? req.body.color2.trim() : "";
+        const noUser = req.body?.noUser === true;
         if (!targetUid || !partnerName) {
             return res.status(400).json({ error: "Missing Partner UID Or Name" });
         }
         updateDataPath(`partners/${targetUid}`, {
-            [partnerName]: { link, photo: "", desc }
+            [partnerName]: { link, photo: "", desc, color1, color2 }
         });
-        updateDataPath(`users/${targetUid}/profile`, { isPartner: true });
+        if (!noUser) {
+            updateDataPath(`users/${targetUid}/profile`, { isPartner: true });
+        }
         res.json({ success: true });
     } catch (err) {
         console.error("Partner Create Error:", err.message);

@@ -83,7 +83,9 @@ export function loadPartnersShape() {
             partners[p.uid][p.name] = {
                 desc: data.desc ?? null,
                 link: data.link ?? null,
-                photo: data.photo ?? null
+                photo: data.photo ?? null,
+                color1: data.color1 ?? null,
+                color2: data.color2 ?? null
             };
         }
     }
@@ -103,7 +105,9 @@ export function savePartnersShape(partners = {}) {
                     name,
                     desc: info?.desc ?? null,
                     link: info?.link ?? null,
-                    photo: info?.photo ?? null
+                    photo: info?.photo ?? null,
+                    color1: info?.color1 ?? null,
+                    color2: info?.color2 ?? null
                 });
             }
         }
