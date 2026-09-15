@@ -85,7 +85,6 @@ export function initDevCli(ctx) {
         _listFilesInterval = setInterval(renderList, 1000);
         renderList();
     }
-
     function deleteFilePrompt() {
         const files = fs.readdirSync(UPLOADS_DIR).filter((f) => fs.statSync(path.join(UPLOADS_DIR, f)).isFile());
         if (files.length === 0) return console.log("No Files To Delete."), mainMenu();
@@ -114,19 +113,21 @@ export function initDevCli(ctx) {
             return { uid, displayName: profile?.displayName || "Unknown User" };
         });
     }
-    async function sendTestNotificationToUser(uid, displayName) {
+    async function sendTestNotificationToUser(uid, displayName, customMessage) {
         try {
             const tokens = await _getPushTokensForUser(uid);
             if (!tokens.length) {
                 console.log(`${displayName} (${uid}) Has No Notifications Enabled. Skipped.`);
                 return { uid, sent: 0, failed: 0, skipped: true };
             }
+            const title = customMessage?.title || "Test Notification";
+            const body = customMessage?.body || `Hey ${displayName}, This Is A Test Notification Sent From The Server Terminal.`;
             const response = await admin.messaging().sendEachForMulticast({
                 tokens,
                 data: {
                     type: "test",
-                    title: "Test Notification",
-                    body: `Hey ${displayName}, This Is A Test Notification Sent From The Server Terminal.`,
+                    title,
+                    body,
                     url: "/InfiniteChatters.html?chat=true"
                 }
             });
@@ -149,37 +150,46 @@ export function initDevCli(ctx) {
             return mainMenu();
         }
         console.log("\nSend A Test Notification");
-        console.log("Users To Select From:");
-        users.forEach((u, i) => console.log(`${i + 1}: ${u.displayName} (${u.uid})`));
-        console.log("To Select A User, Enter Their Number, Displayname, Or Uid");
-        console.log("To Select All Users, Type ALL");
-        rl.question("> ", async (input) => {
-            const trimmed = input.trim();
-            if (!trimmed) {
-                console.log("No Selection Entered.");
-                return mainMenu();
-            }
-            if (trimmed.toUpperCase() === "ALL") {
-                for (const u of users) {
-                    await sendTestNotificationToUser(u.uid, u.displayName);
-                }
-                return mainMenu();
-            }
-            let target = null;
-            const asNum = parseInt(trimmed, 10);
-            if (!isNaN(asNum) && users[asNum - 1]) {
-                target = users[asNum - 1];
-            } else {
-                target = users.find(
-                    (u) => u.uid === trimmed || u.displayName.toLowerCase() === trimmed.toLowerCase()
-                );
-            }
-            if (!target) {
-                console.log("User Not Found.");
-                return mainMenu();
-            }
-            await sendTestNotificationToUser(target.uid, target.displayName);
-            mainMenu();
+        console.log("Enter A Custom Title (Leave Blank For Default: \"Test Notification\")");
+        rl.question("Title> ", (titleInput) => {
+            const title = titleInput.trim();
+            console.log("Enter A Custom Message Body (Leave Blank For Default Message)");
+            rl.question("Message> ", (bodyInput) => {
+                const body = bodyInput.trim();
+                const customMessage = (title || body) ? { title: title || undefined, body: body || undefined } : null;
+                console.log("\nUsers To Select From:");
+                users.forEach((u, i) => console.log(`${i + 1}: ${u.displayName} (${u.uid})`));
+                console.log("To Select A User, Enter Their Number, Displayname, Or Uid");
+                console.log("To Select All Users, Type ALL");
+                rl.question("> ", async (input) => {
+                    const trimmed = input.trim();
+                    if (!trimmed) {
+                        console.log("No Selection Entered.");
+                        return mainMenu();
+                    }
+                    if (trimmed.toUpperCase() === "ALL") {
+                        for (const u of users) {
+                            await sendTestNotificationToUser(u.uid, u.displayName, customMessage);
+                        }
+                        return mainMenu();
+                    }
+                    let target = null;
+                    const asNum = parseInt(trimmed, 10);
+                    if (!isNaN(asNum) && users[asNum - 1]) {
+                        target = users[asNum - 1];
+                    } else {
+                        target = users.find(
+                            (u) => u.uid === trimmed || u.displayName.toLowerCase() === trimmed.toLowerCase()
+                        );
+                    }
+                    if (!target) {
+                        console.log("User Not Found.");
+                        return mainMenu();
+                    }
+                    await sendTestNotificationToUser(target.uid, target.displayName, customMessage);
+                    mainMenu();
+                });
+            });
         });
     }
     function mainMenu() {
