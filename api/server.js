@@ -4995,6 +4995,26 @@ async function discordRequestForce({ method = "get", url, headers = {}, data = n
     };
     return enqueueDiscordRequest(config);
 }
+let _tmdbGenreMapCache = null;
+let _tmdbGenreMapCacheTime = 0;
+async function getTmdbGenreMap() {
+    const now = Date.now();
+    if (_tmdbGenreMapCache && (now - _tmdbGenreMapCacheTime) < 24 * 60 * 60 * 1000) {
+        return _tmdbGenreMapCache;
+    }
+    try {
+        const res = await fetch(`https://api.themoviedb.org/3/genre/movie/list?api_key=${TMDB_API_KEY}`);
+        const data = await res.json();
+        const map = {};
+        for (const g of (data.genres || [])) map[g.id] = g.name;
+        _tmdbGenreMapCache = map;
+        _tmdbGenreMapCacheTime = now;
+        return map;
+    } catch (err) {
+        console.error("Failed To Fetch TMDB Genre List:", err);
+        return _tmdbGenreMapCache || {};
+    }
+}
 async function findMovieId(movieName) {
     try {
         const searchRes = await fetch(
@@ -5002,7 +5022,7 @@ async function findMovieId(movieName) {
         );
         const searchData = await searchRes.json();
         if (!searchData.results || searchData.results.length === 0) {
-            return { id: null, cover: null, rating: null };
+            return { id: null, cover: null, rating: null, tags: [], releaseDate: null };
         }
         const bestMatch = searchData.results[0];
         let coverUrl = null;
@@ -5013,14 +5033,22 @@ async function findMovieId(movieName) {
         if (bestMatch.vote_average) {
             rating = Math.round((bestMatch.vote_average / 2) * 10) / 10;
         }
+        let tags = [];
+        if (Array.isArray(bestMatch.genre_ids) && bestMatch.genre_ids.length) {
+            const genreMap = await getTmdbGenreMap();
+            tags = bestMatch.genre_ids.map(id => genreMap[id]).filter(Boolean);
+        }
+        const releaseDate = bestMatch.release_date || null;
         return {
             id: bestMatch.id,
             cover: coverUrl,
-            rating: rating
+            rating: rating,
+            tags: tags,
+            releaseDate: releaseDate
         };
     } catch (err) {
         console.error(err);
-        return { id: null, cover: null, rating: null };
+        return { id: null, cover: null, rating: null, tags: [], releaseDate: null };
     }
 }
 async function finishAccept(movieName) {
@@ -5489,7 +5517,7 @@ async function resumeInProgressAccepts() {
                 const cleanName = idBasename.replace(/_\d+$/, "");
                 const tmdbData = await findMovieId(cleanName);
                 if (!moviesJson[baseName]) {
-                    moviesJson[baseName] = { order: getNextOrder(moviesJson), uploadedBy: uploaderUid, db_id: tmdbData.id || null, cover: tmdbData.cover || null, proxiedthumb: tmdbData.cover ? buildProxiedThumbPath(baseName) : null, rating: tmdbData.rating || null };
+                    moviesJson[baseName] = { order: getNextOrder(moviesJson), uploadedBy: uploaderUid, db_id: tmdbData.id || null, cover: tmdbData.cover || null, proxiedthumb: tmdbData.cover ? buildProxiedThumbPath(baseName) : null, rating: tmdbData.rating || null, tags: tmdbData.tags || [], releaseDate: tmdbData.releaseDate || null };
                     saveMoviesJSON(moviesJson);
                 }
                 acceptStatus.set(movieName, { status: "completed", percent: 100, remainingSec: 0, message: "Completed", updated: Date.now() });
@@ -6826,6 +6854,9 @@ function listMovies() {
             cover: moviesJson[f]?.cover || null,
             proxiedthumb: moviesJson[f]?.proxiedthumb || null,
             rating: moviesJson[f]?.rating || null,
+            tags: Array.isArray(moviesJson[f]?.tags) ? moviesJson[f].tags : [],
+            releaseDate: moviesJson[f]?.releaseDate || null,
+            releaseYear: moviesJson[f]?.releaseDate ? String(moviesJson[f].releaseDate).slice(0, 4) : null,
             subtitleUrl: moviesJson[f]?.subtitleUrl || null,
             popularity: moviesJson[f]?.popularity ?? 0
         };
@@ -7425,6 +7456,8 @@ function setupSocketHandlers(ioInstance, label) {
                             cover: tmdbData.cover || null,
                             proxiedthumb: tmdbData.cover ? buildProxiedThumbPath(baseName) : null,
                             rating: tmdbData.rating || null,
+                            tags: tmdbData.tags || [],
+                            releaseDate: tmdbData.releaseDate || null,
                             subtitleUrl: null
                         };
                         saveMoviesJSON(moviesJson);
