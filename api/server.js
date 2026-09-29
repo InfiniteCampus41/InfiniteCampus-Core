@@ -3806,6 +3806,9 @@ app.post("/beta/apply", verifyFirebaseToken, async (req, res) => {
             data: { type: "betaApplication", uid }
         });
         console.log(`[Beta] New Application From ${entry.displayName || uid} (${uid})`);
+        sendBetaApplicationNotification(uid, entry.displayName || "A User", reason).catch(e =>
+            console.error("Beta Application Notification Failed:", e.message)
+        );
         res.json({ success: true });
     } catch (err) {
         console.error("[Beta] apply error:", err.message);
@@ -6033,6 +6036,44 @@ async function sendVerificationNotification(uid, displayName) {
     logEvent("notifications", {
         id: `verify_${uid}_${Date.now()}`,
         data: { type: "verifyUser", uid, displayName }
+    });
+}
+async function sendBetaApplicationNotification(uid, displayName, reason = "") {
+    const _bnData = getDataCache();
+    const tokens = [];
+    const tokenOwners = {};
+    for (const [user, userData] of Object.entries(_bnData.users || {})) {
+        const profile = userData?.profile || {};
+        if (!canReviewBetaApplicants(profile)) continue;
+        const settings = _bnData?.notifications?.[user]?.settings || {};
+        if (settings.betaApplicants === false) continue;
+        const pushTokens = _bnData?.notifications?.[user]?.tokens || {};
+        const deduped = dedupeTokensByDevice(pushTokens);
+        for (const t of deduped) tokenOwners[t] = user;
+        tokens.push(...deduped);
+    }
+    if (tokens.length === 0) {
+        console.log("No Beta Reviewer Tokens Found.");
+        return;
+    }
+    const cleanReason = String(reason || "").replace(/\s+/g, " ").trim();
+    const preview = cleanReason.length > 100 ? cleanReason.slice(0, 97) + "..." : cleanReason;
+    const response = await admin.messaging().sendEachForMulticast({
+        data: {
+            type: "betaApplication",
+            title: "New Beta Application!",
+            body: preview ? `${displayName}: ${preview}` : `${displayName} Applied To Be A Beta Tester`,
+            uid: uid,
+            url: `/InfiniteAdmins.html?chat=true`,
+            tag: `beta-${uid}`
+        },
+        tokens: tokens
+    });
+    pruneInvalidTokens(tokens, response, tokenOwners);
+    console.log(`Beta Application Notification Sent. Success: ${response.successCount}`);
+    logEvent("notifications", {
+        id: `beta_${uid}_${Date.now()}`,
+        data: { type: "betaApplication", uid, displayName }
     });
 }
 async function startAcceptProcess(movieName, existingMessageId = null) {
