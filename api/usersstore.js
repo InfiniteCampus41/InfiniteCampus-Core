@@ -32,8 +32,8 @@ function writeJSON(file, data) {
 function userDir(uid) {
     return path.join(USERS_DIR, String(uid));
 }
-const ROLE_FIELDS = [
-    "isOwner", "isTester", "isCoOwner", "isHAdmin", "isAdmin", "isDev", "isUploader",
+export const ROLE_FIELDS = [
+    "isOwner", "isTester", "isBeta", "isCoOwner", "isHAdmin", "isAdmin", "isDev", "isUploader",
     "premium3", "premium2", "premium1", "mileStone", "isPartner", "verified", "isSus",
     "isDonater", "isGuesser", "isLink", "blocksi", "guardian", "lanschool", "linewize",
     "secure", "fortiguard", "lightspeed", "cisco", "contentkeeper", "deledao", "iboss",

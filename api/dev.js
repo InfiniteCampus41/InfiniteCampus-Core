@@ -19,6 +19,9 @@ export function initDevCli(ctx) {
         getRateLimitLogs,
         getLockdown,
         setLockdown,
+        sendTemplatedEmail,
+        EMAIL_TEMPLATES = [],
+        TEMPLATES_DIR,
     } = ctx;
     function renderScreen(lines) {
         const currentInput = rl.line || "";
@@ -192,6 +195,114 @@ export function initDevCli(ctx) {
             });
         });
     }
+    function listEmailTemplateNames() {
+        try {
+            return fs.readdirSync(TEMPLATES_DIR)
+                .filter((f) => f.toLowerCase().endsWith(".html"))
+                .map((f) => f.slice(0, -5))
+                .sort();
+        } catch {
+            return [];
+        }
+    }
+    function getAllUsersForEmail() {
+        const users = getDataCache()?.users || {};
+        return Object.keys(users).map((uid) => {
+            const profile = users[uid]?.profile || {};
+            const settings = users[uid]?.settings || {};
+            return { uid, displayName: profile.displayName || "Unknown User", email: settings.userEmail || profile.userEmail || "" };
+        });
+    }
+    function buildTestVars(templateName, user) {
+        const html = fs.readFileSync(path.join(TEMPLATES_DIR, `${templateName}.html`), "utf8");
+        const keys = [...new Set([...html.matchAll(/\{\{\s*([A-Za-z0-9_]+)\s*\}\}/g)].map((m) => m[1]))];
+        const defaults = {
+            DISPLAYNAME: user.displayName,
+            EMAIL: user.email,
+            EMAIL1: user.email,
+            EMAIL2: "new-email@example.com",
+            UID: user.uid || "TEST_UID",
+            TIER: "T3",
+            EXPIRE: "3 days, 4 hours",
+            LINK: "https://www.infinitecampus.xyz/InfiniteAccounts.html",
+            CODE: "123456",
+            OOBCODE: "TEST_OOB_CODE",
+            ACTION: "verifyEmail",
+        };
+        const vars = {};
+        for (const k of keys) vars[k] = defaults[k] ?? `TEST_${k}`;
+        return vars;
+    }
+    async function sendTestEmailTo(templateName, user) {
+        let email = user.email;
+        if (!email && user.uid) {
+            try {
+                email = (await admin.auth().getUser(user.uid)).email || "";
+            } catch {}
+        }
+        if (!email) {
+            console.log(`${user.displayName} (${user.uid}) Has No Email On File. Skipped.`);
+            return;
+        }
+        const meta = EMAIL_TEMPLATES.find((t) => t.id === templateName);
+        const subject = `[TEST] ${meta?.defaultSubject || templateName}`;
+        try {
+            const vars = buildTestVars(templateName, { ...user, email });
+            await sendTemplatedEmail(templateName, email, subject, vars);
+            console.log(`Sent "${templateName}" To ${user.displayName} <${email}>`);
+        } catch (err) {
+            console.error(`Failed To Send To ${email}:`, err.message);
+        }
+    }
+    function sendTestEmailPrompt() {
+        if (!sendTemplatedEmail || !TEMPLATES_DIR) {
+            console.log("Email Sending Is Not Available In This Build.");
+            return mainMenu();
+        }
+        const templates = listEmailTemplateNames();
+        if (!templates.length) {
+            console.log(`No Email Templates Found In ${TEMPLATES_DIR}`);
+            return mainMenu();
+        }
+        console.log("\nSend A Test Email");
+        console.log("Templates:");
+        templates.forEach((t, i) => console.log(`${i + 1}: ${t}`));
+        rl.question("Template (Number Or Name)> ", (tInput) => {
+            const tTrim = tInput.trim();
+            const tNum = parseInt(tTrim, 10);
+            const templateName = (!isNaN(tNum) && templates[tNum - 1]) || templates.find((t) => t.toLowerCase() === tTrim.toLowerCase());
+            if (!templateName) {
+                console.log("Template Not Found.");
+                return mainMenu();
+            }
+            const users = getAllUsersForEmail();
+            console.log("\nUsers To Select From:");
+            users.forEach((u, i) => console.log(`${i + 1}: ${u.displayName} (${u.uid})`));
+            console.log("To Select A User, Enter Their Number, Displayname, Or Uid");
+            console.log("To Send To Any Address, Type The Email Address Directly");
+            rl.question("Recipient> ", async (input) => {
+                const trimmed = input.trim();
+                if (!trimmed) {
+                    console.log("No Selection Entered.");
+                    return mainMenu();
+                }
+                if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
+                    const match = users.find((u) => u.email.toLowerCase() === trimmed.toLowerCase());
+                    await sendTestEmailTo(templateName, match || { uid: "", displayName: "Test User", email: trimmed });
+                    return mainMenu();
+                }
+                const asNum = parseInt(trimmed, 10);
+                const target = (!isNaN(asNum) && users[asNum - 1]) ||
+                    users.find((u) => u.uid === trimmed || u.displayName.toLowerCase() === trimmed.toLowerCase());
+                if (!target) {
+                    console.log("User Not Found.");
+                    return mainMenu();
+                }
+                await sendTestEmailTo(templateName, target);
+                mainMenu();
+            });
+        });
+    }
     function mainMenu() {
         if (_listFilesInterval) {
             clearInterval(_listFilesInterval);
@@ -203,6 +314,7 @@ export function initDevCli(ctx) {
         console.log("3  Lockdown (Currently: " + (getLockdown() ? "ON" : "OFF") + ")");
         console.log("4  Exit");
         console.log("5  Send Test Notification");
+        console.log("6  Send Test Email");
         rl.question("Choose An Option: ", (a) => {
             switch (a.trim()) {
                 case "1":
@@ -221,6 +333,9 @@ export function initDevCli(ctx) {
                     process.exit(0);
                 case "5":
                     sendTestNotificationPrompt();
+                    break;
+                case "6":
+                    sendTestEmailPrompt();
                     break;
                 default:
                     console.log("Invalid Choice");

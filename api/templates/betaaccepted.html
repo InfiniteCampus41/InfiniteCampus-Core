@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beta Application Accepted – Infinite Campus</title>
+    <style>
+        body { margin: 0; padding: 0; background-color: #0a0a0a; font-family: 'Segoe UI', Arial, sans-serif; color: #ffffff; }
+        .wrapper { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+        .card { background: linear-gradient(135deg, #111111 0%, #1a1a1a 100%); border: 1px solid #2a2a2a; border-radius: 16px; overflow: hidden; }
+        .header { background: linear-gradient(135deg, #0f4013 0%, #2e8023 50%, #0f4013 100%); padding: 40px 36px; text-align: center; position: relative; }
+        .header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 2px; background: linear-gradient(90deg, transparent, #44cc88, transparent); }
+        img { display: block; margin: 0 auto 20px; height:30px; border-radius:10px;}
+        .logo { font-size: 13px; font-weight: 700; letter-spacing: 3px; color: #44cc88; text-transform: uppercase; margin-bottom: 18px; opacity: 0.8; }
+        .header h1 { margin: 0; font-size: 28px; font-weight: 800; letter-spacing: -0.5px; }
+        .header h1 span { color: #44cc88; }
+        .header .subtitle { margin: 10px 0 0; color: #888; font-size: 14px; }
+        .body { padding: 36px; }
+        .greeting { font-size: 18px; font-weight: 600; margin-bottom: 12px; color: #f0f0f0; }
+        .message { color: #aaa; font-size: 15px; line-height: 1.7; margin-bottom: 28px; }
+        .info-box { background: #0e1a10; border: 1px solid #2b442a; border-radius: 10px; padding: 20px 24px; margin-bottom: 28px; }
+        .info-title { font-size: 11px; font-weight: 700; letter-spacing: 1.5px; color: #555; text-transform: uppercase; margin-bottom: 12px; }
+        .info-item { color: #ddd; font-size: 14px; line-height: 1.6; margin: 0 0 8px; }
+        .info-item:last-child { margin-bottom: 0; }
+        .info-item strong { color: #44cc88; }
+        .cta-btn { display: block; background: linear-gradient(135deg, #44cc88, #2b944e); color: #fff; text-decoration: none; text-align: center; padding: 18px 32px; border-radius: 10px; font-size: 16px; font-weight: 700; letter-spacing: 0.5px; margin-bottom: 28px; }
+        .note { background: #1a1400; border: 1px solid #333300; border-radius: 8px; padding: 14px 18px; margin-bottom: 28px; }
+        .note p { margin: 0; color: #888; font-size: 13px; line-height: 1.6; }
+        .note strong { color: #ffcc00; }
+        .footer { padding: 24px 36px; text-align: center; border-top: 1px solid #1a1a1a; }
+        .footer p { color: #444; font-size: 12px; line-height: 1.6; margin: 4px 0; }
+        .footer a { color: #44cc88; text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="wrapper">
+        <div class="card">
+            <div class="header">
+                <div class="logo"><img src="https://infinitecampus.xyz/res/icon.png">Infinite Campus</div>
+                <h1><span>You're In!</span></h1>
+                <p class="subtitle">Welcome To The Infinite Campus Beta</p>
+            </div>
+            <div class="body">
+                <div class="greeting">Hey {{DISPLAYNAME}},</div>
+                <p class="message">
+                    Great News! Your Application To Join The Infinite Campus Beta Has Been Accepted.
+                    Your Account Now Has The Beta Tester Role, And You Now Have Access To View The Beta URL
+                </p>
+                <a href="https://beta.infinitecampus.xyz" class="cta-btn">
+                    View The Beta URL →
+                </a>
+                <div class="info-box">
+                    <div class="info-title">What Happens Now</div>
+                    <p class="info-item"><strong>✓</strong> A Beta Tester Badge Has Been Added To Your Profile</p>
+                    <p class="info-item"><strong>✓</strong> You Get Early Access To Features As They Are Released</p>
+                    <p class="info-item"><strong>✓</strong> Your Feedback Helps Shape What Ships Next</p>
+                </div>
+
+                <a href="https://www.infinitecampus.xyz/InfiniteAccounts.html" class="cta-btn">
+                    View Your Account →
+                </a>
+
+                <div class="note">
+                    <p><strong>⚠ Heads Up:</strong> Beta Features Can Be Unfinished Or Change Without Notice. If You Run Into A Bug, Please Let Us Know So We Can Fix It.</p>
+                </div>
+            </div>
+            <div class="footer">
+                <p>This Email Was Sent To <a href="mailto:{{EMAIL}}">{{EMAIL}}</a></p>
+                <p>You Received This Because You Applied For The Infinite Campus Beta</p>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

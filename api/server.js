@@ -31,7 +31,8 @@ import { attachZoneGameRoutes, initZoneGames } from "./zonesstore.js";
 import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMap as persistDiscordChannelMap } from "./datastore.js";
 import { loadUrlsFile, saveUrlsFile, isAllowedHost, normalizeOrigin, makeEntryId } from "./urlsstore.js";
 import { getOrCreatePartnerId, findPartnerImageFile, deletePartnerImageFiles, partnerDir } from "./partnersstore.js";
-import { loadUsersShape, saveUsersShape, USERS_DIR } from "./usersstore.js";
+import { loadUsersShape, saveUsersShape, USERS_DIR, ROLE_FIELDS } from "./usersstore.js";
+import { getBetaApplicant, saveBetaApplicant, listBetaApplicants, BETA_REAPPLY_COOLDOWN_MS } from "./betastore.js";
 import * as Bans from "./bansstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -170,6 +171,8 @@ const EMAIL_TEMPLATES = [
     { id: "email_verify", label: "Email Verification", defaultSubject: "Verify Your Infinite Campus Email", vars: ["DISPLAYNAME", "LINK"] },
     { id: "password_reset", label: "Password Reset", defaultSubject: "Reset Your Infinite Campus Password", vars: ["DISPLAYNAME", "LINK"] },
     { id: "two_factor", label: "Two-Factor Code", defaultSubject: "Your Infinite Campus Two-Factor Code", vars: ["DISPLAYNAME", "CODE"] },
+    { id: "betaaccepted", label: "Beta Application Accepted", defaultSubject: "You're In! Welcome To The Infinite Campus Beta", vars: ["DISPLAYNAME", "EMAIL", "UID"] },
+    { id: "betadenied", label: "Beta Application Denied", defaultSubject: "Your Infinite Campus Beta Application", vars: ["DISPLAYNAME", "EMAIL", "UID"] },
 ];
 const exec = util.promisify(util.promisify ? util.promisify : (fn => fn));
 const execProm = util.promisify(child_process.exec);
@@ -309,6 +312,9 @@ const server = httpServer.listen(PORT, () => {
             initDevCli({
                 rl,
                 admin,
+                sendTemplatedEmail,
+                EMAIL_TEMPLATES,
+                TEMPLATES_DIR: path.join(DATA_ROOT, "templates"),
                 getDataCache,
                 readDataPath,
                 _getPushTokensForUser,
@@ -3722,6 +3728,152 @@ app.post("/uploadthis", verifyFirebaseToken, uploadChunk.single("file"), async (
         res.status(500).json({ error: "Upload Failed" });
     }
 });
+const BETA_REASON_MIN = 10;
+const BETA_REASON_MAX = 1000;
+function canReviewBetaApplicants(profile) {
+    return !!(profile && (profile.isOwner || profile.isTester || profile.isCoOwner || profile.isHAdmin || profile.isDev));
+}
+function formatAccountAgeDays(days) {
+    if (!Number.isFinite(days) || days < 0) return "Unknown";
+    if (days < 1) return "Less Than A Day";
+    if (days < 60) return `${days} Day${days !== 1 ? "s" : ""}`;
+    const months = Math.floor(days / 30.4375);
+    if (months < 24) return `${months} Month${months !== 1 ? "s" : ""} (${days} Days)`;
+    const years = (days / 365.25).toFixed(1);
+    return `${years} Years (${days} Days)`;
+}
+app.get("/beta/status", verifyFirebaseToken, (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const profile = readDataPath(`users/${uid}/profile`) || {};
+        if (profile.isBeta) return res.json({ isBeta: true, status: "accepted" });
+        const entry = getBetaApplicant(uid);
+        const out = { isBeta: false, status: entry?.status || null, submittedAt: entry?.submittedAt || null };
+        if (entry?.status === "denied") {
+            out.canReapplyAt = (entry.reviewedAt || entry.submittedAt || 0) + BETA_REAPPLY_COOLDOWN_MS;
+        }
+        res.json(out);
+    } catch (err) {
+        console.error("[Beta] status error:", err.message);
+        res.status(500).json({ error: "Failed To Load Beta Status" });
+    }
+});
+app.post("/beta/apply", verifyFirebaseToken, async (req, res) => {
+    try {
+        const uid = req.user.uid;
+        const reason = typeof req.body?.reason === "string" ? req.body.reason.trim() : "";
+        if (reason.length < BETA_REASON_MIN) {
+            return res.status(400).json({ error: `Please Write At Least ${BETA_REASON_MIN} Characters` });
+        }
+        if (reason.length > BETA_REASON_MAX) {
+            return res.status(400).json({ error: `Please Keep It Under ${BETA_REASON_MAX} Characters` });
+        }
+        const profile = readDataPath(`users/${uid}/profile`) || {};
+        if (profile.isBeta) return res.status(400).json({ error: "You Are Already A Beta Tester" });
+        const existing = getBetaApplicant(uid);
+        if (existing?.status === "pending") {
+            return res.status(400).json({ error: "You Already Have A Pending Application" });
+        }
+        if (existing?.status === "denied") {
+            const retryAt = (existing.reviewedAt || existing.submittedAt || 0) + BETA_REAPPLY_COOLDOWN_MS;
+            if (Date.now() < retryAt) {
+                return res.status(429).json({ error: `You Can Re-Apply On ${new Date(retryAt).toLocaleDateString("en-US")}` });
+            }
+        }
+        const firebaseUser = await admin.auth().getUser(uid);
+        const email = firebaseUser.email || readDataPath(`users/${uid}/settings/userEmail`) || "";
+        const createdAt = Date.parse(firebaseUser.metadata?.creationTime || "") || null;
+        const accountAgeDays = createdAt ? Math.floor((Date.now() - createdAt) / 86400000) : null;
+        const roles = {};
+        for (const k of ROLE_FIELDS) {
+            if (profile[k]) roles[k] = profile[k];
+        }
+        const entry = {
+            uid,
+            email,
+            displayName: profile.displayName || "",
+            submittedAt: Date.now(),
+            roles,
+            accountCreatedAt: createdAt,
+            accountAgeDays,
+            accountAge: accountAgeDays === null ? "Unknown" : formatAccountAgeDays(accountAgeDays),
+            reason,
+            status: "pending"
+        };
+        saveBetaApplicant(uid, entry);
+        logEvent("betaApplications", {
+            id: `beta_${uid}_${entry.submittedAt}`,
+            data: { type: "betaApplication", uid }
+        });
+        console.log(`[Beta] New Application From ${entry.displayName || uid} (${uid})`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error("[Beta] apply error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Submit Application" });
+    }
+});
+app.post("/beta/applicants", verifyFirebaseToken, (req, res) => {
+    try {
+        const profile = readDataPath(`users/${req.user.uid}/profile`);
+        if (!canReviewBetaApplicants(profile)) return res.status(403).json({ error: "Not Authorized" });
+        res.json({ success: true, applicants: listBetaApplicants("pending") });
+    } catch (err) {
+        console.error("[Beta] applicants error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Load Applicants" });
+    }
+});
+app.post("/beta/review", verifyFirebaseToken, async (req, res) => {
+    try {
+        const reviewerUid = req.user.uid;
+        const reviewer = readDataPath(`users/${reviewerUid}/profile`);
+        if (!canReviewBetaApplicants(reviewer)) return res.status(403).json({ error: "Not Authorized" });
+        const { uid, action } = req.body || {};
+        if (!uid || typeof uid !== "string") return res.status(400).json({ error: "Missing uid" });
+        if (action !== "accept" && action !== "deny") return res.status(400).json({ error: "action Must Be accept Or deny" });
+        const entry = getBetaApplicant(uid);
+        if (!entry) return res.status(404).json({ error: "Application Not Found" });
+        if (entry.status !== "pending") return res.status(400).json({ error: `Application Already ${entry.status}` });
+        const targetProfile = readDataPath(`users/${uid}/profile`) || {};
+        const displayName = targetProfile.displayName || entry.displayName || "User";
+        let toEmail = entry.email;
+        try {
+            const fu = await admin.auth().getUser(uid);
+            if (fu.email) toEmail = fu.email;
+        } catch {}
+        if (action === "accept") updateDataPath(`users/${uid}/profile`, { isBeta: true });
+        entry.status = action === "accept" ? "accepted" : "denied";
+        entry.reviewedBy = reviewerUid;
+        entry.reviewedAt = Date.now();
+        saveBetaApplicant(uid, entry);
+        logEvent("betaApplications", {
+            id: `betareview_${uid}_${entry.reviewedAt}`,
+            data: { type: `beta${action === "accept" ? "Accepted" : "Denied"}`, uid, reviewedBy: reviewerUid }
+        });
+        let emailSent = false;
+        let emailError = null;
+        if (!toEmail) {
+            emailError = "No Email On File";
+        } else {
+            try {
+                const isAccept = action === "accept";
+                await sendTemplatedEmail(
+                    isAccept ? "betaaccepted" : "betadenied",
+                    toEmail,
+                    isAccept ? "You're In! Welcome To The Infinite Campus Beta" : "Your Infinite Campus Beta Application",
+                    { DISPLAYNAME: displayName, EMAIL: toEmail, UID: uid }
+                );
+                emailSent = true;
+            } catch (mailErr) {
+                emailError = mailErr.message || "Email Failed";
+            }
+        }
+        console.log(`[Beta] ${uid} ${entry.status} by ${reviewerUid} (email ${emailSent ? "sent" : "not sent"})`);
+        res.json({ success: true, status: entry.status, emailSent, emailError });
+    } catch (err) {
+        console.error("[Beta] review error:", err.message);
+        res.status(500).json({ error: err.message || "Failed To Review Application" });
+    }
+});
 app.post("/verify-user", verifyFirebaseToken, async (req, res) => {
     try {
         const requesterUid = req.user.uid;
@@ -6789,6 +6941,7 @@ function computeProfileRoles(profile) {
     return {
         isOwner: !!p.isOwner,
         isTester: !!p.isTester,
+        isBeta: !!p.isBeta,
         isCoOwner: !!p.isCoOwner,
         isHAdmin: !!p.isHAdmin,
         isAdmin: !!p.isAdmin,
