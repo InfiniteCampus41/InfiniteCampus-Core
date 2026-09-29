@@ -5,7 +5,7 @@ const path = require("path");
 const SERVER_FILENAME = __filename;
 const SERVER_DIRNAME = __dirname;
 const axios = require("axios");
-const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, MessageFlags, PermissionFlagsBits, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder } = require("discord.js");
+const { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, MessageFlags, PermissionFlagsBits, EmbedBuilder, ModalBuilder, TextInputBuilder, TextInputStyle, ActionRowBuilder, ButtonBuilder, ButtonStyle, ChannelType, InteractionContextType } = require("discord.js");
 const { Jimp } = require("jimp");
 const dotenv = require("dotenv");
 const fs = require("fs");
@@ -63,6 +63,7 @@ const AD_PASS_1 = process.env.AD_PASS_1;
 const AD_PASS_2 = process.env.AD_PASS_2;
 const AD_PASS_3 = process.env.AD_PASS_3;
 const DT_PING = process.env.DT_PING;
+const SITE_LOGS_ID = process.env.SITE_LOGS_ID;
 initializeApp({
     credential: cert(require("./admin.json")),
     databaseURL: DB_URL
@@ -168,6 +169,8 @@ if (fs.existsSync(VARS_FILE)) {
 	vars = JSON.parse(fs.readFileSync(VARS_FILE));
 }
 if (!vars.sticky) vars.sticky = {};
+if (!vars.banChannel) vars.banChannel = { channel: null, roles: [] };
+if (!vars.appeals) vars.appeals = {};
 if (!vars.counting) {
 	vars.counting = {
 		channel: null,
@@ -345,6 +348,175 @@ async function getAvatarColor(url) {
 	} catch {
 		return 0x2b2d31;
 	}
+}
+const BAN_DM_MESSAGE =
+	"**You Were banned from the Infinite Campus Discord Server**\n" +
+	"**Reason:** You Sent Images Related To A Scam.\n" +
+	"**Feedback:** Your Account May Be Compromised, Please Change Your Password And Log Out Of All Sessions.\n" +
+	"To Appeal This Ban, Run The /appeal Command\n" +
+	"-# This Is An Automated Message";
+const BAN_CHANNEL_NOTICE =
+	"# DO NOT SEND MESSAGES HERE\n" +
+	"You **Will** Be Banned If You Send A Message Here\n" +
+	"This Is To Combat Spammers And Bots\n" +
+	"-# This Is An Automated Message";
+const APPEAL_ACCEPTED_MESSAGE =
+	"**Your Ban Appeal Has Been Accepted!**\n" +
+	"You Are Unbanned From The Infinite Campus Discord Server, Join Back At https://discord.infinitecampus.xyz\n" +
+	"-# This Is An Automated Message";
+const APPEAL_REJECTED_MESSAGE =
+	"**Your Ban Appeal Has Been Rejected**\n" +
+	"For Further Questions, Please Contact @hacker41 On Discord\n" +
+	"-# This Is An Automated Message";
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|avif|heic|svg)(\?|#|$)/i;
+const IMAGE_URL = /https?:\/\/\S+\.(?:png|jpe?g|gif|webp|bmp|avif)(?:[?#]\S*)?(?:\s|$)/i;
+const banInProgress = new Set();
+function isImageAttachment(a) {
+	if (a.contentType && a.contentType.startsWith("image/")) return true;
+	return IMAGE_EXT.test(a.name || a.url || "");
+}
+function messageHasImage(message) {
+	if ([...message.attachments.values()].some(isImageAttachment)) return true;
+	if (message.embeds.some(e => e.type === "image" || e.type === "gifv")) return true;
+	return IMAGE_URL.test(message.content || "");
+}
+function collectRoleIds(interaction) {
+	const ids = [];
+	for (let i = 1; i <= 5; i++) {
+		const role = interaction.options.getRole(`role${i}`);
+		if (role && !ids.includes(role.id)) ids.push(role.id);
+	}
+	return ids;
+}
+function addRoleOptions(builder, firstRequired) {
+	for (let i = 1; i <= 5; i++) {
+		builder.addRoleOption(option =>
+			option.setName(`role${i}`)
+				.setDescription("Role Excluded From The Ban Channel")
+				.setRequired(firstRequired && i === 1)
+		);
+	}
+	return builder;
+}
+async function banForImages(message, member) {
+	const user = message.author;
+	const guild = message.guild;
+	const modlog = await client.channels.fetch(MOD_ID).catch(() => null);
+	if (member && !member.bannable) {
+		await message.delete().catch(() => {});
+		if (modlog) {
+			modlog.send(`**Ban Channel:** Could Not Ban ${user.tag} (${user.id}) For Sending Images. My Role Is Not High Enough. The Message Was Deleted.`).catch(() => {});
+		}
+		return;
+	}
+	const files = [];
+	let totalBytes = 0;
+	for (const a of message.attachments.values()) {
+		if (files.length >= 10) break;
+		if (!isImageAttachment(a)) continue;
+		if (totalBytes + a.size > 8 * 1024 * 1024) continue;
+		try {
+			const res = await axios.get(a.url, { responseType: "arraybuffer", timeout: 10000 });
+			files.push({ attachment: Buffer.from(res.data), name: `SPOILER_${a.name || "image.png"}` });
+			totalBytes += a.size;
+		} catch {}
+	}
+	try {
+		await user.send(BAN_DM_MESSAGE);
+	} catch {}
+	if (modlog) {
+		const content = message.content ? message.content.slice(0, 1000) : "None";
+		const embed = new EmbedBuilder()
+			.setTitle("Auto Ban: Images Sent In Ban Channel")
+			.setColor(0xff0000)
+			.addFields(
+				{ name: "User", value: `${user.tag} (${user.id})\n<@${user.id}>` },
+				{ name: "Channel", value: `<#${message.channel.id}>` },
+				{ name: "Message Content", value: content },
+				{ name: "Images Attached", value: String(files.length) }
+			)
+			.setTimestamp();
+		const payload = { embeds: [embed] };
+		if (files.length) payload.files = files;
+		await modlog.send(payload).catch(async (err) => {
+			console.error("Failed To Log Ban Channel Message With Files:", err.message);
+			delete payload.files;
+			await modlog.send(payload).catch(() => {});
+		});
+	}
+	await message.delete().catch(() => {});
+	recentlyBanned.add(user.id);
+	try {
+		await guild.members.ban(user.id, { reason: "Auto Ban: Sent images in the ban channel (suspected scam)" });
+	} catch (err) {
+		console.error("Failed To Ban User:", err);
+		recentlyBanned.delete(user.id);
+		if (modlog) {
+			modlog.send(`**Ban Channel:** Failed To Ban ${user.tag} (${user.id}).`).catch(() => {});
+		}
+	}
+}
+async function handleBanChannelMessage(message) {
+	const cfg = vars.banChannel;
+	if (!cfg.channel || message.channel.id !== cfg.channel) return false;
+	if (message.author.bot || message.webhookId) return true;
+	const member = message.member ?? await message.guild.members.fetch(message.author.id).catch(() => null);
+	if (member && member.roles.cache.some(r => cfg.roles.includes(r.id))) return true;
+	if (!messageHasImage(message) || banInProgress.has(message.author.id)) {
+		await message.delete().catch(() => {});
+		return true;
+	}
+	banInProgress.add(message.author.id);
+	try {
+		await banForImages(message, member);
+	} catch (err) {
+		console.error(err);
+	} finally {
+		setTimeout(() => banInProgress.delete(message.author.id), 30_000);
+	}
+	return true;
+}
+async function handleAppealDecision(interaction, accepted, uid) {
+	if (!interaction.member?.permissions.has(PermissionFlagsBits.Administrator)) {
+		return interaction.reply({
+			content: "Only Admins Can Review Ban Appeals.",
+			flags: MessageFlags.Ephemeral
+		});
+	}
+	await interaction.deferUpdate();
+	if (accepted) {
+		try {
+			await interaction.guild.members.unban(uid, `Ban appeal accepted by ${interaction.user.tag}`);
+		} catch (err) {
+			if (err.code !== 10026) {
+				console.error(err);
+				return interaction.followUp({
+					content: "Failed To Unban That User. Make Sure I Have The Ban Members Permission.",
+					flags: MessageFlags.Ephemeral
+				});
+			}
+		}
+	}
+	let dmSent = true;
+	try {
+		const user = await client.users.fetch(uid);
+		await user.send(accepted ? APPEAL_ACCEPTED_MESSAGE : APPEAL_REJECTED_MESSAGE);
+	} catch {
+		dmSent = false;
+	}
+	if (accepted) {
+		delete vars.appeals[uid];
+	} else {
+		vars.appeals[uid] = { status: "declined" };
+	}
+	saveVars();
+	const embed = EmbedBuilder.from(interaction.message.embeds[0])
+		.setColor(accepted ? 0x57f287 : 0xed4245)
+		.addFields({
+			name: "Status",
+			value: `${accepted ? "Accepted" : "Declined"} By ${interaction.user.tag}${dmSent ? "" : "\n(Could Not DM The User)"}`
+		});
+	await interaction.editReply({ embeds: [embed], components: [] });
 }
 const commands = [
 	addCommand(
@@ -633,7 +805,9 @@ const commands = [
 				"/mute",
 				"/unban",
 				"/announce",
-				"/setnick"
+				"/setnick",
+				"/setup-ban-channel",
+				"/edit-ban-channel-settings"
 			];
 			let description = `**User Commands:**\n${userCommands.join("\n")}`;
 			if (isAdmin) {
@@ -903,6 +1077,8 @@ const commands = [
 			const id = interaction.options.getString("userid");
 			try {
 				await interaction.guild.members.unban(id);
+				delete vars.appeals[id];
+				saveVars();
 				await interaction.reply({
 					content: `User **${id}** Has Been Unbanned.`,
 					flags: MessageFlags.Ephemeral
@@ -975,6 +1151,150 @@ const commands = [
 			}
 		}
 	),
+	addCommand(
+		addRoleOptions(
+			new SlashCommandBuilder()
+				.setName("setup-ban-channel")
+				.setDescription("Set Up The Auto Ban Channel (Can Only Be Run Once)")
+				.setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+				.addChannelOption(option =>
+					option.setName("channel")
+						.setDescription("Channel To Use As The Ban Channel")
+						.addChannelTypes(ChannelType.GuildText)
+						.setRequired(true)
+				),
+			true
+		),
+		async (interaction) => {
+			if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+				return interaction.reply({
+					content: "You Do Not Have Permission To Use This Command.",
+					flags: MessageFlags.Ephemeral
+				});
+			}
+			if (vars.banChannel.channel) {
+				return interaction.reply({
+					content: `The Ban Channel Has Already Been Set Up (<#${vars.banChannel.channel}>). Use /edit-ban-channel-settings To Change The Excluded Roles.`,
+					flags: MessageFlags.Ephemeral
+				});
+			}
+			const channel = await client.channels.fetch(interaction.options.getChannel("channel").id).catch(() => null);
+			const roles = collectRoleIds(interaction);
+			try {
+				await channel.send(BAN_CHANNEL_NOTICE);
+			} catch (err) {
+				console.error(err);
+				return interaction.reply({
+					content: "Failed To Send The Notice In That Channel. Make Sure I Can View And Send Messages There.",
+					flags: MessageFlags.Ephemeral
+				});
+			}
+			vars.banChannel.channel = channel.id;
+			vars.banChannel.roles = roles;
+			saveVars();
+			await interaction.reply({
+				content: `Ban Channel Set To ${channel}.\nExcluded Roles: ${roles.map(id => `<@&${id}>`).join(", ")}`,
+				flags: MessageFlags.Ephemeral
+			});
+		}
+	),
+	addCommand(
+		addRoleOptions(
+			new SlashCommandBuilder()
+				.setName("edit-ban-channel-settings")
+				.setDescription("Edit The Roles Excluded From The Ban Channel")
+				.setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+				.addStringOption(option =>
+					option.setName("action")
+						.setDescription("What To Do With The Roles")
+						.setRequired(true)
+						.addChoices(
+							{ name: "Add Roles", value: "add" },
+							{ name: "Remove Roles", value: "remove" },
+							{ name: "Replace All Roles", value: "replace" },
+							{ name: "View Current Roles", value: "view" }
+						)
+				),
+			false
+		),
+		async (interaction) => {
+			if (!interaction.member.permissions.has(PermissionFlagsBits.Administrator)) {
+				return interaction.reply({
+					content: "You Do Not Have Permission To Use This Command.",
+					flags: MessageFlags.Ephemeral
+				});
+			}
+			if (!vars.banChannel.channel) {
+				return interaction.reply({
+					content: "The Ban Channel Has Not Been Set Up Yet. Run /setup-ban-channel First.",
+					flags: MessageFlags.Ephemeral
+				});
+			}
+			const action = interaction.options.getString("action");
+			const input = collectRoleIds(interaction);
+			let roles = [...vars.banChannel.roles];
+			if (action !== "view") {
+				if (!input.length) {
+					return interaction.reply({
+						content: "Provide At Least One Role.",
+						flags: MessageFlags.Ephemeral
+					});
+				}
+				if (action === "add") roles = [...new Set([...roles, ...input])];
+				else if (action === "remove") roles = roles.filter(id => !input.includes(id));
+				else roles = input;
+				if (!roles.length) {
+					return interaction.reply({
+						content: "At Least One Excluded Role Must Remain, Otherwise Everyone (Including Admins) Would Be Banned For Sending Images.",
+						flags: MessageFlags.Ephemeral
+					});
+				}
+				vars.banChannel.roles = roles;
+				saveVars();
+			}
+			await interaction.reply({
+				content: `Ban Channel: <#${vars.banChannel.channel}>\nExcluded Roles${action === "view" ? "" : " (Updated)"}: ${roles.map(id => `<@&${id}>`).join(", ")}`,
+				flags: MessageFlags.Ephemeral
+			});
+		}
+	),
+];
+const globalCommands = [
+	addCommand(
+		new SlashCommandBuilder()
+			.setName("appeal")
+			.setDescription("Appeal Your Ban From The Infinite Campus Discord Server")
+			.setContexts(InteractionContextType.BotDM),
+		async (interaction) => {
+			const guild = client.guilds.cache.get(GU_ID) ?? await client.guilds.fetch(GU_ID).catch(() => null);
+			if (!guild) {
+				return interaction.reply("Something Went Wrong. Please Try Again Later.");
+			}
+			const ban = await guild.bans.fetch(interaction.user.id).catch(() => null);
+			if (!ban) {
+				return interaction.reply("You Are Not Banned From The Infinite Campus Discord Server.");
+			}
+			const existing = vars.appeals[interaction.user.id];
+			if (existing?.status === "pending") {
+				return interaction.reply("You Already Have A Pending Appeal. Please Wait For A Response.");
+			}
+			if (existing?.status === "declined") {
+				return interaction.reply("Your Ban Appeal Was Already Reviewed And Rejected. For Further Questions, Please Contact @hacker41 On Discord");
+			}
+			const modal = new ModalBuilder()
+				.setCustomId("appeal_modal")
+				.setTitle("Ban Appeal");
+			const reasonInput = new TextInputBuilder()
+				.setCustomId("appeal_reason")
+				.setLabel("Why Should You Be Unbanned?")
+				.setStyle(TextInputStyle.Paragraph)
+				.setMinLength(10)
+				.setMaxLength(1000)
+				.setRequired(true);
+			modal.addComponents(new ActionRowBuilder().addComponents(reasonInput));
+			await interaction.showModal(modal);
+		}
+	),
 ];
 async function registerCommands() {
   	const rest = new REST({ version: "10" }).setToken(BOT_TOKEN);
@@ -988,6 +1308,8 @@ async function registerCommands() {
       		{ body: commands }
     	);
     	console.log("Test Commands Registered Instantly.");
+    	await rest.put(Routes.applicationCommands(CL_ID), { body: globalCommands });
+    	console.log("Global Commands Registered.");
   	} catch (err) {
     	console.error(err);
   	}
@@ -1006,7 +1328,56 @@ client.on("interactionCreate", async interaction => {
 			});
 		}
 	}
+	if (interaction.isButton()) {
+		const [action, uid] = interaction.customId.split(":");
+		if (action === "appeal_accept" || action === "appeal_decline") {
+			try {
+				await handleAppealDecision(interaction, action === "appeal_accept", uid);
+			} catch (err) {
+				console.error(err);
+			}
+		}
+	}
 	if (interaction.isModalSubmit()) {
+		if (interaction.customId === "appeal_modal") {
+			await interaction.deferReply();
+			const uid = interaction.user.id;
+			if (vars.appeals[uid]) {
+				return interaction.editReply("You Already Have An Appeal On File.");
+			}
+			const appealText = interaction.fields.getTextInputValue("appeal_reason");
+			const logs = await client.channels.fetch(SITE_LOGS_ID).catch(() => null);
+			if (!logs) {
+				return interaction.editReply("Could Not Submit Your Appeal Right Now. Please Try Again Later.");
+			}
+			vars.appeals[uid] = { status: "pending" };
+			saveVars();
+			const guild = client.guilds.cache.get(GU_ID);
+			const ban = guild ? await guild.bans.fetch(uid).catch(() => null) : null;
+			const embed = new EmbedBuilder()
+				.setTitle("New Ban Appeal")
+				.setColor(0xfee75c)
+				.setThumbnail(interaction.user.displayAvatarURL({ extension: "png", size: 256 }))
+				.addFields(
+					{ name: "User", value: `${interaction.user.tag} (${uid})\n<@${uid}>` },
+					{ name: "Ban Reason", value: ban?.reason ? ban.reason.slice(0, 1000) : "Unknown" },
+					{ name: "Appeal", value: appealText.slice(0, 1000) }
+				)
+				.setTimestamp();
+			const row = new ActionRowBuilder().addComponents(
+				new ButtonBuilder().setCustomId(`appeal_accept:${uid}`).setLabel("Accept").setStyle(ButtonStyle.Success),
+				new ButtonBuilder().setCustomId(`appeal_decline:${uid}`).setLabel("Decline").setStyle(ButtonStyle.Danger)
+			);
+			try {
+				await logs.send({ embeds: [embed], components: [row] });
+			} catch (err) {
+				console.error(err);
+				delete vars.appeals[uid];
+				saveVars();
+				return interaction.editReply("Could Not Submit Your Appeal Right Now. Please Try Again Later.");
+			}
+			return interaction.editReply("Your Appeal Has Been Submitted. You Will Receive A Message Here Once It Has Been Reviewed.");
+		}
 		if (interaction.customId === "announce_modal") {
 			const message = interaction.fields.getTextInputValue("announcement_message");
 			const channel = await client.channels.fetch(ANNOUNCE_ID).catch(()=>null);
@@ -1026,6 +1397,11 @@ client.on("interactionCreate", async interaction => {
 });
 client.on("messageCreate", async message => {
 	if (!message.guild) return;
+	try {
+		if (await handleBanChannelMessage(message)) return;
+	} catch (err) {
+		console.error(err);
+	}
 	if (
 		vars.counting.enabled &&
 		message.channel.id === vars.counting.channel &&
