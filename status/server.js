@@ -203,6 +203,8 @@ const sites = [
     	services: "Website",
     	failures: 0,
     	isDown: false,
+    	firstFailureAt: null,
+    	downSince: null,
     	alertMessageId: null
   	},
   	{
@@ -213,6 +215,8 @@ const sites = [
     	services: "Movie Streaming, Chat, File Upload, Games",
     	failures: 0,
     	isDown: false,
+    	firstFailureAt: null,
+    	downSince: null,
     	alertMessageId: null
   	},
   	{
@@ -223,6 +227,8 @@ const sites = [
     	services: "Mirror Website Link",
     	failures: 0,
     	isDown: false,
+    	firstFailureAt: null,
+    	downSince: null,
     	alertMessageId: null
   	}
 ];
@@ -252,6 +258,19 @@ function addCommand(builder, handler) {
 	const json = builder.toJSON();
 	commandHandlers[json.name] = handler;
 	return json;
+}
+function formatDuration(ms) {
+  	const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  	const days = Math.floor(totalSeconds / 86400);
+  	const hours = Math.floor((totalSeconds % 86400) / 3600);
+  	const minutes = Math.floor((totalSeconds % 3600) / 60);
+  	const seconds = totalSeconds % 60;
+  	const parts = [];
+  	if (days) parts.push(`${days}d`);
+  	if (hours) parts.push(`${hours}h`);
+  	if (minutes) parts.push(`${minutes}m`);
+  	if (seconds || parts.length === 0) parts.push(`${seconds}s`);
+  	return parts.join(" ");
 }
 async function checkSite(site) {
   	try {
@@ -298,15 +317,22 @@ async function monitorSites() {
     	if (isUp) {
       		site.failures = 0;
       		if (site.isDown) {
+        		const downtime = site.downSince ? formatDuration(Date.now() - site.downSince) : "Unknown";
         		site.isDown = false;
+        		site.downSince = null;
+        		site.firstFailureAt = null;
         		await deletePreviousAlert(site);
         		await updateChannelName(site, true);
-        		await sendAlert(`✅ **${site.name} Is Back Up**\n<@&${DT_PING}>`);
+        		await sendAlert(`✅ **${site.name} Is Back Up**\nTotal Downtime: ${downtime}\n<@&${DT_PING}>`);
+      		} else {
+        		site.firstFailureAt = null;
       		}
     	} else {
       		site.failures++;
+      		if (!site.firstFailureAt) site.firstFailureAt = Date.now();
       		if (site.failures >= FAILURE_THRESHOLD && !site.isDown) {
         		site.isDown = true;
+        		site.downSince = site.firstFailureAt;
         		await updateChannelName(site, false);
         		const alert = await sendAlert(
           			`🚨 **${site.name} Is DOWN**\nAffected Services: ${site.services}\n<@&${DT_PING}>`
