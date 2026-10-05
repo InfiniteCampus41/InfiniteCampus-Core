@@ -403,9 +403,22 @@ function injectBaseTag(html, baseHref) {
     if (/<base(?=[\s/>])/i.test(html)) return html;
     return injectHeadStart(html, `<base href="${baseHref}">`);
 }
-function rewriteRootRelativeUrls(content, basePath, rootBasePath) {
-    const rootPrefixRaw = rootBasePath || basePath;
-    const rootPrefix = rootPrefixRaw.endsWith("/") ? rootPrefixRaw.slice(0, -1) : rootPrefixRaw;
+function relativeUrl(fromPath, toPath) {
+    const fromDir = String(fromPath).split("?")[0].split("/");
+    fromDir.pop();
+    const fromSegs = fromDir.filter(Boolean);
+    const toSegs = String(toPath).split("/").filter(Boolean);
+    let common = 0;
+    while (common < fromSegs.length && common < toSegs.length && fromSegs[common] === toSegs[common]) common++;
+    const parts = [...Array(fromSegs.length - common).fill(".."), ...toSegs.slice(common)];
+    if (!parts.length) return "./";
+    return parts.join("/") + (String(toPath).endsWith("/") ? "/" : "");
+}
+function stripTrailingSlash(p) {
+    return p.endsWith("/") ? p.slice(0, -1) : p;
+}
+function rewriteRootRelativeUrls(content, rootPrefixRaw) {
+    const rootPrefix = stripTrailingSlash(rootPrefixRaw);
     let result = content.replace(
         /((?:src|href|action|poster)\s*=\s*)(["'])\/(?!\/)/gi,
         (m, attr, quote) => `${attr}${quote}${rootPrefix}/`
@@ -618,6 +631,26 @@ function hashId(str) {
 function zoneKey(id) {
     return `${ZONE_KEY_PREFIX}${id}`;
 }
+const SAFE_FEED_ID = /^[A-Za-z0-9_-]{1,64}$/;
+function entriesFromKeyedObject(obj) {
+    const out = [];
+    for (const [key, val] of Object.entries(obj)) {
+        if (key.startsWith("_") || key.startsWith(ZONE_KEY_PREFIX)) continue;
+        if (!val || typeof val !== "object" || Array.isArray(val)) continue;
+        out.push({ ...val, feedId: SAFE_FEED_ID.test(key) ? key : null });
+    }
+    return out;
+}
+function normalizeManifestFeed(json) {
+    if (Array.isArray(json)) return json;
+    if (!json || typeof json !== "object") return null;
+    if (Array.isArray(json.games)) return json.games;
+    if (json.games && typeof json.games === "object") return entriesFromKeyedObject(json.games);
+    return entriesFromKeyedObject(json);
+}
+function localManifestEntries(games) {
+    return entriesFromKeyedObject(games).filter(isValidManifestGame);
+}
 async function fetchRawFeed(source) {
     let lastErr = null;
     for (const url of source.manifestUrls) {
@@ -635,8 +668,8 @@ async function fetchRawFeed(source) {
                 if (!Array.isArray(json)) throw new Error("Invalid Dated Feed Format (expected array, no zones.json wrapper)");
                 return json;
             }
-            const games = Array.isArray(json?.games) ? json.games : null;
-            if (!games) throw new Error("Invalid Manifest Feed Format (expected { games: [...] })");
+            const games = normalizeManifestFeed(json);
+            if (!games) throw new Error("Invalid Manifest Feed Format (expected { games: [...] }, an array, or an object keyed by game id)");
             return games;
         } catch (e) {
             errlog(source.id, "feed fetch FAILED from", url, "-", e.message);
@@ -666,8 +699,13 @@ function buildZoneList(zones, games) {
 function buildManifestList(entries, games) {
     const valid = entries.filter(isValidManifestGame);
     return valid.map((g) => {
-        const id = hashId(g.url);
-        if (!games[id]) games[id] = { popularity: 0, dateAdded: Date.now() };
+        const id = typeof g.feedId === "string" && g.feedId ? g.feedId : hashId(g.url);
+        if (!games[id]) {
+            games[id] = {
+                popularity: Number.isFinite(g.popularity) ? g.popularity : 0,
+                dateAdded: Number.isFinite(g.dateAdded) && g.dateAdded > 0 ? g.dateAdded : Date.now(),
+            };
+        }
         const stored = games[id];
         stored.url = g.url;
         stored.thumbnail = typeof g.thumbnail === "string" ? g.thumbnail : null;
@@ -775,8 +813,11 @@ function startRefreshLoop(source, deps) {
 }
 async function mergeSourceIntoGamesJSON(source, deps) {
     const { __dirname } = deps;
-    const raw = source.kind === "dated" ? readSeedJSON(__dirname, source.id) : await refreshRawFeed(source);
     const games = loadGamesJSON(__dirname, source.id);
+    let raw;
+    if (source.kind === "dated") raw = readSeedJSON(__dirname, source.id);
+    else if (source.kind === "manifest" && !source.manifestUrls.length) raw = localManifestEntries(games);
+    else raw = await refreshRawFeed(source);
     const list =
         source.kind === "zone" ? buildZoneList(raw, games) :
         source.kind === "dated" ? buildDatedList(raw, games, source) :
@@ -821,6 +862,11 @@ export function attachZoneGameRoutes(app, deps) {
     const { __dirname } = deps;
     const sources = getSourcesConfig();
     for (const source of sources) ensureSourceFiles(__dirname, source.id, source.kind);
+    const API_ALIAS_RE = /^\/api(?=\/(?:games|game-sources|commits|admin\/(?:games|games-json|hidden-games))(?:[\/?]|$))/;
+    app.use((req, res, next) => {
+        if (API_ALIAS_RE.test(req.url)) req.url = req.url.replace(API_ALIAS_RE, "") || "/";
+        next();
+    });
     app.get("/game-sources", (req, res) => {
         res.json({ ok: true, sources: getSourcesConfig().map((s) => ({ id: s.id, name: s.name, main: !!s.main })) });
     });
@@ -1062,20 +1108,21 @@ export function attachZoneGameRoutes(app, deps) {
                     return res.status(status).send(msg);
                 }
             }
-            const rootBasePath = `/games/${source.id}/${encodeURIComponent(id)}/_root/`;
+            const rootPath = `/games/${source.id}/${encodeURIComponent(id)}/_root/`;
+            const baseHref = relativeUrl(req.path, rootPath);
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=300");
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                const rewritten = rewriteRootRelativeUrls(html, rootBasePath, rootBasePath);
-                return res.send(injectBaseTag(rewritten, rootBasePath));
+                const rewritten = rewriteRootRelativeUrls(html, ".");
+                return res.send(injectBaseTag(rewritten, baseHref));
             }
             if (contentType.includes("text/css")) {
                 const css = await upstream.text();
                 res.setHeader("Content-Type", "text/css; charset=utf-8");
-                return res.send(rewriteRootRelativeUrls(css, rootBasePath, rootBasePath));
+                return res.send(rewriteRootRelativeUrls(css, baseHref));
             }
             res.setHeader("Content-Type", contentType);
             pipeUpstream(upstream, res);
@@ -1108,9 +1155,10 @@ export function attachZoneGameRoutes(app, deps) {
         const rest = Array.isArray(req.params.rest) ? req.params.rest.join("/") : req.params.rest || "";
         const isRawAssetRequest = rest === "__raw__";
         const effectiveRest = isRawAssetRequest ? "" : rest;
+        const gameRoot = `/games/${source.id}/${encodeURIComponent(id)}/`;
         log(source.id, "GET", `/games/${source.id}/${id}${rest ? "/" + rest : ""}`, "from", req.ip);
         try {
-            let upstream, fetchUrl, basePath;
+            let upstream, fetchUrl;
             if (source.kind === "zone") {
                 if (!/^\d+$/.test(id)) return res.status(404).send("Not Found");
                 const zones = await getRawFeed(source);
@@ -1130,7 +1178,6 @@ export function attachZoneGameRoutes(app, deps) {
                     const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
                     return res.status(status).send(msg);
                 }
-                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
             } else if (source.kind === "dated") {
                 const games = loadGamesJSON(__dirname, source.id);
                 const entry = games[id];
@@ -1138,7 +1185,7 @@ export function attachZoneGameRoutes(app, deps) {
                 if (!rest) {
                     const emulatorKind = detectEmulatorKind(entry);
                     if (emulatorKind) {
-                        let mediaUrl = `/games/${source.id}/${encodeURIComponent(id)}/__raw__`;
+                        let mediaUrl = relativeUrl(req.path, `${gameRoot}__raw__`);
                         if (entry.file) {
                             try {
                                 mediaUrl = await buildEmulatorDataUri(source, id, entry, emulatorKind);
@@ -1174,7 +1221,6 @@ export function attachZoneGameRoutes(app, deps) {
                     const msg = status === 400 ? "Bad Path" : status === 403 ? "Blocked" : status === 502 ? "Proxy Error" : "Upstream Error";
                     return res.status(status).send(msg);
                 }
-                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
             } else if (source.id === "source3" && rest === "main.js") {
                 const localPath = path.join(sourceDir(__dirname, source.id), "main.js");
                 let buf;
@@ -1199,7 +1245,7 @@ export function attachZoneGameRoutes(app, deps) {
                         res.setHeader("Cache-Control", "no-store");
                         return res.send(buildEmulatorWrapperHtml(
                             emulatorKind,
-                            `/games/${source.id}/${encodeURIComponent(id)}/__raw__`
+                            relativeUrl(req.path, `${gameRoot}__raw__`)
                         ));
                     }
                 }
@@ -1227,24 +1273,24 @@ export function attachZoneGameRoutes(app, deps) {
                         return res.status(status).send(msg);
                     }
                 }
-                basePath = `/games/${source.id}/${encodeURIComponent(id)}/`;
             }
-            const rootBasePath = `/games/${source.id}/${encodeURIComponent(id)}/_root/`;
+            const baseHref = relativeUrl(req.path, gameRoot);
+            const cssRootPrefix = relativeUrl(req.path, `${gameRoot}_root/`);
             const contentType = upstream.headers.get("content-type") || "application/octet-stream";
             res.setHeader("X-Content-Type-Options", "nosniff");
             res.setHeader("Cache-Control", "public, max-age=300");
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                const rewritten = rewriteRootRelativeUrls(html, basePath, rootBasePath);
-                const withBase = injectBaseTag(rewritten, basePath);
+                const rewritten = rewriteRootRelativeUrls(html, "_root");
+                const withBase = injectBaseTag(rewritten, baseHref);
                 const finalHtml = injectCustomCss(withBase, source.customCss);
                 return res.send(finalHtml);
             }
             if (contentType.includes("text/css")) {
                 const css = await upstream.text();
                 res.setHeader("Content-Type", "text/css; charset=utf-8");
-                return res.send(rewriteRootRelativeUrls(css, basePath, rootBasePath));
+                return res.send(rewriteRootRelativeUrls(css, cssRootPrefix));
             }
             res.setHeader("Content-Type", contentType);
             pipeUpstream(upstream, res);
@@ -1257,6 +1303,7 @@ export function attachZoneGameRoutes(app, deps) {
         const zoneSource = getZoneSource();
         if (!zoneSource) return res.status(404).send("Not Found");
         log(zoneSource.id, "GET /commits from", req.ip);
+        const commitsBase = relativeUrl(req.path, "/commits/");
         try {
             let upstream, fetchUrl;
             try {
@@ -1280,13 +1327,13 @@ export function attachZoneGameRoutes(app, deps) {
             if (contentType.includes("text/html")) {
                 const html = await upstream.text();
                 res.setHeader("Content-Type", "text/html; charset=utf-8");
-                const rewritten = rewriteRootRelativeUrls(html, "/commits/");
-                return res.send(injectCustomCss(injectBaseTag(rewritten, "/commits/"), zoneSource.customCss));
+                const rewritten = rewriteRootRelativeUrls(html, ".");
+                return res.send(injectCustomCss(injectBaseTag(rewritten, commitsBase), zoneSource.customCss));
             }
             if (contentType.includes("text/css")) {
                 const css = await upstream.text();
                 res.setHeader("Content-Type", "text/css; charset=utf-8");
-                return res.send(rewriteRootRelativeUrls(css, "/commits/"));
+                return res.send(rewriteRootRelativeUrls(css, commitsBase));
             }
             res.setHeader("Content-Type", contentType);
             pipeUpstream(upstream, res);
