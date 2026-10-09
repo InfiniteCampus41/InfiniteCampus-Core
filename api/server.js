@@ -588,6 +588,11 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 // attachGameAssetFallback(app, { __dirname });
 attachZoneGameRoutes(app, { __dirname });
 app.use(express.static(path.join(__dirname, "public")));
+import { attachLegacySyncRoutes } from "./legacy-sync-routes.js";
+attachLegacySyncRoutes(app, { getUsersCache, saveUsers, avatars: {
+  read(uid){ const f=findUserPfpFile(uid); if(!f) return null; return { bytes: fs.readFileSync(f), mime: PFP_MIME_TYPES[path.extname(f).toLowerCase()] || "application/octet-stream" }; },
+  write(uid, bytes, ext){ const d=pfpDirForUser(uid); fs.mkdirSync(d,{recursive:true}); deleteUserPfpFiles(uid); fs.writeFileSync(path.join(d,`pic${ext}`), bytes); },
+  remove(uid){ deleteUserPfpFiles(uid); } } });
 app.use(requireAdminPassword);
 attachGameRoutes(app, {
     __dirname,
