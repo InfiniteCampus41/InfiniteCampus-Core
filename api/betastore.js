@@ -35,3 +35,14 @@ export function listBetaApplicants(status = null) {
     }
     return out.sort((a, b) => (a.submittedAt || 0) - (b.submittedAt || 0));
 }
+export function getBetaSignature() {
+    ensureDir(BETA_DIR);
+    const parts = [];
+    for (const d of fs.readdirSync(BETA_DIR, { withFileTypes: true })) {
+        if (!d.isDirectory()) continue;
+        try {
+            parts.push(`${d.name}:${fs.statSync(entryPath(d.name)).mtimeMs}`);
+        } catch {}
+    }
+    return parts.sort().join("|");
+}

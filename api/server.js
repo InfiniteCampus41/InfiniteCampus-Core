@@ -32,7 +32,7 @@ import { loadFullData, saveFullData, loadDiscordChannelMap, saveDiscordChannelMa
 import { loadUrlsFile, saveUrlsFile, isAllowedHost, normalizeOrigin, makeEntryId } from "./urlsstore.js";
 import { getOrCreatePartnerId, findPartnerImageFile, deletePartnerImageFiles, partnerDir } from "./partnersstore.js";
 import { loadUsersShape, saveUsersShape, USERS_DIR, ROLE_FIELDS } from "./usersstore.js";
-import { getBetaApplicant, saveBetaApplicant, listBetaApplicants, BETA_REAPPLY_COOLDOWN_MS } from "./betastore.js";
+import { getBetaApplicant, saveBetaApplicant, listBetaApplicants, getBetaSignature, BETA_REAPPLY_COOLDOWN_MS } from "./betastore.js";
 import * as Bans from "./bansstore.js";
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -589,7 +589,10 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 attachZoneGameRoutes(app, { __dirname });
 app.use(express.static(path.join(__dirname, "public")));
 import { attachLegacySyncRoutes } from "./legacy-sync-routes.js";
-attachLegacySyncRoutes(app, { getUsersCache, saveUsers, avatars: {
+attachLegacySyncRoutes(app, { getUsersCache, saveUsers,
+  beta: { list: (status) => listBetaApplicants(status), signature: getBetaSignature,
+    review: ({ uid, action, reviewedBy, sendEmail }) => reviewBetaApplicant({ uid, action, reviewerUid: reviewedBy || "legacy-sync", sendEmail }) },
+  avatars: {
   read(uid){ const f=findUserPfpFile(uid); if(!f) return null; return { bytes: fs.readFileSync(f), mime: PFP_MIME_TYPES[path.extname(f).toLowerCase()] || "application/octet-stream" }; },
   write(uid, bytes, ext){ const d=pfpDirForUser(uid); fs.mkdirSync(d,{recursive:true}); deleteUserPfpFiles(uid); fs.writeFileSync(path.join(d,`pic${ext}`), bytes); },
   remove(uid){ deleteUserPfpFiles(uid); } } });
@@ -3830,56 +3833,65 @@ app.post("/beta/applicants", verifyFirebaseToken, (req, res) => {
         res.status(500).json({ error: err.message || "Failed To Load Applicants" });
     }
 });
+async function reviewBetaApplicant({ uid, action, reviewerUid, sendEmail = true }) {
+    const fail = (httpStatus, message) => Object.assign(new Error(message), { httpStatus });
+    if (!uid || typeof uid !== "string") throw fail(400, "Missing uid");
+    if (action !== "accept" && action !== "deny") throw fail(400, "action Must Be accept Or deny");
+    const entry = getBetaApplicant(uid);
+    if (!entry) throw fail(404, "Application Not Found");
+    if (entry.status !== "pending") throw fail(400, `Application Already ${entry.status}`);
+    const targetProfile = readDataPath(`users/${uid}/profile`) || {};
+    const displayName = targetProfile.displayName || entry.displayName || "User";
+    let toEmail = entry.email;
+    if (sendEmail) {
+        try {
+            const fu = await admin.auth().getUser(uid);
+            if (fu.email) toEmail = fu.email;
+        } catch {}
+    }
+    if (action === "accept") updateDataPath(`users/${uid}/profile`, { isBeta: true });
+    entry.status = action === "accept" ? "accepted" : "denied";
+    entry.reviewedBy = reviewerUid;
+    entry.reviewedAt = Date.now();
+    saveBetaApplicant(uid, entry);
+    logEvent("betaApplications", {
+        id: `betareview_${uid}_${entry.reviewedAt}`,
+        data: { type: `beta${action === "accept" ? "Accepted" : "Denied"}`, uid, reviewedBy: reviewerUid }
+    });
+    let emailSent = false;
+    let emailError = null;
+    if (!sendEmail) {
+        emailError = "Skipped";
+    } else if (!toEmail) {
+        emailError = "No Email On File";
+    } else {
+        try {
+            const isAccept = action === "accept";
+            await sendTemplatedEmail(
+                isAccept ? "betaaccepted" : "betadenied",
+                toEmail,
+                isAccept ? "You're In! Welcome To The Infinite Campus Beta" : "Your Infinite Campus Beta Application",
+                { DISPLAYNAME: displayName, EMAIL: toEmail, UID: uid }
+            );
+            emailSent = true;
+        } catch (mailErr) {
+            emailError = mailErr.message || "Email Failed";
+        }
+    }
+    console.log(`[Beta] ${uid} ${entry.status} by ${reviewerUid} (email ${emailSent ? "sent" : "not sent"})`);
+    return { status: entry.status, emailSent, emailError };
+}
 app.post("/beta/review", verifyFirebaseToken, async (req, res) => {
     try {
         const reviewerUid = req.user.uid;
         const reviewer = readDataPath(`users/${reviewerUid}/profile`);
         if (!canReviewBetaApplicants(reviewer)) return res.status(403).json({ error: "Not Authorized" });
         const { uid, action } = req.body || {};
-        if (!uid || typeof uid !== "string") return res.status(400).json({ error: "Missing uid" });
-        if (action !== "accept" && action !== "deny") return res.status(400).json({ error: "action Must Be accept Or deny" });
-        const entry = getBetaApplicant(uid);
-        if (!entry) return res.status(404).json({ error: "Application Not Found" });
-        if (entry.status !== "pending") return res.status(400).json({ error: `Application Already ${entry.status}` });
-        const targetProfile = readDataPath(`users/${uid}/profile`) || {};
-        const displayName = targetProfile.displayName || entry.displayName || "User";
-        let toEmail = entry.email;
-        try {
-            const fu = await admin.auth().getUser(uid);
-            if (fu.email) toEmail = fu.email;
-        } catch {}
-        if (action === "accept") updateDataPath(`users/${uid}/profile`, { isBeta: true });
-        entry.status = action === "accept" ? "accepted" : "denied";
-        entry.reviewedBy = reviewerUid;
-        entry.reviewedAt = Date.now();
-        saveBetaApplicant(uid, entry);
-        logEvent("betaApplications", {
-            id: `betareview_${uid}_${entry.reviewedAt}`,
-            data: { type: `beta${action === "accept" ? "Accepted" : "Denied"}`, uid, reviewedBy: reviewerUid }
-        });
-        let emailSent = false;
-        let emailError = null;
-        if (!toEmail) {
-            emailError = "No Email On File";
-        } else {
-            try {
-                const isAccept = action === "accept";
-                await sendTemplatedEmail(
-                    isAccept ? "betaaccepted" : "betadenied",
-                    toEmail,
-                    isAccept ? "You're In! Welcome To The Infinite Campus Beta" : "Your Infinite Campus Beta Application",
-                    { DISPLAYNAME: displayName, EMAIL: toEmail, UID: uid }
-                );
-                emailSent = true;
-            } catch (mailErr) {
-                emailError = mailErr.message || "Email Failed";
-            }
-        }
-        console.log(`[Beta] ${uid} ${entry.status} by ${reviewerUid} (email ${emailSent ? "sent" : "not sent"})`);
-        res.json({ success: true, status: entry.status, emailSent, emailError });
+        const result = await reviewBetaApplicant({ uid, action, reviewerUid, sendEmail: req.body?.sendEmail !== false });
+        res.json({ success: true, ...result });
     } catch (err) {
         console.error("[Beta] review error:", err.message);
-        res.status(500).json({ error: err.message || "Failed To Review Application" });
+        res.status(err.httpStatus || 500).json({ error: err.message || "Failed To Review Application" });
     }
 });
 app.post("/verify-user", verifyFirebaseToken, async (req, res) => {
